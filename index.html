@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: header (headline + progress), four status lanes, today's activity. A task opens in a dialog with its story, history and actions. */
+/* Layout: header (headline + progress), then two tabs: Tickets (four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions. */
 :root {
   --bg: #f3f5f8; --surface: #ffffff; --ink: #172033; --muted: #5b6577; --line: #dde2ea;
   --accent: #2f5bd3; --accent-soft: #e6ecfb;
@@ -23,12 +23,22 @@
   --crit: #f0827a; --crit-soft: #3a1f22; --warn: #e2b05a; --warn-soft: #362b17; --ok: #6cc795; --ok-soft: #173126;
   color-scheme: dark; } }
 
-html { font-size: clamp(16px, 1.15vw, 28px); }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 0.875rem/1.5 var(--body); }
-.wrap { max-width: 77.5rem; margin: 0 auto; padding-block: max(1.5rem, env(safe-area-inset-top, 0rem)) 3rem;
-  padding-left: max(1rem, env(safe-area-inset-left, 0rem)); padding-right: max(1rem, env(safe-area-inset-right, 0rem));
+/* Full width: extra screen goes to the lanes, not to bigger type. */
+.wrap { padding-block: max(1.5rem, env(safe-area-inset-top, 0rem)) 3rem;
+  padding-left: max(clamp(1rem, 2vw, 2rem), env(safe-area-inset-left, 0rem)); padding-right: max(clamp(1rem, 2vw, 2rem), env(safe-area-inset-right, 0rem));
   display: grid; gap: 1.25rem; }
+.tabs { display: flex; gap: 0.25rem; border-bottom: 1px solid var(--line); }
+.tab { all: unset; cursor: pointer; font: 600 0.875rem var(--body); color: var(--muted); padding: 0.5rem 0.875rem; border-bottom: 0.125rem solid transparent; margin-bottom: -1px; }
+.tab:hover { color: var(--ink); }
+.tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.tab:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: -0.125rem; }
+.tab .count { font: 500 0.75rem var(--mono); color: var(--muted); margin-left: 0.25rem; }
+.weeknav { display: flex; gap: 0.75rem; align-items: center; }
+.weeknav b { font: 600 0.875rem var(--mono); font-variant-numeric: tabular-nums; }
+ol.tl li.day { display: block; font: 600 0.75rem var(--mono); text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding-top: 0.625rem; border-top: 1px solid var(--line); }
 header { display: grid; gap: 0.875rem; grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
 @media (max-width: 720px) { header { grid-template-columns: minmax(0, 1fr); } }
 .eyebrow { font: 500 0.75rem var(--mono); color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
@@ -58,6 +68,8 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 
 .card { all: unset; box-sizing: border-box; cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.625rem 0.75rem; display: grid; gap: 0.375rem; min-width: 0; }
 .card:hover { border-color: var(--accent); }
+.lanes { align-items: stretch; } .lane { align-content: start; border-radius: 0.5rem; }
+.lane.drop { outline: 0.125rem dashed var(--accent); outline-offset: 0.25rem; }
 .card:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
 .card.urgent { border-left: 0.1875rem solid var(--crit); }
 .card.closed .title { color: var(--muted); }
@@ -123,9 +135,13 @@ textarea:focus, input:focus { outline: 0.125rem solid var(--accent); outline-off
       <div class="week" id="week" aria-label="Tasks closed per day, last 7 days"></div>
     </div>
   </header>
-  <div class="lanes" id="lanes"></div>
-  <section class="log">
-    <h2>Today's activity</h2>
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" id="tab-tickets" aria-controls="lanes">Tickets <span class="count" id="n-tickets"></span></button>
+    <button class="tab" role="tab" id="tab-history" aria-controls="log">History <span class="count" id="n-history"></span></button>
+  </div>
+  <div class="lanes" id="lanes" role="tabpanel" aria-labelledby="tab-tickets"></div>
+  <section class="log" id="log" role="tabpanel" aria-labelledby="tab-history">
+    <div class="weeknav"><button class="btn" id="wk-prev">‹ Earlier week</button><b id="wk-label"></b><button class="btn" id="wk-next">Later week ›</button></div>
     <ol class="tl" id="activity"></ol>
   </section>
 </div>
@@ -180,8 +196,8 @@ function render() {
   for (const t of state.tasks) { const l = laneOf(t); if (l) by[l].push(t); }
   for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
     : (a.group === "urgent" ? 0 : 1) - (b.group === "urgent" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
-  $("lanes").innerHTML = LANES.map(([k, label]) => `<section class="lane"><h2>${label} <span class="count">${by[k].length}</span></h2>${
-    by[k].map((t) => `<button class="card ${t.group === "urgent" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></button>`).join("")
+  $("lanes").innerHTML = LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
+    by[k].map((t) => `<button class="card ${t.group === "urgent" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" draggable="true" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></button>`).join("")
     || `<div class="empty">${k === "closed" ? "Nothing closed yet today." : "Empty."}</div>`}</section>`).join("");
 
   const total = by.todo.length + by.doing.length + by.waiting.length + by.closed.length;
@@ -191,11 +207,8 @@ function render() {
   const counts = days.map((d) => state.tasks.filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
   $("week").innerHTML = days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join("");
 
-  const acts = [...state.tasks.flatMap((t) => (t.history || []).map((e) => ({ ...e, task: t }))), ...(state.log || []).map((e) => ({ ...e, task: { title: "board" } }))]
-    .filter((e) => ymd(new Date(e.at)) === today)
-    .sort((a, b) => a.at.localeCompare(b.at));
-  $("activity").innerHTML = acts.length ? acts.map((e) => `<li><time>${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.task.title)}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`).join("")
-    : `<li><time>—</time><span class="hint">Nothing yet today.</span></li>`;
+  $("n-tickets").textContent = total - by.closed.length;
+  $("n-history").textContent = [...state.tasks.flatMap((t) => t.history || []), ...(state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
 
   const b = state.brief || {};
   if (b.headline) $("headline").innerHTML = linkify(b.headline);
@@ -246,6 +259,7 @@ async function refresh() {
     if (!r.ok) throw new Error(r.status);
     state = await r.json(); today = ymd(new Date());
     $("note").hidden = true; render();
+    if (!$("log").hidden) loadLog();
   } catch (e) { $("note").hidden = false; $("note").textContent = "Can't reach the board server; what's shown may be out of date."; }
   clearTimeout(poll); poll = setTimeout(refresh, state.tasks.some(running) ? 3000 : 20000);
 }
@@ -267,11 +281,57 @@ $("lanes").addEventListener("click", (e) => {
   const c = e.target.closest(".card"); if (!c) return;
   openId = c.dataset.id; renderDialog(true); $("dlg").showModal();
 });
+// Drag a card to another lane to change its status (desktop only; HTML5 drag events don't fire on touch).
+const LANE_STATUS = { todo: "todo", doing: "doing", waiting: "waiting", closed: "done" };
+$("lanes").addEventListener("dragstart", (e) => { const c = e.target.closest(".card"); if (c) e.dataTransfer.setData("text/plain", c.dataset.id); });
+$("lanes").addEventListener("dragover", (e) => { const l = e.target.closest(".lane"); if (!l) return; e.preventDefault(); l.classList.add("drop"); });
+$("lanes").addEventListener("dragleave", (e) => { const l = e.target.closest(".lane"); if (l && !l.contains(e.relatedTarget)) l.classList.remove("drop"); });
+$("lanes").addEventListener("drop", async (e) => {
+  const l = e.target.closest(".lane"); if (!l) return;
+  e.preventDefault(); l.classList.remove("drop");
+  const t = state.tasks.find((x) => x.id === e.dataTransfer.getData("text/plain"));
+  if (!t || laneOf(t) === l.dataset.lane) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(t.id)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: LANE_STATUS[l.dataset.lane] }) }).catch(() => null);
+  if (!r || !r.ok) { $("note").hidden = false; $("note").textContent = `Couldn't move “${t.title}”.`; return; }
+  refresh();
+});
 $("dlg").addEventListener("click", (e) => {
   if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
   const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act, b.dataset.key);
 });
 $("dlg").addEventListener("close", () => { openId = null; });
+// The open tab lives in the URL hash, so a reload or a bookmark keeps it.
+function showTab() {
+  const hist = location.hash === "#history";
+  $("tab-tickets").setAttribute("aria-selected", !hist); $("tab-history").setAttribute("aria-selected", hist);
+  $("lanes").hidden = hist; $("log").hidden = !hist;
+  if (hist) loadLog();
+}
+
+// History reads one Monday–Sunday week at a time from the server's week files, newest first, grouped by day.
+const mondayOf = (d) => { const m = new Date(d); m.setDate(m.getDate() - (m.getDay() + 6) % 7); return ymd(m); };
+const addDays = (s, n) => { const d = new Date(s + "T12:00"); d.setDate(d.getDate() + n); return ymd(d); };
+let week = mondayOf(new Date());
+async function loadLog() {
+  const shown = week;
+  const r = await fetch(`api/log?week=${shown}`).catch(() => null);
+  if (!r || !r.ok || shown !== week) return;
+  const { entries, older } = await r.json();
+  const thisWeek = mondayOf(new Date());
+  $("wk-label").textContent = `${dm(week)} – ${dm(addDays(week, 6))}${week === thisWeek ? " · this week" : ""}`;
+  $("wk-prev").disabled = !older; $("wk-next").disabled = week >= thisWeek;
+  let day = "";
+  $("activity").innerHTML = entries.sort((a, b) => b.at.localeCompare(a.at)).map((e) => {
+    const d = ymd(new Date(e.at)), head = d === day ? "" : `<li class="day">${d === today ? "Today" : new Date(e.at).toLocaleDateString("en-GB", { weekday: "long" })} ${dm(d)}</li>`;
+    day = d;
+    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
+  }).join("") || `<li><time>—</time><span class="hint">Nothing this week.</span></li>`;
+}
+$("wk-prev").addEventListener("click", () => { week = addDays(week, -7); loadLog(); });
+$("wk-next").addEventListener("click", () => { week = addDays(week, 7); loadLog(); });
+$("tab-tickets").addEventListener("click", () => { history.replaceState(null, "", location.pathname + location.search); showTab(); });
+$("tab-history").addEventListener("click", () => { history.replaceState(null, "", "#history"); showTab(); });
+showTab();
 refresh();
 </script>
 </body>

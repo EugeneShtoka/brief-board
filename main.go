@@ -4,6 +4,7 @@
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
 // BOARD_WORKDIR (where claude runs), BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page).
+// Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
 package main
 
 import (
@@ -35,6 +36,13 @@ type Entry struct {
 	Actor string    `json:"actor"` // eugene | claude
 	Kind  string    `json:"kind"`  // note | reply | clarify | act | drop | status
 	Text  string    `json:"text"`
+}
+
+// LogEntry is one line of a week file: an entry and the task it belongs to (none for board-level).
+type LogEntry struct {
+	Entry
+	Task  string `json:"task,omitempty"`
+	Title string `json:"title,omitempty"`
 }
 
 type Job struct {
@@ -79,6 +87,7 @@ const logCap = 200
 type Board struct {
 	mu      sync.Mutex
 	path    string
+	logDir  string
 	st      State
 	workdir string
 	claude  string
@@ -119,8 +128,63 @@ func (b *Board) save() error {
 }
 
 func (b *Board) note(t *Task, actor, kind, text string) {
-	t.History = append(t.History, Entry{At: time.Now(), Actor: actor, Kind: kind, Text: text})
+	e := Entry{At: time.Now(), Actor: actor, Kind: kind, Text: text}
+	t.History = append(t.History, e)
 	t.UpdatedAt = time.Now()
+	b.archive(LogEntry{Entry: e, Task: t.ID, Title: t.Title})
+}
+
+// weekOf is the local Monday that starts t's week, as YYYY-MM-DD; it names the week's log file.
+func weekOf(t time.Time) string {
+	return t.AddDate(0, 0, -(int(t.Weekday())+6)%7).Format(time.DateOnly)
+}
+
+// archive appends e to its week's file; callers hold mu.
+func (b *Board) archive(e LogEntry) {
+	f, err := os.OpenFile(filepath.Join(b.logDir, weekOf(e.At)+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		log.Printf("archive: %v", err)
+		return
+	}
+	defer f.Close()
+	line, _ := json.Marshal(e)
+	f.Write(append(line, '\n'))
+}
+
+// handleLog returns one week's entries: ?week=YYYY-MM-DD (any day of it), this week by default.
+func (b *Board) handleLog(w http.ResponseWriter, r *http.Request) {
+	week := weekOf(time.Now())
+	if q := r.URL.Query().Get("week"); q != "" {
+		d, err := time.Parse(time.DateOnly, q)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "week: want YYYY-MM-DD"})
+			return
+		}
+		week = weekOf(d)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	entries := []LogEntry{}
+	if f, err := os.Open(filepath.Join(b.logDir, week+".jsonl")); err == nil {
+		rd := bufio.NewReader(f)
+		for {
+			line, err := rd.ReadBytes('\n')
+			var e LogEntry
+			if json.Unmarshal(line, &e) == nil {
+				entries = append(entries, e)
+			}
+			if err != nil {
+				break
+			}
+		}
+		f.Close()
+	}
+	older := false
+	files, _ := os.ReadDir(b.logDir)
+	for _, f := range files {
+		older = older || strings.HasSuffix(f.Name(), ".jsonl") && f.Name() < week+".jsonl"
+	}
+	writeJSON(w, 200, map[string]any{"week": week, "entries": entries, "older": older})
 }
 
 func setStatus(t *Task, status string) {
@@ -220,7 +284,8 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	if _, set := patch["status"]; set && next.Status != prevStatus {
 		setStatus(&next, next.Status)
 		if ok {
-			b.note(&next, "claude", "status", prevStatus+" → "+next.Status)
+			// ?actor=eugene marks a drag on the board; the brief's writes leave it unset.
+			b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "claude"), "status", prevStatus+" → "+next.Status)
 		}
 	}
 	next.UpdatedAt = time.Now()
@@ -348,7 +413,9 @@ func (b *Board) start(t *Task, req actRequest) {
 }
 
 func (b *Board) logf(kind, format string, args ...any) {
-	b.st.Log = append(b.st.Log, Entry{At: time.Now(), Actor: "claude", Kind: kind, Text: fmt.Sprintf(format, args...)})
+	e := Entry{At: time.Now(), Actor: "claude", Kind: kind, Text: fmt.Sprintf(format, args...)}
+	b.st.Log = append(b.st.Log, e)
+	b.archive(LogEntry{Entry: e})
 	if len(b.st.Log) > logCap {
 		b.st.Log = b.st.Log[len(b.st.Log)-logCap:]
 	}
@@ -445,6 +512,26 @@ func main() {
 	if err := b.load(); err != nil {
 		log.Fatalf("load %s: %v", b.path, err)
 	}
+	b.logDir = filepath.Join(filepath.Dir(b.path), "log")
+	// First start with week files: seed them from the history state.json already holds.
+	if _, err := os.Stat(b.logDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(b.logDir, 0o700); err != nil {
+			log.Fatal(err)
+		}
+		var all []LogEntry
+		for _, t := range b.st.Tasks {
+			for _, e := range t.History {
+				all = append(all, LogEntry{Entry: e, Task: t.ID, Title: t.Title})
+			}
+		}
+		for _, e := range b.st.Log {
+			all = append(all, LogEntry{Entry: e})
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].At.Before(all[j].At) })
+		for _, e := range all {
+			b.archive(e)
+		}
+	}
 	// A restart kills running jobs; don't leave them looking alive.
 	for _, t := range b.st.Tasks {
 		if t.Job != nil && t.Job.Status == "running" {
@@ -474,6 +561,7 @@ func main() {
 		w.Write(indexHTML)
 	})
 	mux.HandleFunc("GET /api/state", b.handleState)
+	mux.HandleFunc("GET /api/log", b.handleLog)
 	mux.HandleFunc("PUT /api/brief", b.handleBrief)
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
