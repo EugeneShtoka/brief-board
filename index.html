@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Brief Board</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: header (headline + progress), four status lanes, today's activity. A task opens in a dialog with its story, history and actions. */
+:root {
+  --bg: #f3f5f8; --surface: #ffffff; --ink: #172033; --muted: #5b6577; --line: #dde2ea;
+  --accent: #2f5bd3; --accent-soft: #e6ecfb;
+  --crit: #c2362f; --crit-soft: #fbe9e7; --warn: #a96a06; --warn-soft: #fbf1df; --ok: #23824f; --ok-soft: #e3f3ea;
+  --display: "Schibsted Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --bg: #0f1420; --surface: #171e2d; --ink: #e5e9f1; --muted: #98a2b5; --line: #273145;
+  --accent: #7d9cf0; --accent-soft: #1f2a46;
+  --crit: #f0827a; --crit-soft: #3a1f22; --warn: #e2b05a; --warn-soft: #362b17; --ok: #6cc795; --ok-soft: #173126;
+  color-scheme: dark; } }
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--body); }
+.wrap { max-width: 1240px; margin: 0 auto; padding-block: max(24px, env(safe-area-inset-top, 0px)) 48px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: grid; gap: 20px; }
+header { display: grid; gap: 14px; grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
+@media (max-width: 720px) { header { grid-template-columns: minmax(0, 1fr); } }
+.eyebrow { font: 500 12px var(--mono); color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+h1 { font: 700 28px/1.15 var(--display); margin: 2px 0 6px; text-wrap: balance; }
+.headline { color: var(--muted); max-width: 72ch; margin: 0; }
+.note { font: 12px var(--mono); color: var(--warn); }
+
+.progress { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: grid; gap: 10px; min-width: 280px; }
+@media (max-width: 720px) { .progress { min-width: 0; } }
+.progress .num { font: 700 26px var(--display); font-variant-numeric: tabular-nums; }
+.progress .num small { font: 500 13px var(--body); color: var(--muted); }
+.bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; }
+.bar > span { display: block; height: 100%; background: var(--ok); width: 0; transition: width .4s ease; }
+.week { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; height: 46px; }
+.week div { display: grid; gap: 3px; justify-items: center; align-content: end; }
+.week i { display: block; width: 100%; background: var(--accent); border-radius: 3px 3px 0 0; min-height: 2px; }
+.week i.today { background: var(--ok); }
+.week b { font: 400 10px var(--mono); color: var(--muted); }
+
+.lanes { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); align-items: start; }
+@media (max-width: 1000px) { .lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .lanes { grid-template-columns: minmax(0, 1fr); } }
+.lane { display: grid; gap: 8px; min-width: 0; }
+.lane h2 { font: 600 13px var(--body); margin: 0; display: flex; gap: 8px; align-items: baseline; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.lane h2 .count { font: 500 12px var(--mono); color: var(--ink); }
+.empty { color: var(--muted); font-size: 13px; padding: 10px 2px; border-top: 1px dashed var(--line); }
+
+.card { all: unset; box-sizing: border-box; cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; display: grid; gap: 6px; min-width: 0; }
+.card:hover { border-color: var(--accent); }
+.card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.card.urgent { border-left: 3px solid var(--crit); }
+.card.closed .title { color: var(--muted); }
+.card.dropped .title { text-decoration: line-through; }
+.title { font-weight: 500; overflow-wrap: anywhere; }
+.meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font: 12px var(--mono); color: var(--muted); }
+.pill { font: 500 11px var(--mono); padding: 1px 7px; border-radius: 99px; background: var(--accent-soft); color: var(--accent); white-space: nowrap; }
+.pill.crit { background: var(--crit-soft); color: var(--crit); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.run { background: var(--warn-soft); color: var(--warn); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .55; } }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code.ref { font: 500 12px var(--mono); }
+
+section.log { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: grid; gap: 8px; }
+section.log h2, dialog h3 { font: 700 16px var(--display); margin: 0; }
+ol.tl { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+ol.tl li { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 10px; }
+ol.tl time { font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; padding-top: 1px; }
+ol.tl .who { font: 500 11px var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+ol.tl .txt { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+dialog { width: min(760px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); border: 1px solid var(--line); border-radius: 12px; padding: 0; background: var(--surface); color: var(--ink); }
+dialog::backdrop { background: rgb(10 14 24 / .45); }
+.dlg { display: grid; gap: 16px; padding: 18px 20px 20px; }
+.dlg-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: start; }
+.dlg-head h2 { font: 700 20px/1.25 var(--display); margin: 0 0 6px; text-wrap: balance; overflow-wrap: anywhere; }
+.x { all: unset; cursor: pointer; font: 20px var(--mono); color: var(--muted); padding: 0 6px; border-radius: 6px; }
+.x:focus-visible { outline: 2px solid var(--accent); }
+.story { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 72ch; }
+.refs { display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 13px; }
+.actions { border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 10px; }
+label { font: 500 12px var(--body); color: var(--muted); display: grid; gap: 4px; }
+textarea, input[type=text] { font: 14px var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; width: 100%; }
+textarea { min-height: 72px; resize: vertical; }
+textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+.btns { display: flex; flex-wrap: wrap; gap: 8px; }
+.btn { font: 600 13px var(--body); border-radius: 8px; padding: 8px 14px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; }
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+.btn.danger { color: var(--crit); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.hint { font-size: 12px; color: var(--muted); }
+.err { font-size: 13px; color: var(--crit); }
+@media (prefers-reduced-motion: reduce) { .bar > span { transition: none; } .pill.run { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <div class="eyebrow" id="date">Today</div>
+      <h1>Brief Board</h1>
+      <p class="headline" id="headline">Tasks from the daily brief appear here once Claude writes them.</p>
+      <div class="note" id="note" hidden></div>
+    </div>
+    <div class="progress" aria-label="Today's progress">
+      <div class="num" id="pnum">0 / 0 <small>closed today</small></div>
+      <div class="bar"><span id="pbar"></span></div>
+      <div class="week" id="week" aria-label="Tasks closed per day, last 7 days"></div>
+    </div>
+  </header>
+  <div class="lanes" id="lanes"></div>
+  <section class="log">
+    <h2>Today's activity</h2>
+    <ol class="tl" id="activity"></ol>
+  </section>
+</div>
+
+<dialog id="dlg" aria-labelledby="dlg-title"><div class="dlg" id="dlg-body"></div></dialog>
+
+<script>
+const LANES = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting on others"], ["closed", "Closed today"]];
+const GROUP = { urgent: ["Urgent", "crit"], waiting_on_you: ["Owed reply", "warn"], ready: ["Ready to close", "ok"],
+  waiting_on_others: ["Waiting", ""], roadmap: ["Roadmap", ""], later: ["Later", ""] };
+const $ = (id) => document.getElementById(id);
+const ymd = (d) => { const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; };
+const hm = (s) => new Date(s).toTimeString().slice(0, 5);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// Issue and PR link bases come from the server (BOARD_ISSUE_URL, BOARD_PR_URL); no link when unset.
+const cfg = () => state.config || {};
+const linkify = (s) => esc(s)
+  .replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (m) => cfg().issue ? `<a href="${cfg().issue}${m}" target="_blank" rel="noopener"><code class="ref">${m}</code></a>` : `<code class="ref">${m}</code>`)
+  .replace(/(^|[\s(])#(\d{3,5})\b/g, (m, pre, n) => cfg().pr ? `${pre}<a href="${cfg().pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
+  .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+let state = { brief: {}, tasks: [] }, openId = null, today = ymd(new Date()), poll;
+
+const closed = (t) => t.status === "done" || t.status === "dropped";
+const running = (t) => t.job && t.job.status === "running";
+function laneOf(t) {
+  if (closed(t)) return t.doneAt && ymd(new Date(t.doneAt)) === today ? "closed" : null;
+  return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
+}
+const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
+
+function pills(t) {
+  const [gl, gc] = GROUP[t.group] || [t.group || "", ""], out = [];
+  if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
+  if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
+  else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
+  if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + hm(t.doneAt) : ""}</span>`);
+  else if (carried(t) > 0) out.push(`<span class="pill ${carried(t) >= 3 ? "crit" : ""}">carried ${carried(t)}d</span>`);
+  if (t.who) out.push(`<span>${esc(t.who)}</span>`);
+  return out.join("");
+}
+
+function render() {
+  const by = { todo: [], doing: [], waiting: [], closed: [] };
+  for (const t of state.tasks) { const l = laneOf(t); if (l) by[l].push(t); }
+  for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
+    : (a.group === "urgent" ? 0 : 1) - (b.group === "urgent" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
+  $("lanes").innerHTML = LANES.map(([k, label]) => `<section class="lane"><h2>${label} <span class="count">${by[k].length}</span></h2>${
+    by[k].map((t) => `<button class="card ${t.group === "urgent" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></button>`).join("")
+    || `<div class="empty">${k === "closed" ? "Nothing closed yet today." : "Empty."}</div>`}</section>`).join("");
+
+  const total = by.todo.length + by.doing.length + by.waiting.length + by.closed.length;
+  $("pnum").innerHTML = `${by.closed.length} / ${total} <small>closed today</small>`;
+  $("pbar").style.width = total ? `${(100 * by.closed.length) / total}%` : "0";
+  const days = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return ymd(d); });
+  const counts = days.map((d) => state.tasks.filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
+  $("week").innerHTML = days.map((d, i) => `<div title="${d}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(30 * counts[i]) / max}px"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join("");
+
+  const acts = state.tasks.flatMap((t) => (t.history || []).filter((e) => ymd(new Date(e.at)) === today).map((e) => ({ ...e, task: t })))
+    .sort((a, b) => a.at.localeCompare(b.at));
+  $("activity").innerHTML = acts.length ? acts.map((e) => `<li><time>${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.task.title)}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`).join("")
+    : `<li><time>—</time><span class="hint">Nothing yet today.</span></li>`;
+
+  const b = state.brief || {};
+  if (b.headline) $("headline").innerHTML = linkify(b.headline);
+  $("date").textContent = b.at ? `Brief ${String(b.at).slice(0, 10)} ${String(b.at).slice(11, 16)}` : new Date().toDateString();
+  if (openId) renderDialog(false);
+}
+
+function renderDialog(fresh) {
+  const t = state.tasks.find((x) => x.id === openId);
+  if (!t) return;
+  const busy = running(t);
+  // Keep what Eugene is typing across live refreshes.
+  const keep = fresh ? {} : { comment: $("f-comment")?.value, what: $("f-what")?.value };
+  const refs = [...(t.jira || []).map((k) => `<a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a>`),
+    ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
+  $("dlg-body").innerHTML = `
+    <div class="dlg-head"><div><h2 id="dlg-title">${esc(t.title)}</h2><div class="meta">${pills(t)}${t.since ? `<span>since ${esc(t.since)}</span>` : ""}</div></div>
+      <button class="x" id="x" aria-label="Close">×</button></div>
+    ${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
+    ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}
+    <div><h3>History</h3><ol class="tl" style="margin-top:8px">${(t.history || []).slice().reverse().map((e) =>
+      `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : esc(String(e.at).slice(5, 10))}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text)}</span></span></li>`).join("")
+      || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`}</ol></div>
+    <div class="actions">
+      ${busy ? `<div class="pill run" style="justify-self:start">Claude is working on “${esc(t.job.action)}” since ${hm(t.job.startedAt)}</div>` : ""}
+      <label for="f-comment">Guidance for Claude (optional)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
+      <label for="f-what">What to clarify (for Clarify)<input type="text" id="f-what" placeholder="e.g. does Available still mean purchasable for a parlay?"></label>
+      <div class="btns">
+        ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
+        <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
+        <button class="btn" data-act="clarify" ${busy ? "disabled" : ""}>Clarify</button>
+        <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>
+      </div>
+      <div class="hint">Reply sends right away. Act and Clarify run Claude on this task; its report lands in the history.</div>
+      <div class="err" id="f-err" hidden></div>
+    </div>`;
+  if (keep.comment) $("f-comment").value = keep.comment;
+  if (keep.what) $("f-what").value = keep.what;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("api/state");
+    if (!r.ok) throw new Error(r.status);
+    state = await r.json(); today = ymd(new Date());
+    $("note").hidden = true; render();
+  } catch (e) { $("note").hidden = false; $("note").textContent = "Can't reach the board server; what's shown may be out of date."; }
+  clearTimeout(poll); poll = setTimeout(refresh, state.tasks.some(running) ? 3000 : 20000);
+}
+
+async function act(action) {
+  const comment = $("f-comment").value.trim(), what = $("f-what").value.trim(), err = $("f-err");
+  if (action === "clarify" && !what && !comment) { err.hidden = false; err.textContent = "Say what to clarify, or give guidance."; return; }
+  err.hidden = true;
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, comment, what }) });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) { err.hidden = false; err.textContent = body.error || `Failed (${r.status})`; return; }
+  state.tasks = state.tasks.map((t) => (t.id === body.id ? body : t));
+  $("f-comment").value = ""; $("f-what").value = "";
+  render(); renderDialog(true);
+  clearTimeout(poll); poll = setTimeout(refresh, 3000);
+}
+
+$("lanes").addEventListener("click", (e) => {
+  const c = e.target.closest(".card"); if (!c) return;
+  openId = c.dataset.id; renderDialog(true); $("dlg").showModal();
+});
+$("dlg").addEventListener("click", (e) => {
+  if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
+  const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act);
+});
+$("dlg").addEventListener("close", () => { openId = null; });
+refresh();
+</script>
+</body>
+</html>
