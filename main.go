@@ -242,8 +242,7 @@ func (b *Board) handleNote(w http.ResponseWriter, r *http.Request) {
 type actRequest struct {
 	Action  string `json:"action"` // reply | clarify | act | drop
 	Comment string `json:"comment"`
-	What    string `json:"what"` // clarify only
-	Key     string `json:"key"`  // qa only: the Jira key to move
+	Key     string `json:"key"` // qa only: the Jira key to move
 }
 
 func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
@@ -273,9 +272,6 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		text := req.Comment
-		if req.What != "" {
-			text = strings.TrimSpace("Clarify: " + req.What + "\n" + req.Comment)
-		}
 		if req.Action == "qa" {
 			text = strings.TrimSpace("Move " + req.Key + " to QA - Staging. " + req.Comment)
 		}
@@ -299,7 +295,7 @@ const actionRules = `What each action means:
   (task.thread names the room, reply_to and thread when known; otherwise find the message with kith-mcp).
   Write in that room's language and in Eugene's voice. Send once: never retry inside the room's cooldown,
   and report exactly what kith answered, "sent" or "drafted". A Jira question gets a Jira comment instead.
-- clarify: get the missing information named under "What to clarify". If only a person can answer it, ask them
+- clarify: get the missing information Eugene's guidance names. If only a person can answer it, ask them
   in the thread where the item came from and send it. Otherwise investigate (Jira, chat, code, public API) and answer it yourself.
 - act: do the task itself, as far as it can be done safely now. Follow the repo's CLAUDE.md, skills and memory
   (branch from development, pre-PR checklist, PR review post). Never merge, push to main, deploy or touch prod data.
@@ -317,9 +313,6 @@ func (b *Board) prompt(t *Task, req actRequest) string {
 	}
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Eugene pressed %q on an item of his Brief Board (%s).\n\nTask:\n%s\n\nEugene's guidance: %s\n", req.Action, b.selfURL, taskJSON, guidance)
-	if req.Action == "clarify" {
-		fmt.Fprintf(&sb, "What to clarify: %s\n", req.What)
-	}
 	if req.Action == "qa" {
 		fmt.Fprintf(&sb, "Jira key to move: %s\n", req.Key)
 	}

@@ -140,7 +140,7 @@ const ymd = (d) => { const z = (n) => String(n).padStart(2, "0"); return `${d.ge
 const hm = (s) => new Date(s).toTimeString().slice(0, 5);
 // Dates read day.month (30.11). Accepts a Date, an ISO timestamp or YYYY-MM-DD.
 const dm = (s) => { const d = typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) ? new Date(s + "T12:00") : new Date(s); return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`; };
-const PRE_QA = new Set(["Backlog", "Selected for Development", "ToDo", "To Do", "In Progress"]);
+const PRE_QA = new Set(["Backlog", "Selected for Development", "ToDo", "To Do", "In Progress", "Dev Done"]);
 const preQa = (t) => t.status === "done" ? (t.jira || []).filter((k) => PRE_QA.has((t.jiraStatus || {})[k])) : [];
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // Issue and PR link bases come from the server (BOARD_ISSUE_URL, BOARD_PR_URL); no link when unset.
@@ -203,7 +203,7 @@ function renderDialog(fresh) {
   if (!t) return;
   const busy = running(t);
   // Keep what Eugene is typing across live refreshes.
-  const keep = fresh ? {} : { comment: $("f-comment")?.value, what: $("f-what")?.value };
+  const keep = fresh ? {} : { comment: $("f-comment")?.value };
   const js = t.jiraStatus || {}, late = preQa(t);
   const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
     ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
@@ -217,8 +217,7 @@ function renderDialog(fresh) {
       || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`}</ol></div>
     <div class="actions">
       ${busy ? `<div class="pill run" style="justify-self:start">Claude is working on “${esc(t.job.action)}” since ${hm(t.job.startedAt)}</div>` : ""}
-      <label for="f-comment">Guidance for Claude (optional)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
-      <label for="f-what">What to clarify (for Clarify)<input type="text" id="f-what" placeholder="e.g. does Available still mean purchasable for a parlay?"></label>
+      <label for="f-comment">Guidance for Claude (optional; for Clarify, what to clarify)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
       <div class="btns">
         ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
         <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
@@ -230,7 +229,6 @@ function renderDialog(fresh) {
       <div class="err" id="f-err" hidden></div>
     </div>`;
   if (keep.comment) $("f-comment").value = keep.comment;
-  if (keep.what) $("f-what").value = keep.what;
 }
 
 async function refresh() {
@@ -244,14 +242,14 @@ async function refresh() {
 }
 
 async function act(action, key) {
-  const comment = $("f-comment").value.trim(), what = $("f-what").value.trim(), err = $("f-err");
-  if (action === "clarify" && !what && !comment) { err.hidden = false; err.textContent = "Say what to clarify, or give guidance."; return; }
+  const comment = $("f-comment").value.trim(), err = $("f-err");
+  if (action === "clarify" && !comment) { err.hidden = false; err.textContent = "Say what to clarify."; return; }
   err.hidden = true;
-  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, comment, what, key }) });
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, comment, key }) });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) { err.hidden = false; err.textContent = body.error || `Failed (${r.status})`; return; }
   state.tasks = state.tasks.map((t) => (t.id === body.id ? body : t));
-  $("f-comment").value = ""; $("f-what").value = "";
+  $("f-comment").value = "";
   render(); renderDialog(true);
   clearTimeout(poll); poll = setTimeout(refresh, 3000);
 }
