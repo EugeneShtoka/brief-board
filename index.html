@@ -142,6 +142,9 @@ const hm = (s) => new Date(s).toTimeString().slice(0, 5);
 // Dates read day.month (30.11). Accepts a Date, an ISO timestamp or YYYY-MM-DD.
 const dm = (s) => { const d = typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) ? new Date(s + "T12:00") : new Date(s); return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`; };
 const PRE_QA = new Set(["Backlog", "Selected for Development", "ToDo", "To Do", "In Progress", "Dev Done"]);
+// A kith: link opens kith at that room, and at the message when there is one.
+const kithURI = (room, event) => "kith:" + encodeURIComponent(room) + (event ? "?event=" + encodeURIComponent(event) : "");
+const kithLink = (label, room, event) => `<a href="${esc(kithURI(room, event))}">${esc(label)} ↗</a>`;
 const preQa = (t) => t.status === "done" ? (t.jira || []).filter((k) => PRE_QA.has((t.jiraStatus || {})[k])) : [];
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // Issue and PR link bases come from the server (BOARD_ISSUE_URL, BOARD_PR_URL); no link when unset.
@@ -207,6 +210,8 @@ function renderDialog(fresh) {
   const keep = fresh ? {} : { comment: $("f-comment")?.value };
   const js = t.jiraStatus || {}, late = preQa(t);
   const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
+    ...(t.messages || []).map((m) => kithLink(m.label || "message", m.room, m.event)),
+    ...(t.thread && t.thread.room ? [kithLink(t.thread.reply_to ? "reply goes here" : "reply room", t.thread.room, t.thread.reply_to)] : []),
     ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
   $("dlg-body").innerHTML = `
     <div class="dlg-head"><div><h2 id="dlg-title">${esc(t.title)}</h2><div class="meta">${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}</div></div>
