@@ -191,14 +191,17 @@ function render() {
   const counts = days.map((d) => state.tasks.filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
   $("week").innerHTML = days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join("");
 
-  const acts = state.tasks.flatMap((t) => (t.history || []).filter((e) => ymd(new Date(e.at)) === today).map((e) => ({ ...e, task: t })))
+  const acts = [...state.tasks.flatMap((t) => (t.history || []).map((e) => ({ ...e, task: t }))), ...(state.log || []).map((e) => ({ ...e, task: { title: "board" } }))]
+    .filter((e) => ymd(new Date(e.at)) === today)
     .sort((a, b) => a.at.localeCompare(b.at));
   $("activity").innerHTML = acts.length ? acts.map((e) => `<li><time>${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.task.title)}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`).join("")
     : `<li><time>—</time><span class="hint">Nothing yet today.</span></li>`;
 
   const b = state.brief || {};
   if (b.headline) $("headline").innerHTML = linkify(b.headline);
-  $("date").textContent = b.at ? `Brief ${dm(b.at)} ${hm(b.at)}` : new Date().toDateString();
+  const run = state.briefRun;
+  $("date").textContent = (b.at ? `Brief ${dm(b.at)} ${hm(b.at)}` : new Date().toDateString())
+    + (run ? ` · auto-brief ${run.status === "running" ? "running since " + hm(run.startedAt) : run.status + " " + dm(run.startedAt) + " " + hm(run.startedAt)}` : "");
   if (openId) renderDialog(false);
 }
 

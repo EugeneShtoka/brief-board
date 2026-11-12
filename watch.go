@@ -1,0 +1,226 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"regexp"
+	"slices"
+	"strings"
+	"time"
+)
+
+// mcpCall runs one tool call against a fresh stdio MCP server (kith-mcp) and returns its text.
+func mcpCall(server, tool string, args map[string]any) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, server)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		return "", err
+	}
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+	defer cmd.Wait()
+	defer in.Close()
+	sc := bufio.NewScanner(out)
+	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
+	send := func(msg map[string]any) error {
+		msg["jsonrpc"] = "2.0"
+		data, _ := json.Marshal(msg)
+		_, err := in.Write(append(data, '\n'))
+		return err
+	}
+	await := func(id int) (json.RawMessage, error) {
+		for sc.Scan() {
+			var r struct {
+				ID     *int            `json:"id"`
+				Result json.RawMessage `json:"result"`
+				Error  *struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if json.Unmarshal(sc.Bytes(), &r) != nil || r.ID == nil || *r.ID != id {
+				continue
+			}
+			if r.Error != nil {
+				return nil, fmt.Errorf("%s: %s", tool, r.Error.Message)
+			}
+			return r.Result, nil
+		}
+		return nil, fmt.Errorf("%s: server closed: %v", tool, sc.Err())
+	}
+	if err := send(map[string]any{"id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "brief-board", "version": "0"}}}); err != nil {
+		return "", err
+	}
+	if _, err := await(1); err != nil {
+		return "", err
+	}
+	send(map[string]any{"method": "notifications/initialized"})
+	if err := send(map[string]any{"id": 2, "method": "tools/call", "params": map[string]any{"name": tool, "arguments": args}}); err != nil {
+		return "", err
+	}
+	raw, err := await(2)
+	if err != nil {
+		return "", err
+	}
+	var res struct {
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+		IsError bool `json:"isError"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil || len(res.Content) == 0 {
+		return "", fmt.Errorf("%s: unexpected result %s", tool, raw)
+	}
+	if res.IsError {
+		return "", fmt.Errorf("%s: %s", tool, res.Content[0].Text)
+	}
+	return res.Content[0].Text, nil
+}
+
+type feedMessage struct {
+	EventID string `json:"event_id"`
+	Sent    string `json:"sent"`
+	Body    string `json:"body"`
+}
+
+// watchJira polls the Jira feed room and hands each new update to Claude, per ticket.
+func (b *Board) watchJira(server, room string, keyRe *regexp.Regexp, every time.Duration) {
+	for {
+		if err := b.pollJira(server, room, keyRe); err != nil {
+			log.Printf("jira feed: %v", err)
+		}
+		time.Sleep(every)
+	}
+}
+
+func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
+	text, err := mcpCall(server, "read_room", map[string]any{"room": room, "limit": 50})
+	if err != nil {
+		return err
+	}
+	var read struct {
+		Messages []feedMessage `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(text), &read); err != nil {
+		return fmt.Errorf("read_room answer: %w", err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	baseline := b.st.JiraSeen == nil
+	ids := make([]string, 0, len(read.Messages))
+	byKey := map[string][]string{}
+	var keys []string
+	for _, m := range read.Messages {
+		ids = append(ids, m.EventID)
+		if baseline || slices.Contains(b.st.JiraSeen, m.EventID) {
+			continue
+		}
+		for _, key := range keyRe.FindAllString(m.Body, -1) {
+			if _, ok := byKey[key]; !ok {
+				keys = append(keys, key)
+			}
+			if !slices.Contains(byKey[key], m.Body) {
+				byKey[key] = append(byKey[key], m.Body)
+			}
+		}
+	}
+	b.st.JiraSeen = ids
+	for _, key := range keys {
+		update := strings.Join(byKey[key], "\n")
+		var tracked bool
+		for _, t := range b.st.Tasks {
+			if !slices.Contains(t.Jira, key) {
+				continue
+			}
+			tracked = true
+			b.note(t, "jira", "update", update)
+			if t.Job == nil || t.Job.Status != "running" {
+				b.start(t, actRequest{Action: "update", Comment: update})
+			}
+		}
+		if !tracked {
+			go b.triageKey(key, update)
+		}
+	}
+	return b.save()
+}
+
+// triageKey asks Claude whether an untracked ticket belongs on the board, one at a time.
+func (b *Board) triageKey(key, update string) {
+	b.triage <- struct{}{}
+	defer func() { <-b.triage }()
+	prompt := fmt.Sprintf(`A Jira update mentions %[1]s, which has no task on Eugene's Brief Board (%[2]s). Nobody is watching this run.
+
+The update: %[3]s
+
+Look %[1]s up in Jira. If it concerns Eugene's work (assigned to him, mentions or asks him, a ticket he reported,
+commented on or is blocked by), add it to the board in the brief skill's format (step 5 of .claude/skills/brief/SKILL.md):
+  curl -s -X PUT %[2]s/api/tasks/<slug> -H 'Content-Type: application/json' -d '{...}'
+with the whole story in summary, jira, jiraStatus, and messages when chat is involved. Otherwise change nothing.
+Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update)
+	status, text := runClaude(b.claude, b.workdir, prompt)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.logf("triage", "%s (%s): %s", key, status, text)
+	b.save()
+}
+
+// scheduleBrief runs the brief skill whenever the last brief is older than every.
+func (b *Board) scheduleBrief(every time.Duration) {
+	for {
+		b.mu.Lock()
+		last := b.lastBrief()
+		due := time.Since(last) >= every && (b.st.BriefRun == nil || b.st.BriefRun.Status != "running")
+		if due {
+			b.st.BriefRun = &Job{Action: "brief", Status: "running", StartedAt: time.Now()}
+			b.save()
+		}
+		b.mu.Unlock()
+		if due {
+			status, text := runClaude(b.claude, b.workdir, `Use the brief skill. This is a scheduled run from the Brief Board and nobody is watching:
+do the sweep, save the history file and sync the board (step 5), but take no actions and send nothing.
+Your final message is the brief's opening paragraph.`)
+			b.mu.Lock()
+			now := time.Now()
+			b.st.BriefRun.Status, b.st.BriefRun.EndedAt = status, &now
+			b.logf("brief", "%s: %s", status, text)
+			b.save()
+			b.mu.Unlock()
+		}
+		time.Sleep(10 * time.Minute)
+	}
+}
+
+// lastBrief is when the last brief started: a scheduled run, or the brief Claude last pushed.
+func (b *Board) lastBrief() time.Time {
+	var last time.Time
+	if b.st.BriefRun != nil {
+		last = b.st.BriefRun.StartedAt
+	}
+	if at, ok := b.st.Brief["at"].(string); ok {
+		if t, err := time.Parse(time.RFC3339, at); err == nil && t.After(last) {
+			last = t
+		}
+	}
+	return last
+}
+
+func envDuration(key string) time.Duration {
+	d, err := time.ParseDuration(os.Getenv(key))
+	if err != nil {
+		return 0
+	}
+	return d
+}

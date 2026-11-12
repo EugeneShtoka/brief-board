@@ -8,6 +8,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -65,7 +67,14 @@ type Task struct {
 type State struct {
 	Brief map[string]any   `json:"brief"`
 	Tasks map[string]*Task `json:"tasks"`
+	// Log is board-level activity (Jira triage, scheduled briefs), newest last, capped at logCap.
+	Log []Entry `json:"log,omitempty"`
+	// JiraSeen is the event ids of the Jira feed's last read; nil until the first read sets a baseline.
+	JiraSeen []string `json:"jiraSeen,omitempty"`
+	BriefRun *Job     `json:"briefRun,omitempty"`
 }
+
+const logCap = 200
 
 type Board struct {
 	mu      sync.Mutex
@@ -74,6 +83,7 @@ type Board struct {
 	workdir string
 	claude  string
 	selfURL string
+	triage  chan struct{} // one Jira triage at a time
 }
 
 func env(k, def string) string {
@@ -141,7 +151,7 @@ func (b *Board) handleState(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(tasks, func(i, j int) bool {
 		return tasks[i].Order < tasks[j].Order || tasks[i].Order == tasks[j].Order && tasks[i].ID < tasks[j].ID
 	})
-	writeJSON(w, 200, map[string]any{"brief": b.st.Brief, "tasks": tasks,
+	writeJSON(w, 200, map[string]any{"brief": b.st.Brief, "tasks": tasks, "log": b.st.Log, "briefRun": b.st.BriefRun,
 		"config": map[string]string{"issue": os.Getenv("BOARD_ISSUE_URL"), "pr": os.Getenv("BOARD_PR_URL")}})
 }
 
@@ -241,7 +251,7 @@ func (b *Board) handleNote(w http.ResponseWriter, r *http.Request) {
 }
 
 type actRequest struct {
-	Action  string `json:"action"` // reply | clarify | act | drop
+	Action  string `json:"action"` // reply | clarify | act | qa | drop; update comes from the Jira watcher
 	Comment string `json:"comment"`
 	Key     string `json:"key"` // qa only: the Jira key to move
 }
@@ -280,9 +290,7 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 			text = "(no guidance)"
 		}
 		b.note(t, "eugene", req.Action, text)
-		t.Job = &Job{Action: req.Action, Status: "running", StartedAt: time.Now()}
-		prompt := b.prompt(t, req)
-		go b.run(t.ID, req.Action, prompt)
+		b.start(t, req)
 	default:
 		writeJSON(w, 400, map[string]string{"error": "action must be reply, clarify, act or drop"})
 		return
@@ -302,7 +310,11 @@ const actionRules = `What each action means:
   (branch from development, pre-PR checklist, PR review post). Never merge, push to main, deploy or touch prod data.
 - qa: the task is done but its Jira ticket is still before QA. Transition that one key to "QA - Staging"
   (read its transitions first). A sub-task that has no QA state goes straight to Done. Change nothing else, then
-  record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.`
+  record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.
+- update: a Jira update arrived (from the Jira feed, not from Eugene). Read the ticket in Jira (status, newest
+  comments) and refresh this task: summary (what changed, who said what), jiraStatus, messages. If the update asks
+  something of Eugene (a mention, a question, an assignment), set group "waiting_on_you" and status "todo".
+  Never send messages and never change Jira on an update.`
 
 func (b *Board) prompt(t *Task, req actRequest) string {
 	view := *t
@@ -313,7 +325,11 @@ func (b *Board) prompt(t *Task, req actRequest) string {
 		guidance = "none"
 	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Eugene pressed %q on an item of his Brief Board (%s).\n\nTask:\n%s\n\nEugene's guidance: %s\n", req.Action, b.selfURL, taskJSON, guidance)
+	if req.Action == "update" {
+		fmt.Fprintf(&sb, "A Jira update arrived for an item of Eugene's Brief Board (%s). Nobody is watching this run.\n\nTask:\n%s\n\nThe update: %s\n", b.selfURL, taskJSON, guidance)
+	} else {
+		fmt.Fprintf(&sb, "Eugene pressed %q on an item of his Brief Board (%s).\n\nTask:\n%s\n\nEugene's guidance: %s\n", req.Action, b.selfURL, taskJSON, guidance)
+	}
 	if req.Action == "qa" {
 		fmt.Fprintf(&sb, "Jira key to move: %s\n", req.Key)
 	}
@@ -323,6 +339,19 @@ func (b *Board) prompt(t *Task, req actRequest) string {
 		"Your final message goes into the task's history as is: 2-4 plain lines saying what you did, what was sent or drafted, and links.\n",
 		actionRules, b.selfURL, t.ID)
 	return sb.String()
+}
+
+// start runs Claude on t in the background; callers hold mu.
+func (b *Board) start(t *Task, req actRequest) {
+	t.Job = &Job{Action: req.Action, Status: "running", StartedAt: time.Now()}
+	go b.run(t.ID, req.Action, b.prompt(t, req))
+}
+
+func (b *Board) logf(kind, format string, args ...any) {
+	b.st.Log = append(b.st.Log, Entry{At: time.Now(), Actor: "claude", Kind: kind, Text: fmt.Sprintf(format, args...)})
+	if len(b.st.Log) > logCap {
+		b.st.Log = b.st.Log[len(b.st.Log)-logCap:]
+	}
 }
 
 func (b *Board) run(id, action, prompt string) {
@@ -408,6 +437,7 @@ func main() {
 		workdir: env("BOARD_WORKDIR", home),
 		claude:  env("BOARD_CLAUDE", "claude"),
 		selfURL: env("BOARD_URL", "http://localhost"+addr),
+		triage:  make(chan struct{}, 1),
 	}
 	if err := os.MkdirAll(filepath.Dir(b.path), 0o700); err != nil {
 		log.Fatal(err)
@@ -422,7 +452,21 @@ func main() {
 			b.note(t, "claude", t.Job.Action, "Interrupted: the board restarted while this was running.")
 		}
 	}
+	if b.st.BriefRun != nil && b.st.BriefRun.Status == "running" {
+		b.st.BriefRun.Status = "failed"
+	}
 	b.save()
+
+	// BOARD_JIRA_ROOM: the kith room the Jira bot posts in; BOARD_ISSUE_KEY: the key pattern in it.
+	if room := os.Getenv("BOARD_JIRA_ROOM"); room != "" {
+		every := cmp.Or(envDuration("BOARD_JIRA_POLL"), 2*time.Minute)
+		go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), room, regexp.MustCompile(env("BOARD_ISSUE_KEY", `\b[A-Z][A-Z0-9]+-\d+\b`)), every)
+		log.Printf("watching %s for Jira updates every %s", room, every)
+	}
+	if every := envDuration("BOARD_BRIEF_EVERY"); every > 0 {
+		go b.scheduleBrief(every)
+		log.Printf("brief every %s", every)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
