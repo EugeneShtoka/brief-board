@@ -138,6 +138,10 @@ const GROUP = { urgent: ["Urgent", "crit"], waiting_on_you: ["Owed reply", "warn
 const $ = (id) => document.getElementById(id);
 const ymd = (d) => { const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; };
 const hm = (s) => new Date(s).toTimeString().slice(0, 5);
+// Dates read day.month (30.11). Accepts a Date, an ISO timestamp or YYYY-MM-DD.
+const dm = (s) => { const d = typeof s === "string" && /^\d{4}-\d{2}-\d{2}$/.test(s) ? new Date(s + "T12:00") : new Date(s); return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`; };
+const PRE_QA = new Set(["Backlog", "Selected for Development", "ToDo", "To Do", "In Progress"]);
+const preQa = (t) => t.status === "done" ? (t.jira || []).filter((k) => PRE_QA.has((t.jiraStatus || {})[k])) : [];
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // Issue and PR link bases come from the server (BOARD_ISSUE_URL, BOARD_PR_URL); no link when unset.
 const cfg = () => state.config || {};
@@ -160,6 +164,7 @@ function pills(t) {
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
+  if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
   if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + hm(t.doneAt) : ""}</span>`);
   else if (carried(t) > 0) out.push(`<span class="pill ${carried(t) >= 3 ? "crit" : ""}">carried ${carried(t)}d</span>`);
   if (t.who) out.push(`<span>${esc(t.who)}</span>`);
@@ -180,7 +185,7 @@ function render() {
   $("pbar").style.width = total ? `${(100 * by.closed.length) / total}%` : "0";
   const days = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return ymd(d); });
   const counts = days.map((d) => state.tasks.filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
-  $("week").innerHTML = days.map((d, i) => `<div title="${d}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(30 * counts[i]) / max}px"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join("");
+  $("week").innerHTML = days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(30 * counts[i]) / max}px"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join("");
 
   const acts = state.tasks.flatMap((t) => (t.history || []).filter((e) => ymd(new Date(e.at)) === today).map((e) => ({ ...e, task: t })))
     .sort((a, b) => a.at.localeCompare(b.at));
@@ -189,7 +194,7 @@ function render() {
 
   const b = state.brief || {};
   if (b.headline) $("headline").innerHTML = linkify(b.headline);
-  $("date").textContent = b.at ? `Brief ${String(b.at).slice(0, 10)} ${String(b.at).slice(11, 16)}` : new Date().toDateString();
+  $("date").textContent = b.at ? `Brief ${dm(b.at)} ${hm(b.at)}` : new Date().toDateString();
   if (openId) renderDialog(false);
 }
 
@@ -199,15 +204,16 @@ function renderDialog(fresh) {
   const busy = running(t);
   // Keep what Eugene is typing across live refreshes.
   const keep = fresh ? {} : { comment: $("f-comment")?.value, what: $("f-what")?.value };
-  const refs = [...(t.jira || []).map((k) => `<a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a>`),
+  const js = t.jiraStatus || {}, late = preQa(t);
+  const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
     ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
   $("dlg-body").innerHTML = `
-    <div class="dlg-head"><div><h2 id="dlg-title">${esc(t.title)}</h2><div class="meta">${pills(t)}${t.since ? `<span>since ${esc(t.since)}</span>` : ""}</div></div>
+    <div class="dlg-head"><div><h2 id="dlg-title">${esc(t.title)}</h2><div class="meta">${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}</div></div>
       <button class="x" id="x" aria-label="Close">×</button></div>
     ${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
     ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}
     <div><h3>History</h3><ol class="tl" style="margin-top:8px">${(t.history || []).slice().reverse().map((e) =>
-      `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : esc(String(e.at).slice(5, 10))}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text)}</span></span></li>`).join("")
+      `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : dm(e.at) + " " + hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text)}</span></span></li>`).join("")
       || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`}</ol></div>
     <div class="actions">
       ${busy ? `<div class="pill run" style="justify-self:start">Claude is working on “${esc(t.job.action)}” since ${hm(t.job.startedAt)}</div>` : ""}
@@ -217,6 +223,7 @@ function renderDialog(fresh) {
         ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
         <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
         <button class="btn" data-act="clarify" ${busy ? "disabled" : ""}>Clarify</button>
+        ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
         <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>
       </div>
       <div class="hint">Reply sends right away. Act and Clarify run Claude on this task; its report lands in the history.</div>
@@ -236,11 +243,11 @@ async function refresh() {
   clearTimeout(poll); poll = setTimeout(refresh, state.tasks.some(running) ? 3000 : 20000);
 }
 
-async function act(action) {
+async function act(action, key) {
   const comment = $("f-comment").value.trim(), what = $("f-what").value.trim(), err = $("f-err");
   if (action === "clarify" && !what && !comment) { err.hidden = false; err.textContent = "Say what to clarify, or give guidance."; return; }
   err.hidden = true;
-  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, comment, what }) });
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, comment, what, key }) });
   const body = await r.json().catch(() => ({}));
   if (!r.ok) { err.hidden = false; err.textContent = body.error || `Failed (${r.status})`; return; }
   state.tasks = state.tasks.map((t) => (t.id === body.id ? body : t));
@@ -255,7 +262,7 @@ $("lanes").addEventListener("click", (e) => {
 });
 $("dlg").addEventListener("click", (e) => {
   if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
-  const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act);
+  const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act, b.dataset.key);
 });
 $("dlg").addEventListener("close", () => { openId = null; });
 refresh();

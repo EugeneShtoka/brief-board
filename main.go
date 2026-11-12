@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -42,21 +43,22 @@ type Job struct {
 }
 
 type Task struct {
-	ID        string              `json:"id"`
-	Title     string              `json:"title"`
-	Group     string              `json:"group"`  // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
-	Status    string              `json:"status"` // todo | doing | waiting | done | dropped
-	Who       string              `json:"who,omitempty"`
-	Since     string              `json:"since,omitempty"`
-	Order     int                 `json:"order,omitempty"`
-	Summary   string              `json:"summary,omitempty"` // the story: what was asked, by whom, what's known
-	Jira      []string            `json:"jira,omitempty"`
-	Links     []map[string]string `json:"links,omitempty"`  // {label, url}
-	Thread    map[string]string   `json:"thread,omitempty"` // where a reply goes: {room, reply_to, thread}
-	DoneAt    *time.Time          `json:"doneAt,omitempty"`
-	UpdatedAt time.Time           `json:"updatedAt"`
-	History   []Entry             `json:"history"`
-	Job       *Job                `json:"job,omitempty"`
+	ID         string              `json:"id"`
+	Title      string              `json:"title"`
+	Group      string              `json:"group"`  // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
+	Status     string              `json:"status"` // todo | doing | waiting | done | dropped
+	Who        string              `json:"who,omitempty"`
+	Since      string              `json:"since,omitempty"`
+	Order      int                 `json:"order,omitempty"`
+	Summary    string              `json:"summary,omitempty"` // the story: what was asked, by whom, what's known
+	Jira       []string            `json:"jira,omitempty"`
+	JiraStatus map[string]string   `json:"jiraStatus,omitempty"` // key -> Jira status name, written by the brief
+	Links      []map[string]string `json:"links,omitempty"`      // {label, url}
+	Thread     map[string]string   `json:"thread,omitempty"`     // where a reply goes: {room, reply_to, thread}
+	DoneAt     *time.Time          `json:"doneAt,omitempty"`
+	UpdatedAt  time.Time           `json:"updatedAt"`
+	History    []Entry             `json:"history"`
+	Job        *Job                `json:"job,omitempty"`
 }
 
 type State struct {
@@ -176,6 +178,22 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		t = &Task{ID: id, Status: "todo", History: []Entry{}}
 	}
 	prevStatus := t.Status
+	// jiraStatus merges per key, so updating one ticket keeps the others.
+	if raw, ok := patch["jiraStatus"]; ok {
+		var m map[string]string
+		if err := json.Unmarshal(raw, &m); err != nil {
+			writeJSON(w, 400, map[string]string{"error": "jiraStatus: " + err.Error()})
+			return
+		}
+		merged := map[string]string{}
+		for k, v := range t.JiraStatus {
+			merged[k] = v
+		}
+		for k, v := range m {
+			merged[k] = v
+		}
+		patch["jiraStatus"], _ = json.Marshal(merged)
+	}
 	cur, _ := json.Marshal(t)
 	var merged map[string]json.RawMessage
 	json.Unmarshal(cur, &merged)
@@ -225,6 +243,7 @@ type actRequest struct {
 	Action  string `json:"action"` // reply | clarify | act | drop
 	Comment string `json:"comment"`
 	What    string `json:"what"` // clarify only
+	Key     string `json:"key"`  // qa only: the Jira key to move
 }
 
 func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +263,11 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 	case "drop":
 		setStatus(t, "dropped")
 		b.note(t, "eugene", "drop", strings.TrimSpace("Dropped. "+req.Comment))
-	case "reply", "clarify", "act":
+	case "reply", "clarify", "act", "qa":
+		if req.Action == "qa" && !slices.Contains(t.Jira, req.Key) {
+			writeJSON(w, 400, map[string]string{"error": "qa needs one of this task's Jira keys"})
+			return
+		}
 		if t.Job != nil && t.Job.Status == "running" {
 			writeJSON(w, 409, map[string]string{"error": "Claude is already working on this task"})
 			return
@@ -252,6 +275,9 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 		text := req.Comment
 		if req.What != "" {
 			text = strings.TrimSpace("Clarify: " + req.What + "\n" + req.Comment)
+		}
+		if req.Action == "qa" {
+			text = strings.TrimSpace("Move " + req.Key + " to QA - Staging. " + req.Comment)
 		}
 		if text == "" {
 			text = "(no guidance)"
@@ -276,7 +302,10 @@ const actionRules = `What each action means:
 - clarify: get the missing information named under "What to clarify". If only a person can answer it, ask them
   in the thread where the item came from and send it. Otherwise investigate (Jira, chat, code, public API) and answer it yourself.
 - act: do the task itself, as far as it can be done safely now. Follow the repo's CLAUDE.md, skills and memory
-  (branch from development, pre-PR checklist, PR review post). Never merge, push to main, deploy or touch prod data.`
+  (branch from development, pre-PR checklist, PR review post). Never merge, push to main, deploy or touch prod data.
+- qa: the task is done but its Jira ticket is still before QA. Transition that one key to "QA - Staging"
+  (read its transitions first). A sub-task that has no QA state goes straight to Done. Change nothing else, then
+  record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.`
 
 func (b *Board) prompt(t *Task, req actRequest) string {
 	view := *t
@@ -290,6 +319,9 @@ func (b *Board) prompt(t *Task, req actRequest) string {
 	fmt.Fprintf(&sb, "Eugene pressed %q on an item of his Brief Board (%s).\n\nTask:\n%s\n\nEugene's guidance: %s\n", req.Action, b.selfURL, taskJSON, guidance)
 	if req.Action == "clarify" {
 		fmt.Fprintf(&sb, "What to clarify: %s\n", req.What)
+	}
+	if req.Action == "qa" {
+		fmt.Fprintf(&sb, "Jira key to move: %s\n", req.Key)
 	}
 	fmt.Fprintf(&sb, "\n%s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\"}'   # todo|doing|waiting|done|dropped\n"+
