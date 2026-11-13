@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -14,6 +15,66 @@ import (
 	"time"
 )
 
+// mcpConn speaks newline-delimited JSON-RPC to a stdio MCP server, for one tool call.
+type mcpConn struct {
+	in   io.Writer
+	sc   *bufio.Scanner
+	tool string
+}
+
+func (c *mcpConn) send(msg map[string]any) error {
+	msg["jsonrpc"] = "2.0"
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("%s: %w", c.tool, err)
+	}
+	if _, err := c.in.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("%s: send: %w", c.tool, err)
+	}
+	return nil
+}
+
+func (c *mcpConn) await(id int) (json.RawMessage, error) {
+	for c.sc.Scan() {
+		var r struct {
+			ID     *int            `json:"id"`
+			Result json.RawMessage `json:"result"`
+			Error  *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(c.sc.Bytes(), &r) != nil || r.ID == nil || *r.ID != id {
+			continue
+		}
+		if r.Error != nil {
+			return nil, fmt.Errorf("%s: %s", c.tool, r.Error.Message)
+		}
+		return r.Result, nil
+	}
+	if err := c.sc.Err(); err != nil {
+		return nil, fmt.Errorf("%s: server closed: %w", c.tool, err)
+	}
+	return nil, fmt.Errorf("%s: server closed", c.tool)
+}
+
+// call initializes the session, then calls the tool with args and returns its result.
+func (c *mcpConn) call(args map[string]any) (json.RawMessage, error) {
+	if err := c.send(map[string]any{"id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "brief-board", "version": "0"}}}); err != nil {
+		return nil, err
+	}
+	if _, err := c.await(1); err != nil {
+		return nil, err
+	}
+	if err := c.send(map[string]any{"method": "notifications/initialized"}); err != nil {
+		return nil, err
+	}
+	if err := c.send(map[string]any{"id": 2, "method": "tools/call", "params": map[string]any{"name": c.tool, "arguments": args}}); err != nil {
+		return nil, err
+	}
+	return c.await(2)
+}
+
 // mcpCall runs one tool call against a fresh stdio MCP server (kith-mcp) and returns its text.
 func mcpCall(server, tool string, args map[string]any) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -21,56 +82,21 @@ func mcpCall(server, tool string, args map[string]any) (string, error) {
 	cmd := exec.CommandContext(ctx, server)
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%s: %w", tool, err)
 	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%s: %w", tool, err)
 	}
-	if err := cmd.Start(); err != nil {
-		return "", err
+	if err = cmd.Start(); err != nil {
+		return "", fmt.Errorf("%s: %w", tool, err)
 	}
-	defer cmd.Wait()
+	// Once the answer is in, how the server exits after stdin closes changes nothing.
+	defer func() { _ = cmd.Wait() }()
 	defer in.Close()
 	sc := bufio.NewScanner(out)
 	sc.Buffer(make([]byte, 0, 1<<20), 16<<20)
-	send := func(msg map[string]any) error {
-		msg["jsonrpc"] = "2.0"
-		data, _ := json.Marshal(msg)
-		_, err := in.Write(append(data, '\n'))
-		return err
-	}
-	await := func(id int) (json.RawMessage, error) {
-		for sc.Scan() {
-			var r struct {
-				ID     *int            `json:"id"`
-				Result json.RawMessage `json:"result"`
-				Error  *struct {
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if json.Unmarshal(sc.Bytes(), &r) != nil || r.ID == nil || *r.ID != id {
-				continue
-			}
-			if r.Error != nil {
-				return nil, fmt.Errorf("%s: %s", tool, r.Error.Message)
-			}
-			return r.Result, nil
-		}
-		return nil, fmt.Errorf("%s: server closed: %v", tool, sc.Err())
-	}
-	if err := send(map[string]any{"id": 1, "method": "initialize", "params": map[string]any{
-		"protocolVersion": "2025-06-18", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "brief-board", "version": "0"}}}); err != nil {
-		return "", err
-	}
-	if _, err := await(1); err != nil {
-		return "", err
-	}
-	send(map[string]any{"method": "notifications/initialized"})
-	if err := send(map[string]any{"id": 2, "method": "tools/call", "params": map[string]any{"name": tool, "arguments": args}}); err != nil {
-		return "", err
-	}
-	raw, err := await(2)
+	raw, err := (&mcpConn{in: in, sc: sc, tool: tool}).call(args)
 	if err != nil {
 		return "", err
 	}
@@ -80,7 +106,7 @@ func mcpCall(server, tool string, args map[string]any) (string, error) {
 		} `json:"content"`
 		IsError bool `json:"isError"`
 	}
-	if err := json.Unmarshal(raw, &res); err != nil || len(res.Content) == 0 {
+	if err = json.Unmarshal(raw, &res); err != nil || len(res.Content) == 0 {
 		return "", fmt.Errorf("%s: unexpected result %s", tool, raw)
 	}
 	if res.IsError {
@@ -123,7 +149,7 @@ func (b *Board) kithBack(lastOK time.Time) bool {
 	}
 	b.rerun = true
 	b.logf("kith", "kith reads work again; re-running the brief that ran while it was down")
-	b.save()
+	b.saveOrLog()
 	select {
 	case b.wake <- struct{}{}:
 	default:
@@ -200,7 +226,7 @@ Never send messages and never change Jira. Your final message is one line: what 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("triage", "%s (%s): %s", key, status, text)
-	b.save()
+	b.saveOrLog()
 }
 
 // scheduleBrief runs the brief skill whenever the last brief is older than every.
@@ -212,7 +238,7 @@ func (b *Board) scheduleBrief(every time.Duration) {
 		if due {
 			b.rerun = false
 			b.st.BriefRun = &Job{Action: "brief", Status: "running", StartedAt: time.Now()}
-			b.save()
+			b.saveOrLog()
 		}
 		b.mu.Unlock()
 		if due {
@@ -223,7 +249,7 @@ Your final message is the brief's opening paragraph.`)
 			now := time.Now()
 			b.st.BriefRun.Status, b.st.BriefRun.EndedAt = status, &now
 			b.logf("brief", "%s: %s", status, text)
-			b.save()
+			b.saveOrLog()
 			b.mu.Unlock()
 
 			// Mail, calendar and personal chats: a global skill, so it runs from home, not the work repo.
@@ -231,7 +257,7 @@ Your final message is the brief's opening paragraph.`)
 sync the board, but take no actions and send nothing. Your final message is one line: what changed on the board.`)
 			b.mu.Lock()
 			b.logf("sweep", "%s: %s", status, text)
-			b.save()
+			b.saveOrLog()
 			b.mu.Unlock()
 		}
 		select {

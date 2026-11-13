@@ -14,8 +14,10 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
@@ -149,29 +151,42 @@ func (b *Board) load() error {
 		return nil
 	}
 	if err != nil {
-		return err
+		return fmt.Errorf("load: %w", err)
 	}
-	return json.Unmarshal(data, &b.st)
+	if err := json.Unmarshal(data, &b.st); err != nil {
+		return fmt.Errorf("load: %w", err)
+	}
+	return nil
 }
 
 // save writes atomically; callers hold mu.
 func (b *Board) save() error {
 	data, err := json.MarshalIndent(b.st, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("save: %w", err)
 	}
 	tmp := b.path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
+		return fmt.Errorf("save: %w", err)
 	}
-	return os.Rename(tmp, b.path)
+	if err := os.Rename(tmp, b.path); err != nil {
+		return fmt.Errorf("save: %w", err)
+	}
+	return nil
+}
+
+// saveOrLog is save for the background loops, which have nobody to answer; callers hold mu.
+func (b *Board) saveOrLog() {
+	if err := b.save(); err != nil {
+		log.Print(err)
+	}
 }
 
 func (b *Board) note(t *Task, actor, kind, text string) {
 	e := Entry{At: time.Now(), Actor: actor, Kind: kind, Text: text}
 	t.History = append(t.History, e)
 	t.UpdatedAt = time.Now()
-	b.archive(LogEntry{Entry: e, Task: t.ID, Title: t.Title})
+	b.archive(&LogEntry{Entry: e, Task: t.ID, Title: t.Title})
 }
 
 // weekOf is the local Monday that starts t's week, as YYYY-MM-DD; it names the week's log file.
@@ -180,15 +195,22 @@ func weekOf(t time.Time) string {
 }
 
 // archive appends e to its week's file; callers hold mu.
-func (b *Board) archive(e LogEntry) {
+func (b *Board) archive(e *LogEntry) {
 	f, err := os.OpenFile(filepath.Join(b.logDir, weekOf(e.At)+".jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		log.Printf("archive: %v", err)
 		return
 	}
-	defer f.Close()
-	line, _ := json.Marshal(e)
-	f.Write(append(line, '\n'))
+	line, err := json.Marshal(e)
+	if err == nil {
+		_, err = f.Write(append(line, '\n'))
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		log.Printf("archive: %v", err)
+	}
 }
 
 // handleLog returns one week's entries: ?week=YYYY-MM-DD (any day of it), this week by default.
@@ -205,7 +227,8 @@ func (b *Board) handleLog(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	entries := []LogEntry{}
-	if f, err := os.Open(filepath.Join(b.logDir, week+".jsonl")); err == nil {
+	// week is a formatted date, so the name stays inside logDir.
+	if f, err := os.Open(filepath.Join(b.logDir, week+".jsonl")); err == nil { //nolint:gosec // see above
 		rd := bufio.NewReader(f)
 		for {
 			line, err := rd.ReadBytes('\n')
@@ -217,7 +240,7 @@ func (b *Board) handleLog(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-		f.Close()
+		_ = f.Close() // read only: nothing to lose
 	}
 	older := false
 	files, _ := os.ReadDir(b.logDir)
@@ -242,7 +265,9 @@ func setStatus(t *Task, status string) {
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("writeJSON: %v", err)
+	}
 }
 
 func (b *Board) handleState(w http.ResponseWriter, r *http.Request) {
@@ -275,6 +300,47 @@ func (b *Board) handleBrief(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, body)
 }
 
+// mergePatch returns t with patch's fields over it. jiraStatus merges per key, so updating one
+// ticket keeps the others.
+func mergePatch(t *Task, patch map[string]json.RawMessage) (Task, error) {
+	if raw, ok := patch["jiraStatus"]; ok {
+		var m map[string]string
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return Task{}, fmt.Errorf("jiraStatus: %w", err)
+		}
+		merged := map[string]string{}
+		maps.Copy(merged, t.JiraStatus)
+		maps.Copy(merged, m)
+		data, err := json.Marshal(merged)
+		if err != nil {
+			return Task{}, fmt.Errorf("jiraStatus: %w", err)
+		}
+		patch["jiraStatus"] = data
+	}
+	var fields map[string]json.RawMessage
+	if err := remarshal(t, &fields); err != nil {
+		return Task{}, err
+	}
+	maps.Copy(fields, patch)
+	var next Task
+	if err := remarshal(fields, &next); err != nil {
+		return Task{}, err
+	}
+	return next, nil
+}
+
+// remarshal moves from into to through JSON.
+func remarshal(from, to any) error {
+	data, err := json.Marshal(from)
+	if err == nil {
+		err = json.Unmarshal(data, to)
+	}
+	if err != nil {
+		return fmt.Errorf("task: %w", err)
+	}
+	return nil
+}
+
 // handleUpsert merges the body's fields into the task; history and job are server-owned.
 func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -293,31 +359,8 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		t = &Task{ID: id, Status: "todo", History: []Entry{}}
 	}
 	prevStatus := t.Status
-	// jiraStatus merges per key, so updating one ticket keeps the others.
-	if raw, ok := patch["jiraStatus"]; ok {
-		var m map[string]string
-		if err := json.Unmarshal(raw, &m); err != nil {
-			writeJSON(w, 400, map[string]string{"error": "jiraStatus: " + err.Error()})
-			return
-		}
-		merged := map[string]string{}
-		for k, v := range t.JiraStatus {
-			merged[k] = v
-		}
-		for k, v := range m {
-			merged[k] = v
-		}
-		patch["jiraStatus"], _ = json.Marshal(merged)
-	}
-	cur, _ := json.Marshal(t)
-	var merged map[string]json.RawMessage
-	json.Unmarshal(cur, &merged)
-	for k, v := range patch {
-		merged[k] = v
-	}
-	raw, _ := json.Marshal(merged)
-	var next Task
-	if err := json.Unmarshal(raw, &next); err != nil {
+	next, err := mergePatch(t, patch)
+	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
@@ -340,7 +383,7 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 	next.UpdatedAt = time.Now()
 	b.st.Tasks[id] = &next
-	if err := b.save(); err != nil {
+	if err = b.save(); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
@@ -366,7 +409,10 @@ func (b *Board) handleNote(w http.ResponseWriter, r *http.Request) {
 		now := time.Now()
 		j.Status, j.EndedAt = "ok", &now
 	}
-	b.save()
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	writeJSON(w, 200, t)
 }
 
@@ -415,7 +461,10 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "action must be reply, clarify, act or drop"})
 		return
 	}
-	b.save()
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
 	writeJSON(w, 200, t)
 }
 
@@ -438,10 +487,13 @@ const actionRules = `What each action means:
   something of Eugene (a mention, a question, an assignment), set group "waiting_on_you" and status "todo".
   Never send messages and never change Jira on an update.`
 
-func (b *Board) prompt(t *Task, req actRequest) string {
+func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	view := *t
 	view.Job = nil
-	taskJSON, _ := json.MarshalIndent(view, "", "  ")
+	taskJSON, err := json.MarshalIndent(view, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("prompt: %w", err)
+	}
 	guidance := req.Comment
 	if guidance == "" {
 		guidance = "none"
@@ -468,47 +520,54 @@ func (b *Board) prompt(t *Task, req actRequest) string {
 			"  jq -n --arg text '...' '{actor: \"claude\", kind: \"%[3]s\", text: $text}' | curl -s -X POST %[1]s/api/tasks/%[2]s/notes -H 'Content-Type: application/json' -d @-\n"+
 			"Then stay open for Eugene.\n", b.selfURL, t.ID, req.Action)
 	}
-	return sb.String()
+	return sb.String(), nil
 }
 
 // start runs Claude on t; callers hold mu. A Jira update runs headless; a button press gets its own
 // interactive session in the wezterm mux server, which outlives a board restart and can be attached to.
 func (b *Board) start(t *Task, req actRequest) {
 	t.Job = &Job{Action: req.Action, Status: "running", StartedAt: time.Now()}
-	if req.Action == "update" {
-		go b.run(t.ID, req.Action, b.prompt(t, req))
+	prompt, err := b.prompt(t, req)
+	if err == nil && req.Action == "update" {
+		go b.run(t.ID, req.Action, prompt)
 		return
 	}
-	t.Job.Session = t.ID + "-" + req.Action
-	pane, err := spawnSession(b.claude, b.dirFor(t), t.Job.Session, b.prompt(t, req))
+	if err == nil {
+		t.Job.Session = t.ID + "-" + req.Action
+		t.Job.Pane, err = spawnSession(b.claude, b.dirFor(t), t.Job.Session, prompt)
+	}
 	if err != nil {
 		now := time.Now()
 		t.Job.Status, t.Job.EndedAt = "failed", &now
 		b.note(t, "claude", req.Action, "Could not start a session: "+err.Error())
 		return
 	}
-	t.Job.Pane = pane
-	b.note(t, "claude", "session", fmt.Sprintf("Started session %q in wezterm pane %s: attach in wezterm, or on claude.ai/code (remote control).", t.Job.Session, pane))
+	b.note(t, "claude", "session", fmt.Sprintf("Started session %q in wezterm pane %s: attach in wezterm, or on claude.ai/code (remote control).", t.Job.Session, t.Job.Pane))
 }
 
 // spawnSession opens an interactive Claude Code session in a new wezterm mux window and returns its pane id.
 // The pane closes when Claude exits, so a live pane means a live session.
 func spawnSession(claude, dir, name, prompt string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	// zsh -lic gives the session the user's login env; the mux server's own PATH is bare.
-	out, err := exec.Command("wezterm", "cli", "spawn", "--new-window", "--cwd", dir, "--",
+	// claude and the prompt reach zsh as "$0" and "$@", never as shell text.
+	out, err := exec.CommandContext(ctx, "wezterm", "cli", "spawn", "--new-window", "--cwd", dir, "--", //nolint:gosec // see above
 		"zsh", "-lic", `exec "$0" "$@"`, claude, "--permission-mode", "auto", "--remote-control", name, "-n", name, prompt).Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			err = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
+		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
+			return "", fmt.Errorf("spawn: %w: %s", err, strings.TrimSpace(string(ee.Stderr)))
 		}
-		return "", err
+		return "", fmt.Errorf("spawn: %w", err)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
 
 // paneAlive reports whether the wezterm mux still has pane; if the mux can't be asked, it assumes yes.
 func paneAlive(pane string) bool {
-	out, err := exec.Command("wezterm", "cli", "list", "--format", "json").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "wezterm", "cli", "list", "--format", "json").Output()
 	var panes []struct {
 		PaneID int `json:"pane_id"`
 	}
@@ -541,7 +600,7 @@ func (b *Board) busy(t *Task) bool {
 func (b *Board) logf(kind, format string, args ...any) {
 	e := Entry{At: time.Now(), Actor: "claude", Kind: kind, Text: fmt.Sprintf(format, args...)}
 	b.st.Log = append(b.st.Log, e)
-	b.archive(LogEntry{Entry: e})
+	b.archive(&LogEntry{Entry: e})
 	if len(b.st.Log) > logCap {
 		b.st.Log = b.st.Log[len(b.st.Log)-logCap:]
 	}
@@ -576,7 +635,7 @@ type streamEvent struct {
 func runClaude(claude, dir, prompt string) (status, text string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, claude, "-p", prompt, "--permission-mode", "auto", "--output-format", "stream-json", "--verbose")
+	cmd := exec.CommandContext(ctx, claude, "-p", prompt, "--permission-mode", "auto", "--output-format", "stream-json", "--verbose") //nolint:gosec // claude is BOARD_CLAUDE, the service's own setting
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "BRIEF_BOARD=1")
 	// Own process group, so a timeout also kills its hooks and MCP servers.
@@ -626,7 +685,7 @@ func main() {
 	home, _ := os.UserHomeDir()
 	addr := env("BOARD_ADDR", ":8787")
 	b := &Board{
-		path:     env("BOARD_STATE", filepath.Join(home, ".local/state/brief-board/state.json")),
+		path:     env("BOARD_STATE", filepath.Join(home, ".local", "state", "brief-board", "state.json")),
 		workdir:  env("BOARD_WORKDIR", home),
 		home:     home,
 		projects: env("BOARD_PROJECTS", filepath.Join(home, "dev")),
@@ -642,24 +701,8 @@ func main() {
 		log.Fatalf("load %s: %v", b.path, err)
 	}
 	b.logDir = filepath.Join(filepath.Dir(b.path), "log")
-	// First start with week files: seed them from the history state.json already holds.
-	if _, err := os.Stat(b.logDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(b.logDir, 0o700); err != nil {
-			log.Fatal(err)
-		}
-		var all []LogEntry
-		for _, t := range b.st.Tasks {
-			for _, e := range t.History {
-				all = append(all, LogEntry{Entry: e, Task: t.ID, Title: t.Title})
-			}
-		}
-		for _, e := range b.st.Log {
-			all = append(all, LogEntry{Entry: e})
-		}
-		sort.Slice(all, func(i, j int) bool { return all[i].At.Before(all[j].At) })
-		for _, e := range all {
-			b.archive(e)
-		}
+	if err := b.seedLog(); err != nil {
+		log.Fatal(err)
 	}
 	// A restart kills running headless jobs; don't leave them looking alive. Sessions live on in wezterm.
 	for _, t := range b.st.Tasks {
@@ -671,13 +714,13 @@ func main() {
 	if b.st.BriefRun != nil && b.st.BriefRun.Status == "running" {
 		b.st.BriefRun.Status = "failed"
 	}
-	b.save()
+	b.saveOrLog()
 
 	// BOARD_JIRA_ROOM: the kith room the Jira bot posts in; BOARD_ISSUE_KEY: the key pattern in it.
 	if room := os.Getenv("BOARD_JIRA_ROOM"); room != "" {
 		every := cmp.Or(envDuration("BOARD_JIRA_POLL"), 2*time.Minute)
 		go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), room, regexp.MustCompile(env("BOARD_ISSUE_KEY", `\b[A-Z][A-Z0-9]+-\d+\b`)), every)
-		log.Printf("watching %s for Jira updates every %s", room, every)
+		log.Printf("watching %q for Jira updates every %s", room, every) //nolint:gosec // room is the service's own setting, quoted
 	}
 	if every := envDuration("BOARD_BRIEF_EVERY"); every > 0 {
 		go b.scheduleBrief(every)
@@ -687,7 +730,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(indexHTML)
+		if _, err := w.Write(indexHTML); err != nil {
+			log.Printf("index: %v", err)
+		}
 	})
 	mux.HandleFunc("GET /api/state", b.handleState)
 	mux.HandleFunc("GET /api/log", b.handleLog)
@@ -696,5 +741,30 @@ func main() {
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
 	log.Printf("brief-board on %s, state %s, claude runs in %s", addr, b.path, b.workdir)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	log.Fatal(srv.ListenAndServe())
+}
+
+// seedLog creates the week files on their first start, from the history state.json already holds.
+func (b *Board) seedLog() error {
+	if _, err := os.Stat(b.logDir); !os.IsNotExist(err) {
+		return nil
+	}
+	if err := os.MkdirAll(b.logDir, 0o700); err != nil {
+		return fmt.Errorf("seedLog: %w", err)
+	}
+	var all []LogEntry
+	for _, t := range b.st.Tasks {
+		for _, e := range t.History {
+			all = append(all, LogEntry{Entry: e, Task: t.ID, Title: t.Title})
+		}
+	}
+	for _, e := range b.st.Log {
+		all = append(all, LogEntry{Entry: e})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].At.Before(all[j].At) })
+	for i := range all {
+		b.archive(&all[i])
+	}
+	return nil
 }

@@ -9,10 +9,10 @@ set -euo pipefail
 
 MODULE="brief-board"
 PROFILE="${1:-coverage.out}"
-# A little under the current figure (7.4%, one package): catch a slide, not noise.
+# A little under the current figure (11.7%, one package): catch a slide, not noise.
 # Raise it as tests land.
-TOTAL_MIN="${TOTAL_MIN:-5}"
-PKG_MIN="${PKG_MIN:-5}"
+TOTAL_MIN="${TOTAL_MIN:-10}"
+PKG_MIN="${PKG_MIN:-10}"
 
 # Generated code is excluded from the gated total (none today).
 GENERATED_RE='\.pb\.go'

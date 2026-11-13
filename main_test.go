@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -59,4 +61,27 @@ func TestKithBack(t *testing.T) {
 		t.Error("a brief from during the outage was not re-run")
 	}
 	b.kithBack(lastOK) // a second nudge must not block on the full channel
+}
+
+func TestMergePatch(t *testing.T) {
+	cur := &Task{ID: "a", Title: "old", Status: "todo", JiraStatus: map[string]string{"X-1": "Open", "X-2": "Open"}}
+	next, err := mergePatch(cur, map[string]json.RawMessage{
+		"title":      json.RawMessage(`"new"`),
+		"jiraStatus": json.RawMessage(`{"X-2": "Done"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.Title != "new" || next.Status != "todo" {
+		t.Errorf("fields: got title %q status %q", next.Title, next.Status)
+	}
+	if want := map[string]string{"X-1": "Open", "X-2": "Done"}; !maps.Equal(next.JiraStatus, want) {
+		t.Errorf("jiraStatus = %v, want %v (merged per key)", next.JiraStatus, want)
+	}
+	if _, err := mergePatch(&Task{}, map[string]json.RawMessage{"jiraStatus": json.RawMessage(`{"X-1": "Done"}`)}); err != nil {
+		t.Errorf("a task with no jiraStatus yet: %v", err)
+	}
+	if _, err := mergePatch(cur, map[string]json.RawMessage{"jiraStatus": json.RawMessage(`"Done"`)}); err == nil {
+		t.Error("a jiraStatus that is not a map was accepted")
+	}
 }
