@@ -1,8 +1,9 @@
-// brief-board serves the daily brief as a task board and runs headless Claude Code
-// on a task when a button is pressed (reply, clarify, act). Drop is handled here.
+// brief-board serves the daily brief as a task board and opens an interactive Claude Code session
+// (wezterm mux, remote control) on a task when a button is pressed (reply, clarify, act). Drop is handled here.
 //
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
-// BOARD_WORKDIR (where claude runs), BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
+// BOARD_WORKDIR (where work sessions run), BOARD_PROJECTS (~/dev: each subfolder but work is a project area),
+// BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page).
 // Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
 package main
@@ -50,13 +51,17 @@ type Job struct {
 	Status    string     `json:"status"` // running | ok | failed
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
+	Session   string     `json:"session,omitempty"` // button jobs: the Claude session's name, for remote control
+	Pane      string     `json:"pane,omitempty"`    // button jobs: its wezterm pane id
 }
 
 type Task struct {
 	ID         string              `json:"id"`
 	Title      string              `json:"title"`
-	Group      string              `json:"group"`  // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
-	Status     string              `json:"status"` // todo | doing | waiting | done | dropped
+	Group      string              `json:"group"`            // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
+	Status     string              `json:"status"`           // todo | doing | waiting | done | dropped
+	Area       string              `json:"area,omitempty"`   // work (default) | personal | a project: a folder name under BOARD_PROJECTS
+	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats)
 	Who        string              `json:"who,omitempty"`
 	Since      string              `json:"since,omitempty"`
 	Order      int                 `json:"order,omitempty"`
@@ -85,14 +90,49 @@ type State struct {
 const logCap = 200
 
 type Board struct {
-	mu      sync.Mutex
-	path    string
-	logDir  string
-	st      State
-	workdir string
-	claude  string
-	selfURL string
-	triage  chan struct{} // one Jira triage at a time
+	mu       sync.Mutex
+	path     string
+	logDir   string
+	st       State
+	workdir  string
+	home     string
+	projects string // folder whose subfolders are the project areas
+	claude   string
+	selfURL  string
+	triage   chan struct{} // one Jira triage at a time
+	wake     chan struct{} // nudges scheduleBrief out of its sleep
+	rerun    bool          // a brief ran while kith was down: run it again now
+}
+
+// areaRe keeps an area a plain folder name, since it picks the folder a session runs in.
+var areaRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
+
+// projectAreas lists the project areas: the folders under b.projects, except work.
+func (b *Board) projectAreas() []string {
+	entries, _ := os.ReadDir(b.projects)
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() && e.Name() != "work" && areaRe.MatchString(e.Name()) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+// dirFor is where a session on t runs: the work repo, home for personal, or the project's folder.
+func (b *Board) dirFor(t *Task) string {
+	switch t.Area {
+	case "", "work":
+		return b.workdir
+	case "personal":
+		return b.home
+	}
+	// The area is a plain folder name: handleUpsert checks it against areaRe.
+	dir := filepath.Join(b.projects, t.Area)
+	if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+		return dir
+	}
+	return b.home
 }
 
 func env(k, def string) string {
@@ -216,7 +256,7 @@ func (b *Board) handleState(w http.ResponseWriter, r *http.Request) {
 		return tasks[i].Order < tasks[j].Order || tasks[i].Order == tasks[j].Order && tasks[i].ID < tasks[j].ID
 	})
 	writeJSON(w, 200, map[string]any{"brief": b.st.Brief, "tasks": tasks, "log": b.st.Log, "briefRun": b.st.BriefRun,
-		"config": map[string]string{"issue": os.Getenv("BOARD_ISSUE_URL"), "pr": os.Getenv("BOARD_PR_URL")}})
+		"config": map[string]any{"issue": os.Getenv("BOARD_ISSUE_URL"), "pr": os.Getenv("BOARD_PR_URL"), "projects": b.projectAreas()}})
 }
 
 func (b *Board) handleBrief(w http.ResponseWriter, r *http.Request) {
@@ -281,6 +321,16 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	if next.Area != "" && !areaRe.MatchString(next.Area) {
+		writeJSON(w, 400, map[string]string{"error": "area: want work, personal or a project folder name"})
+		return
+	}
+	if !ok && r.URL.Query().Get("actor") == "eugene" {
+		b.note(&next, "eugene", "created", "Added on the board.")
+	}
+	if ok && next.Area != t.Area {
+		b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "claude"), "area", cmp.Or(t.Area, "work")+" → "+cmp.Or(next.Area, "work"))
+	}
 	if _, set := patch["status"]; set && next.Status != prevStatus {
 		setStatus(&next, next.Status)
 		if ok {
@@ -311,6 +361,11 @@ func (b *Board) handleNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b.note(t, e.Actor, e.Kind, e.Text)
+	// A session's report on its action ends the job; the session itself stays open.
+	if j := t.Job; j != nil && j.Status == "running" && j.Session != "" && e.Actor == "claude" && e.Kind == j.Action {
+		now := time.Now()
+		j.Status, j.EndedAt = "ok", &now
+	}
 	b.save()
 	writeJSON(w, 200, t)
 }
@@ -343,7 +398,7 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 400, map[string]string{"error": "qa needs one of this task's Jira keys"})
 			return
 		}
-		if t.Job != nil && t.Job.Status == "running" {
+		if b.busy(t) {
 			writeJSON(w, 409, map[string]string{"error": "Claude is already working on this task"})
 			return
 		}
@@ -369,10 +424,12 @@ const actionRules = `What each action means:
   (task.thread names the room, reply_to and thread when known; otherwise find the message with kith-mcp).
   Write in that room's language and in Eugene's voice. Send once: never retry inside the room's cooldown,
   and report exactly what kith answered, "sent" or "drafted". A Jira question gets a Jira comment instead.
+  An email (task.thread.email is its Gmail thread id) gets a Gmail draft reply in that thread, never a sent one.
 - clarify: get the missing information Eugene's guidance names. If only a person can answer it, ask them
   in the thread where the item came from and send it. Otherwise investigate (Jira, chat, code, public API) and answer it yourself.
-- act: do the task itself, as far as it can be done safely now. Follow the repo's CLAUDE.md, skills and memory
-  (branch from development, pre-PR checklist, PR review post). Never merge, push to main, deploy or touch prod data.
+- act: do the task itself, as far as it can be done safely now. Follow the CLAUDE.md, skills and memory of the
+  folder you run in, which the task's area picks (in the be repo: branch from development, pre-PR checklist, PR
+  review post). Never merge, push to main, deploy or touch prod data.
 - qa: the task is done but its Jira ticket is still before QA. Transition that one key to "QA - Staging"
   (read its transitions first). A sub-task that has no QA state goes straight to Done. Change nothing else, then
   record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.
@@ -400,16 +457,85 @@ func (b *Board) prompt(t *Task, req actRequest) string {
 	}
 	fmt.Fprintf(&sb, "\n%s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\"}'   # todo|doing|waiting|done|dropped\n"+
-		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n"+
-		"Your final message goes into the task's history as is: 2-4 plain lines saying what you did, what was sent or drafted, and links.\n",
+		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n",
 		actionRules, b.selfURL, t.ID)
+	if req.Action == "update" {
+		sb.WriteString("Your final message goes into the task's history as is: 2-4 plain lines saying what you did, what was sent or drafted, and links.\n")
+	} else {
+		fmt.Fprintf(&sb, "This is an interactive session Eugene may attach to and steer; the board does not see your final message. "+
+			"When the action is done, post your report once, 2-4 plain lines saying what you did, what was sent or drafted, and links; "+
+			"it goes into the task's history and marks the job finished:\n"+
+			"  jq -n --arg text '...' '{actor: \"claude\", kind: \"%[3]s\", text: $text}' | curl -s -X POST %[1]s/api/tasks/%[2]s/notes -H 'Content-Type: application/json' -d @-\n"+
+			"Then stay open for Eugene.\n", b.selfURL, t.ID, req.Action)
+	}
 	return sb.String()
 }
 
-// start runs Claude on t in the background; callers hold mu.
+// start runs Claude on t; callers hold mu. A Jira update runs headless; a button press gets its own
+// interactive session in the wezterm mux server, which outlives a board restart and can be attached to.
 func (b *Board) start(t *Task, req actRequest) {
 	t.Job = &Job{Action: req.Action, Status: "running", StartedAt: time.Now()}
-	go b.run(t.ID, req.Action, b.prompt(t, req))
+	if req.Action == "update" {
+		go b.run(t.ID, req.Action, b.prompt(t, req))
+		return
+	}
+	t.Job.Session = t.ID + "-" + req.Action
+	pane, err := spawnSession(b.claude, b.dirFor(t), t.Job.Session, b.prompt(t, req))
+	if err != nil {
+		now := time.Now()
+		t.Job.Status, t.Job.EndedAt = "failed", &now
+		b.note(t, "claude", req.Action, "Could not start a session: "+err.Error())
+		return
+	}
+	t.Job.Pane = pane
+	b.note(t, "claude", "session", fmt.Sprintf("Started session %q in wezterm pane %s: attach in wezterm, or on claude.ai/code (remote control).", t.Job.Session, pane))
+}
+
+// spawnSession opens an interactive Claude Code session in a new wezterm mux window and returns its pane id.
+// The pane closes when Claude exits, so a live pane means a live session.
+func spawnSession(claude, dir, name, prompt string) (string, error) {
+	// zsh -lic gives the session the user's login env; the mux server's own PATH is bare.
+	out, err := exec.Command("wezterm", "cli", "spawn", "--new-window", "--cwd", dir, "--",
+		"zsh", "-lic", `exec "$0" "$@"`, claude, "--permission-mode", "auto", "--remote-control", name, "-n", name, prompt).Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			err = fmt.Errorf("%w: %s", err, strings.TrimSpace(string(ee.Stderr)))
+		}
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// paneAlive reports whether the wezterm mux still has pane; if the mux can't be asked, it assumes yes.
+func paneAlive(pane string) bool {
+	out, err := exec.Command("wezterm", "cli", "list", "--format", "json").Output()
+	var panes []struct {
+		PaneID int `json:"pane_id"`
+	}
+	if err != nil || json.Unmarshal(out, &panes) != nil {
+		return true
+	}
+	for _, p := range panes {
+		if fmt.Sprint(p.PaneID) == pane {
+			return true
+		}
+	}
+	return false
+}
+
+// busy reports whether t has a job still running; a session whose pane is gone ended without reporting,
+// and is marked failed so the buttons work again. Callers hold mu.
+func (b *Board) busy(t *Task) bool {
+	if t.Job == nil || t.Job.Status != "running" {
+		return false
+	}
+	if t.Job.Pane == "" || paneAlive(t.Job.Pane) {
+		return true
+	}
+	now := time.Now()
+	t.Job.Status, t.Job.EndedAt = "failed", &now
+	b.note(t, "claude", t.Job.Action, fmt.Sprintf("Session %q ended without reporting back.", t.Job.Session))
+	return false
 }
 
 func (b *Board) logf(kind, format string, args ...any) {
@@ -500,11 +626,14 @@ func main() {
 	home, _ := os.UserHomeDir()
 	addr := env("BOARD_ADDR", ":8787")
 	b := &Board{
-		path:    env("BOARD_STATE", filepath.Join(home, ".local/state/brief-board/state.json")),
-		workdir: env("BOARD_WORKDIR", home),
-		claude:  env("BOARD_CLAUDE", "claude"),
-		selfURL: env("BOARD_URL", "http://localhost"+addr),
-		triage:  make(chan struct{}, 1),
+		path:     env("BOARD_STATE", filepath.Join(home, ".local/state/brief-board/state.json")),
+		workdir:  env("BOARD_WORKDIR", home),
+		home:     home,
+		projects: env("BOARD_PROJECTS", filepath.Join(home, "dev")),
+		claude:   env("BOARD_CLAUDE", "claude"),
+		selfURL:  env("BOARD_URL", "http://localhost"+addr),
+		triage:   make(chan struct{}, 1),
+		wake:     make(chan struct{}, 1),
 	}
 	if err := os.MkdirAll(filepath.Dir(b.path), 0o700); err != nil {
 		log.Fatal(err)
@@ -532,9 +661,9 @@ func main() {
 			b.archive(e)
 		}
 	}
-	// A restart kills running jobs; don't leave them looking alive.
+	// A restart kills running headless jobs; don't leave them looking alive. Sessions live on in wezterm.
 	for _, t := range b.st.Tasks {
-		if t.Job != nil && t.Job.Status == "running" {
+		if t.Job != nil && t.Job.Status == "running" && t.Job.Session == "" {
 			t.Job.Status = "failed"
 			b.note(t, "claude", t.Job.Action, "Interrupted: the board restarted while this was running.")
 		}

@@ -97,12 +97,38 @@ type feedMessage struct {
 
 // watchJira polls the Jira feed room and hands each new update to Claude, per ticket.
 func (b *Board) watchJira(server, room string, keyRe *regexp.Regexp, every time.Duration) {
+	var lastOK time.Time
+	failing := false
 	for {
 		if err := b.pollJira(server, room, keyRe); err != nil {
 			log.Printf("jira feed: %v", err)
+			failing = true
+		} else {
+			if failing {
+				b.kithBack(lastOK)
+			}
+			failing, lastOK = false, time.Now()
 		}
 		time.Sleep(every)
 	}
+}
+
+// kithBack runs when kith reads work again (keyring unlocked, kithd back). A brief that started
+// after the last good read may have run without chat, so it asks scheduleBrief to run it again.
+func (b *Board) kithBack(lastOK time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.lastBrief().After(lastOK) {
+		return false
+	}
+	b.rerun = true
+	b.logf("kith", "kith reads work again; re-running the brief that ran while it was down")
+	b.save()
+	select {
+	case b.wake <- struct{}{}:
+	default:
+	}
+	return true
 }
 
 func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
@@ -146,7 +172,7 @@ func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
 			}
 			tracked = true
 			b.note(t, "jira", "update", update)
-			if t.Job == nil || t.Job.Status != "running" {
+			if !b.busy(t) {
 				b.start(t, actRequest{Action: "update", Comment: update})
 			}
 		}
@@ -182,8 +208,9 @@ func (b *Board) scheduleBrief(every time.Duration) {
 	for {
 		b.mu.Lock()
 		last := b.lastBrief()
-		due := time.Since(last) >= every && (b.st.BriefRun == nil || b.st.BriefRun.Status != "running")
+		due := (time.Since(last) >= every || b.rerun) && (b.st.BriefRun == nil || b.st.BriefRun.Status != "running")
 		if due {
+			b.rerun = false
 			b.st.BriefRun = &Job{Action: "brief", Status: "running", StartedAt: time.Now()}
 			b.save()
 		}
@@ -198,8 +225,19 @@ Your final message is the brief's opening paragraph.`)
 			b.logf("brief", "%s: %s", status, text)
 			b.save()
 			b.mu.Unlock()
+
+			// Mail, calendar and personal chats: a global skill, so it runs from home, not the work repo.
+			status, text = runClaude(b.claude, b.home, `Use the sweep skill. This is a scheduled run from the Brief Board and nobody is watching:
+sync the board, but take no actions and send nothing. Your final message is one line: what changed on the board.`)
+			b.mu.Lock()
+			b.logf("sweep", "%s: %s", status, text)
+			b.save()
+			b.mu.Unlock()
 		}
-		time.Sleep(10 * time.Minute)
+		select {
+		case <-b.wake:
+		case <-time.After(10 * time.Minute):
+		}
 	}
 }
 
