@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -258,6 +260,87 @@ func TestPullsDone(t *testing.T) {
 	} {
 		if got := pullsDone(c.pulls); got != c.want {
 			t.Errorf("pullsDone(%v) = %v, want %v", c.pulls, got, c.want)
+		}
+	}
+}
+
+func TestPruneWorktree(t *testing.T) {
+	// Run as a git hook (pre-push), GIT_DIR and friends would point every git call at the real repo.
+	for _, kv := range os.Environ() {
+		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "GIT_") {
+			t.Setenv(k, "") // restores it after the test
+			if err := os.Unsetenv(k); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	for _, k := range []string{"GIT_AUTHOR", "GIT_COMMITTER"} {
+		t.Setenv(k+"_NAME", "t")
+		t.Setenv(k+"_EMAIL", "t@t")
+	}
+	run := func(dir string, args ...string) string {
+		t.Helper()
+		out, err := git(dir, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(out)
+	}
+	repo := t.TempDir()
+	run(repo, "init", "-q", "-b", "main")
+	run(repo, "commit", "-q", "--allow-empty", "-m", "init")
+	// tree makes .worktrees/name on branch name with one commit; its tip is the merged head.
+	tree := func(name string) (string, string) {
+		path := filepath.Join(repo, ".worktrees", name)
+		run(repo, "worktree", "add", "-q", path, "-b", name)
+		run(path, "commit", "-q", "--allow-empty", "-m", name)
+		return path, run(path, "rev-parse", "HEAD")
+	}
+
+	path, sha := tree("merged")
+	if got, err := pruneWorktree(repo, "merged", sha); err != nil || got != "removed .worktrees/merged and branch merged, merged" {
+		t.Errorf("merged: %q, %v", got, err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("merged worktree still there: %v", err)
+	}
+	if _, err := git(repo, "rev-parse", "--verify", "refs/heads/merged"); err == nil {
+		t.Error("merged branch still there")
+	}
+
+	path, sha = tree("dirty")
+	if err := os.WriteFile(filepath.Join(path, "new.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ahead, aheadSHA := tree("ahead")
+	run(ahead, "commit", "-q", "--allow-empty", "-m", "after the merge")
+	locked, lockedSHA := tree("locked")
+	run(repo, "worktree", "lock", locked)
+	busy, busySHA := tree("busy")
+	sleep := exec.CommandContext(t.Context(), "sleep", "30")
+	sleep.Dir = busy
+	if err := sleep.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sleep.Process.Kill(); _ = sleep.Wait() }()
+
+	for _, c := range []struct{ branch, sha, want string }{
+		{"dirty", sha, "kept .worktrees/dirty: it has uncommitted changes"},
+		{"ahead", aheadSHA, "kept .worktrees/ahead: ahead has moved on from the merged head"},
+		{"locked", lockedSHA, "kept .worktrees/locked: it is locked"},
+		{"busy", busySHA, "kept .worktrees/busy: a process (a session?) is running in it"},
+		{"main", "", ""}, // the main checkout is never one
+		{"nowhere", "", ""},
+	} {
+		if got, err := pruneWorktree(repo, c.branch, c.sha); err != nil || got != c.want {
+			t.Errorf("%s: %q, %v; want %q", c.branch, got, err, c.want)
+		}
+	}
+	for _, p := range []string{path, ahead, locked, busy} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("kept worktree gone: %v", err)
 		}
 	}
 }

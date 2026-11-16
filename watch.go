@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -396,11 +397,15 @@ func taskPulls(t *Task) []string {
 	return pulls
 }
 
-// ghPull is the part of a pull request settleMerged reads.
+// ghPull is the part of a pull request settleMerged and pruneMerged read.
 type ghPull struct {
 	State    string `json:"state"` // open | closed
 	Merged   bool   `json:"merged"`
 	ClosedAt string `json:"closed_at"`
+	Head     struct {
+		Ref string `json:"ref"`
+		SHA string `json:"sha"`
+	} `json:"head"`
 }
 
 // settleCheck is a task a notification reached through a pull request it links: that pull request's page.
@@ -436,8 +441,7 @@ func (b *Board) settleMerged(checks []settleCheck, since string) {
 		pulls := make([]ghPull, 0, len(pages))
 		fresh := false
 		for _, page := range pages {
-			api := strings.Replace(strings.Replace(page, "://github.com/", "://api.github.com/repos/", 1), "/pull/", "/pulls/", 1)
-			out, err := ghAPI(api)
+			out, err := ghAPI(ghAPIURL(page))
 			var p ghPull
 			if err == nil {
 				err = json.Unmarshal(out, &p)
@@ -457,10 +461,147 @@ func (b *Board) settleMerged(checks []settleCheck, since string) {
 		if t := b.st.Tasks[c.id]; t != nil && t.Status != "done" && t.Status != "dropped" {
 			b.note(t, "github", "status", t.Status+" → done: its pull requests are merged or closed")
 			setStatus(t, "done")
+			b.doneNow(t)
 			b.saveOrLog()
 		}
 		b.mu.Unlock()
 	}
+}
+
+// doneNow is t moving to done: with BOARD_PRUNE_WORKTREES, the worktrees of its merged pull
+// requests go (see pruneMerged); callers hold mu.
+func (b *Board) doneNow(t *Task) {
+	if pages := taskPulls(t); b.prune && len(pages) > 0 {
+		go b.pruneMerged(t.ID, b.dirFor(t), pages)
+	}
+}
+
+// pruneMerged runs pruneWorktree in dir for each merged pull request of pages and notes what it did on task id.
+func (b *Board) pruneMerged(id, dir string, pages []string) {
+	for _, page := range pages {
+		out, err := ghAPI(ghAPIURL(page))
+		var p ghPull
+		if err == nil {
+			err = json.Unmarshal(out, &p)
+		}
+		if err != nil {
+			log.Printf("github: prune %s: %v", id, err)
+			continue
+		}
+		if !p.Merged {
+			continue
+		}
+		text, err := pruneWorktree(dir, p.Head.Ref, p.Head.SHA)
+		if err != nil {
+			log.Printf("github: prune %s: %v", id, err)
+		}
+		if text == "" {
+			continue
+		}
+		b.mu.Lock()
+		if t := b.st.Tasks[id]; t != nil {
+			b.note(t, "board", "worktree", text)
+			b.saveOrLog()
+		}
+		b.mu.Unlock()
+	}
+}
+
+// pruneWorktree removes branch's worktree from dir/.worktrees/, and then branch, only when nothing in it
+// can be lost or is in use: it is still at sha (the merged head), has nothing uncommitted, isn't locked and
+// no process runs in it. It returns what it did for the task's history, "" when no worktree there has branch.
+func pruneWorktree(dir, branch, sha string) (string, error) {
+	dir, err := filepath.EvalSymlinks(dir) // git lists real paths
+	if err != nil {
+		return "", fmt.Errorf("pruneWorktree: %w", err)
+	}
+	path, head, locked, err := worktreeOf(dir, branch)
+	if path == "" || err != nil {
+		return "", err
+	}
+	name := ".worktrees/" + filepath.Base(path)
+	status, err := git(path, "status", "--porcelain")
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("pruneWorktree: %w", err)
+	case locked:
+		return "kept " + name + ": it is locked", nil
+	case head != sha:
+		return "kept " + name + ": " + branch + " has moved on from the merged head", nil
+	case status != "":
+		return "kept " + name + ": it has uncommitted changes", nil
+	case inUse(path):
+		return "kept " + name + ": a process (a session?) is running in it", nil
+	}
+	// No --force: git refuses anything it would lose, should that change since the checks.
+	if _, err := git(dir, "worktree", "remove", path); err != nil {
+		return "", fmt.Errorf("pruneWorktree: %w", err)
+	}
+	if _, err := git(dir, "branch", "-D", branch); err != nil {
+		return "removed " + name + ", merged; kept branch " + branch, fmt.Errorf("pruneWorktree: %w", err)
+	}
+	return "removed " + name + " and branch " + branch + ", merged", nil
+}
+
+// worktreeOf is the worktree directly in dir/.worktrees/ that has branch checked out: its path ("" when
+// there is none), its HEAD and whether it is locked.
+func worktreeOf(dir, branch string) (path, head string, locked bool, err error) {
+	list, err := git(dir, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", "", false, fmt.Errorf("worktreeOf: %w", err)
+	}
+	for block := range strings.SplitSeq(list, "\n\n") {
+		path, head, locked = "", "", false
+		on := false
+		for line := range strings.SplitSeq(block, "\n") {
+			k, v, _ := strings.Cut(line, " ")
+			switch k {
+			case "worktree":
+				path = v
+			case "HEAD":
+				head = v
+			case "branch":
+				on = v == "refs/heads/"+branch
+			case "locked":
+				locked = true
+			}
+		}
+		if on && filepath.Dir(path) == filepath.Join(dir, ".worktrees") {
+			return path, head, locked, nil
+		}
+	}
+	return "", "", false, nil
+}
+
+// inUse is whether some process's working folder is path or inside it; true when /proc can't tell.
+func inUse(path string) bool {
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return true
+	}
+	for _, p := range procs {
+		cwd, err := os.Readlink("/proc/" + p.Name() + "/cwd")
+		if err == nil && (cwd == path || strings.HasPrefix(cwd, path+"/")) {
+			return true
+		}
+	}
+	return false
+}
+
+// git is git's output for args, run in dir; what it printed comes back on an error.
+func git(dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...).CombinedOutput() //nolint:gosec // argv, no shell; the board's own folders and GitHub's branch names
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+// ghAPIURL is the API url of a github.com page: github.com/o/r/pull/7 -> .../repos/o/r/pulls/7.
+func ghAPIURL(page string) string {
+	return strings.Replace(strings.Replace(page, "://github.com/", "://api.github.com/repos/", 1), "/pull/", "/pulls/", 1)
 }
 
 // ghNotifications reads every page of a notifications query.

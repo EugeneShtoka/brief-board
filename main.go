@@ -7,7 +7,8 @@
 // BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
 // BOARD_SESSION_IN (tab | window: a wezterm session's new tab in the window last used, or its own window),
-// BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page).
+// BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page),
+// BOARD_PRUNE_WORKTREES (1: a task moving to done removes its merged pull requests' worktrees, see pruneWorktree).
 // Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
 package main
 
@@ -117,6 +118,7 @@ type Board struct {
 	wake     chan struct{} // nudges scheduleBrief out of its sleep
 	rerun    bool          // a brief ran while kith was down: run it again now
 	ghETag   string        // pollGitHub's own: the ETag of its last notifications answer
+	prune    bool          // BOARD_PRUNE_WORKTREES
 }
 
 // areaRe keeps an area a plain folder name, since it picks the folder a session runs in.
@@ -409,6 +411,9 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			// ?actor=eugene marks a drag on the board; the brief's writes leave it unset.
 			b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "claude"), "status", prevStatus+" → "+next.Status)
+		}
+		if next.Status == "done" {
+			b.doneNow(&next)
 		}
 	}
 	next.UpdatedAt = time.Now()
@@ -876,6 +881,7 @@ func main() {
 		claude:   env("BOARD_CLAUDE", "claude"),
 		terminal: strings.Fields(os.Getenv("BOARD_TERMINAL")),
 		window:   os.Getenv("BOARD_SESSION_IN") == "window",
+		prune:    os.Getenv("BOARD_PRUNE_WORKTREES") == "1",
 		selfURL:  env("BOARD_URL", "http://localhost"+addr),
 		triage:   make(chan struct{}, 1),
 		wake:     make(chan struct{}, 1),
