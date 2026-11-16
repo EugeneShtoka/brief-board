@@ -138,7 +138,7 @@ type Area struct {
 }
 
 // parseAreas reads BOARD_AREAS, a JSON list of areas. A missing name is the id; a missing dir is the work dir
-// for work, home for personal, else the id's folder under BOARD_PROJECTS; "~/" starts a dir at home.
+// for work, home for personal, else the id's folder under BOARD_PROJECTS; a dir of "~" or "~/..." is at home.
 func (b *Board) parseAreas(conf string) ([]Area, error) {
 	var areas []Area
 	if err := json.Unmarshal([]byte(conf), &areas); err != nil {
@@ -152,8 +152,8 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		}
 		seen[a.ID] = true
 		a.Name = cmp.Or(a.Name, a.ID)
-		if rest, ok := strings.CutPrefix(a.Dir, "~/"); ok {
-			a.Dir = filepath.Join(b.home, rest)
+		if a.Dir == "~" || strings.HasPrefix(a.Dir, "~/") {
+			a.Dir = filepath.Join(b.home, a.Dir[1:])
 		}
 		a.Dir = cmp.Or(a.Dir, b.defaultDir(a.ID))
 	}

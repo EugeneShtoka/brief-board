@@ -61,7 +61,7 @@ func TestDirFor(t *testing.T) {
 func TestParseAreas(t *testing.T) {
 	projects := t.TempDir()
 	b := &Board{workdir: "/work", home: "/home", projects: projects}
-	areas, err := b.parseAreas(`[{"id": "work", "name": "Work"}, {"id": "kith", "name": "Kith", "dir": "~/src/kith"}, {"id": "nixos"}, {"id": "personal", "name": "Personal"}]`)
+	areas, err := b.parseAreas(`[{"id": "work", "name": "Work"}, {"id": "kith", "name": "Kith", "dir": "~/src/kith"}, {"id": "nixos"}, {"id": "personal", "name": "Personal", "dir": "~"}]`)
 	if err != nil {
 		t.Fatal(err)
 	}
