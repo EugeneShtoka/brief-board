@@ -41,7 +41,7 @@ func TestAreas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work}, {"kith", "Kith", kith}, {"nixos", "nixos", "/home/dev/nixos"}, {"personal", "Personal", "/home"}}
+	want := []Area{{"work", "Work", work, ""}, {"kith", "Kith", kith, ""}, {"nixos", "nixos", "/home/dev/nixos", ""}, {"personal", "Personal", "/home", ""}}
 	if !slices.Equal(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
@@ -141,7 +141,7 @@ func TestMergePatch(t *testing.T) {
 
 func TestHandleUpsertLevels(t *testing.T) {
 	dir := t.TempDir()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{"work", "Work", dir}}}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{"work", "Work", dir, ""}}}
 	b.st.Tasks = map[string]*Task{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)

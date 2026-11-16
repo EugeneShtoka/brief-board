@@ -2,8 +2,8 @@
 // (wezterm mux, remote control) on a task when a button is pressed (reply, clarify, act). Drop is handled here.
 //
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
-// BOARD_AREAS (required: a JSON list of {"id", "name", "dir"}, the board's areas and the folders their sessions run in;
-// work's is also where the brief and triage run),
+// BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "jiraRoom"}, the board's areas and the folders their
+// sessions run in; work's is also where the brief runs; jiraRoom: the kith room the area's Jira bot posts in, see watchJira),
 // BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
@@ -98,8 +98,8 @@ type State struct {
 	Tasks map[string]*Task `json:"tasks"`
 	// Log is board-level activity (Jira triage, scheduled briefs), newest last, capped at logCap.
 	Log []Entry `json:"log,omitempty"`
-	// JiraSeen is the event ids of the Jira feed's last read; nil until the first read sets a baseline.
-	JiraSeen []string `json:"jiraSeen,omitempty"`
+	// JiraSeen is, per Jira feed room, the event ids of its last read; a room with none yet sets a baseline.
+	JiraSeen map[string][]string `json:"jiraSeenIn,omitempty"`
 	// GitHubSince is the newest GitHub notification's updated_at seen; empty until the first poll sets a baseline.
 	GitHubSince string `json:"githubSince,omitempty"`
 	BriefRun    *Job   `json:"briefRun,omitempty"`
@@ -129,11 +129,13 @@ type Board struct {
 // areaRe keeps an area id a plain lowercase name.
 var areaRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
-// Area is one area of the board: its id (what a task stores), the name the page shows, and the folder its sessions run in.
+// Area is one area of the board: its id (what a task stores), the name the page shows, the folder its sessions run in,
+// and the kith room its Jira bot posts in, if it has a Jira.
 type Area struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Dir  string `json:"dir"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Dir      string `json:"dir"`
+	JiraRoom string `json:"jiraRoom,omitempty"`
 }
 
 // parseAreas reads BOARD_AREAS, a JSON list of areas, each with its folder; work is required, since tasks from
@@ -187,7 +189,7 @@ func env(k, def string) string {
 }
 
 func (b *Board) load() error {
-	b.st = State{Brief: map[string]any{}, Tasks: map[string]*Task{}}
+	b.st = State{Brief: map[string]any{}, Tasks: map[string]*Task{}, JiraSeen: map[string][]string{}}
 	data, err := os.ReadFile(b.path)
 	if os.IsNotExist(err) {
 		return nil
@@ -956,12 +958,14 @@ func main() {
 		}
 	}()
 
-	// BOARD_JIRA_ROOM: the kith room the Jira bot posts in; BOARD_ISSUE_KEY: the key pattern in it.
+	// BOARD_ISSUE_KEY: the key pattern in the Jira feeds (each area's jiraRoom) and GitHub notifications.
 	keyRe := regexp.MustCompile(env("BOARD_ISSUE_KEY", `\b[A-Z][A-Z0-9]+-\d+\b`))
-	if room := os.Getenv("BOARD_JIRA_ROOM"); room != "" {
-		every := cmp.Or(envDuration("BOARD_JIRA_POLL"), 2*time.Minute)
-		go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), room, keyRe, every)
-		log.Printf("watching %q for Jira updates every %s", room, every) //nolint:gosec // room is the service's own setting, quoted
+	for _, a := range b.areas {
+		if a.JiraRoom != "" {
+			every := cmp.Or(envDuration("BOARD_JIRA_POLL"), 2*time.Minute)
+			go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), a, keyRe, every)
+			log.Printf("watching %q for %s's Jira updates every %s", a.JiraRoom, a.ID, every)
+		}
 	}
 	// BOARD_GITHUB_POLL: how often to read GitHub notifications (via gh) onto the tasks they are about; unset is off.
 	go b.watchGitHub(keyRe, envDuration("BOARD_GITHUB_POLL"))
