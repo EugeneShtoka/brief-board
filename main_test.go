@@ -379,6 +379,27 @@ func TestTaskPulls(t *testing.T) {
 	}
 }
 
+func TestLinkPulls(t *testing.T) {
+	task := &Task{Links: []map[string]string{{"label": "PR #7", "url": "https://github.com/o/r/pull/7#discussion_r1"}}}
+	linkPulls(task, "Opened #9 https://github.com/o/r/pull/9, review on https://github.com/o/r/pull/7/files and https://github.com/o/r/pull/9.")
+	want := []map[string]string{task.Links[0], {"label": "PR #9", "url": "https://github.com/o/r/pull/9"}}
+	if !reflect.DeepEqual(task.Links, want) {
+		t.Errorf("links = %v, want %v", task.Links, want)
+	}
+}
+
+func TestEndsWithPulls(t *testing.T) {
+	for w, want := range map[string]bool{
+		"": true, "PR review": true, "PR #27 review": true, "pull request merge": true,
+		"prod deploy of release #1034, then re-time a finished match": false,
+		"Bar/Polina: OK to pay + #1024 re-review":                     false,
+	} {
+		if got := endsWithPulls(w); got != want {
+			t.Errorf("endsWithPulls(%q) = %v, want %v", w, got, want)
+		}
+	}
+}
+
 func TestPullsDone(t *testing.T) {
 	merged, closed, open := ghPull{State: "closed", Merged: true}, ghPull{State: "closed"}, ghPull{State: "open"}
 	for _, c := range []struct {
