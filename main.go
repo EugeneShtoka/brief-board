@@ -795,6 +795,20 @@ func runClaude(claude, dir, prompt string) (status, text string) {
 	return "failed", msg
 }
 
+// failInterrupted marks the headless jobs a restart killed as failed; don't leave them looking alive.
+// Sessions live on in their terminal.
+func (b *Board) failInterrupted() {
+	for _, t := range b.st.Tasks {
+		if t.Job != nil && t.Job.Status == "running" && t.Job.Session == "" {
+			t.Job.Status = "failed"
+			b.note(t, "claude", t.Job.Action, "Interrupted: the board restarted while this was running.")
+		}
+	}
+	if b.st.BriefRun != nil && b.st.BriefRun.Status == "running" {
+		b.st.BriefRun.Status = "failed"
+	}
+}
+
 func main() {
 	home, _ := os.UserHomeDir()
 	addr := env("BOARD_ADDR", ":8787")
@@ -820,16 +834,7 @@ func main() {
 	if err := b.seedLog(); err != nil {
 		log.Fatal(err)
 	}
-	// A restart kills running headless jobs; don't leave them looking alive. Sessions live on in wezterm.
-	for _, t := range b.st.Tasks {
-		if t.Job != nil && t.Job.Status == "running" && t.Job.Session == "" {
-			t.Job.Status = "failed"
-			b.note(t, "claude", t.Job.Action, "Interrupted: the board restarted while this was running.")
-		}
-	}
-	if b.st.BriefRun != nil && b.st.BriefRun.Status == "running" {
-		b.st.BriefRun.Status = "failed"
-	}
+	b.failInterrupted()
 	b.saveOrLog()
 
 	// BOARD_JIRA_ROOM: the kith room the Jira bot posts in; BOARD_ISSUE_KEY: the key pattern in it.
