@@ -69,6 +69,28 @@ func TestKithBack(t *testing.T) {
 	b.kithBack(lastOK) // a second nudge must not block on the full channel
 }
 
+func TestHandleBriefRun(t *testing.T) {
+	t.Setenv("BOARD_BRIEF_EVERY", "")
+	b := &Board{wake: make(chan struct{}, 1)}
+	run := func() int {
+		rec := httptest.NewRecorder()
+		b.handleBriefRun(rec, httptest.NewRequestWithContext(t.Context(), "POST", "/api/brief/run", nil))
+		return rec.Code
+	}
+	if code := run(); code != 409 || b.rerun {
+		t.Errorf("unscheduled: %d, rerun %v; want 409 and no run", code, b.rerun)
+	}
+	t.Setenv("BOARD_BRIEF_EVERY", "6h")
+	b.st.BriefRun = &Job{Status: "running"}
+	if code := run(); code != 409 || b.rerun {
+		t.Errorf("while running: %d, rerun %v; want 409 and no run", code, b.rerun)
+	}
+	b.st.BriefRun.Status = "ok"
+	if code := run(); code != 202 || !b.rerun || len(b.wake) != 1 {
+		t.Errorf("run: %d, rerun %v, wake %d; want 202 and a nudge", code, b.rerun, len(b.wake))
+	}
+}
+
 func TestMergePatch(t *testing.T) {
 	cur := &Task{ID: "a", Title: "old", Status: "todo", JiraStatus: map[string]string{"X-1": "Open", "X-2": "Open"}}
 	next, err := mergePatch(cur, map[string]json.RawMessage{

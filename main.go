@@ -313,6 +313,22 @@ func (b *Board) handleBrief(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, body)
 }
 
+// handleBriefRun runs the scheduled brief now, from the board's button.
+func (b *Board) handleBriefRun(w http.ResponseWriter, r *http.Request) {
+	if envDuration("BOARD_BRIEF_EVERY") <= 0 {
+		writeJSON(w, 409, map[string]string{"error": "the brief is not scheduled here (BOARD_BRIEF_EVERY)"})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.st.BriefRun != nil && b.st.BriefRun.Status == "running" {
+		writeJSON(w, 409, map[string]string{"error": "a brief is already running"})
+		return
+	}
+	b.briefNow()
+	writeJSON(w, 202, map[string]string{"status": "queued"})
+}
+
 // mergePatch returns t with patch's fields over it. jiraStatus merges per key, so updating one
 // ticket keeps the others.
 func mergePatch(t *Task, patch map[string]json.RawMessage) (Task, error) {
@@ -830,6 +846,25 @@ func (b *Board) failInterrupted() {
 	}
 }
 
+func (b *Board) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if _, err := w.Write(indexHTML); err != nil {
+			log.Printf("index: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /api/state", b.handleState)
+	mux.HandleFunc("GET /api/log", b.handleLog)
+	mux.HandleFunc("PUT /api/brief", b.handleBrief)
+	mux.HandleFunc("POST /api/brief/run", b.handleBriefRun)
+	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
+	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
+	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
+	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
+	return mux
+}
+
 func main() {
 	home, _ := os.UserHomeDir()
 	addr := env("BOARD_ADDR", ":8787")
@@ -877,22 +912,8 @@ func main() {
 		log.Printf("brief every %s", every)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		if _, err := w.Write(indexHTML); err != nil {
-			log.Printf("index: %v", err)
-		}
-	})
-	mux.HandleFunc("GET /api/state", b.handleState)
-	mux.HandleFunc("GET /api/log", b.handleLog)
-	mux.HandleFunc("PUT /api/brief", b.handleBrief)
-	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
-	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
-	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
-	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
 	log.Printf("brief-board on %s, state %s, claude runs in %s", addr, b.path, b.workdir)
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: addr, Handler: b.routes(), ReadHeaderTimeout: 10 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }
 
