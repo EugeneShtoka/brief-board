@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"testing"
 	"time"
@@ -178,5 +179,26 @@ func TestReapSessions(t *testing.T) {
 	}
 	if _, err := os.Stat(b.path); err != nil {
 		t.Errorf("reaping did not save: %v", err)
+	}
+}
+
+func TestGhTasks(t *testing.T) {
+	b := &Board{st: State{Tasks: map[string]*Task{
+		"pr":     {ID: "pr", Links: []map[string]string{{"url": "https://github.com/o/r/pull/7#discussion_r1"}}},
+		"jira":   {ID: "jira", Jira: []string{"TM-2"}},
+		"pr70":   {ID: "pr70", Links: []map[string]string{{"url": "https://github.com/o/r/pull/70"}}},
+		"other":  {ID: "other", Jira: []string{"TM-20"}},
+		"issue7": {ID: "issue7", Links: []map[string]string{{"url": "https://github.com/o/r/issues/7"}}},
+	}}}
+	n := &ghNotification{}
+	n.Subject.URL = "https://api.github.com/repos/o/r/pulls/7"
+	n.Subject.Title = "TM-2: fix it"
+	var ids []string
+	for _, t := range b.ghTasks(n, regexp.MustCompile(`\b[A-Z][A-Z0-9]+-\d+\b`)) {
+		ids = append(ids, t.ID)
+	}
+	slices.Sort(ids)
+	if want := []string{"jira", "pr"}; !slices.Equal(ids, want) {
+		t.Errorf("ghTasks = %v, want %v", ids, want)
 	}
 }

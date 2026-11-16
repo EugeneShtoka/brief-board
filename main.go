@@ -94,7 +94,9 @@ type State struct {
 	Log []Entry `json:"log,omitempty"`
 	// JiraSeen is the event ids of the Jira feed's last read; nil until the first read sets a baseline.
 	JiraSeen []string `json:"jiraSeen,omitempty"`
-	BriefRun *Job     `json:"briefRun,omitempty"`
+	// GitHubSince is the newest GitHub notification's updated_at seen; empty until the first poll sets a baseline.
+	GitHubSince string `json:"githubSince,omitempty"`
+	BriefRun    *Job   `json:"briefRun,omitempty"`
 }
 
 const logCap = 200
@@ -861,11 +863,14 @@ func main() {
 	}()
 
 	// BOARD_JIRA_ROOM: the kith room the Jira bot posts in; BOARD_ISSUE_KEY: the key pattern in it.
+	keyRe := regexp.MustCompile(env("BOARD_ISSUE_KEY", `\b[A-Z][A-Z0-9]+-\d+\b`))
 	if room := os.Getenv("BOARD_JIRA_ROOM"); room != "" {
 		every := cmp.Or(envDuration("BOARD_JIRA_POLL"), 2*time.Minute)
-		go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), room, regexp.MustCompile(env("BOARD_ISSUE_KEY", `\b[A-Z][A-Z0-9]+-\d+\b`)), every)
+		go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), room, keyRe, every)
 		log.Printf("watching %q for Jira updates every %s", room, every) //nolint:gosec // room is the service's own setting, quoted
 	}
+	// BOARD_GITHUB_POLL: how often to read GitHub notifications (via gh) onto the tasks they are about; unset is off.
+	go b.watchGitHub(keyRe, envDuration("BOARD_GITHUB_POLL"))
 	if every := envDuration("BOARD_BRIEF_EVERY"); every > 0 {
 		go b.scheduleBrief(every)
 		log.Printf("brief every %s", every)

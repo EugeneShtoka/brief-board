@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -279,6 +280,148 @@ func (b *Board) lastBrief() time.Time {
 		}
 	}
 	return last
+}
+
+// ghNotification is the part of a GitHub notification the board reads.
+type ghNotification struct {
+	Reason    string `json:"reason"`
+	UpdatedAt string `json:"updated_at"`
+	Subject   struct {
+		Title            string `json:"title"`
+		URL              string `json:"url"`
+		LatestCommentURL string `json:"latest_comment_url"`
+	} `json:"subject"`
+}
+
+// watchGitHub polls GitHub notifications every so often; never when every is 0.
+func (b *Board) watchGitHub(keyRe *regexp.Regexp, every time.Duration) {
+	if every <= 0 {
+		return
+	}
+	log.Printf("reading GitHub notifications every %s", every)
+	for ; ; time.Sleep(every) {
+		if err := b.pollGitHub(keyRe); err != nil {
+			log.Printf("github: %v", err)
+		}
+	}
+}
+
+// ghAPI is gh api's answer for args (the path last), as the gh user.
+func ghAPI(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "gh", append([]string{"api"}, args...)...).Output() //nolint:gosec // argv, no shell; GitHub's own urls
+	if err != nil {
+		return nil, fmt.Errorf("gh api %s: %w", args[len(args)-1], err)
+	}
+	return out, nil
+}
+
+// pollGitHub notes each new GitHub notification on the tasks it is about (see ghTasks); no Claude runs.
+func (b *Board) pollGitHub(keyRe *regexp.Regexp) error {
+	b.mu.Lock()
+	since := b.st.GitHubSince
+	if since == "" {
+		defer b.mu.Unlock()
+		b.st.GitHubSince = time.Now().UTC().Format(time.RFC3339)
+		return b.save()
+	}
+	b.mu.Unlock()
+	// all=true: a notification already read on github.com still reaches the board.
+	out, err := ghAPI("--paginate", "notifications?all=true&since="+since)
+	if err != nil {
+		return fmt.Errorf("pollGitHub: %w", err)
+	}
+	var all []ghNotification
+	for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); { // --paginate prints one array per page
+		var page []ghNotification
+		if err := dec.Decode(&page); err != nil {
+			return fmt.Errorf("pollGitHub: %w", err)
+		}
+		all = append(all, page...)
+	}
+	slices.SortFunc(all, func(x, y ghNotification) int { return strings.Compare(x.UpdatedAt, y.UpdatedAt) })
+	newest := since
+	type update struct {
+		n    *ghNotification
+		text string
+	}
+	var updates []update
+	for i := range all {
+		n := &all[i]
+		// shortcut: a notification updated in the same second as the last poll's newest is skipped; dedupe by id if that ever bites.
+		if n.UpdatedAt <= since || n.Subject.URL == "" {
+			continue
+		}
+		newest = max(newest, n.UpdatedAt)
+		updates = append(updates, update{n, ghUpdate(n)})
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, u := range updates {
+		for _, t := range b.ghTasks(u.n, keyRe) {
+			b.note(t, "github", "update", u.text)
+		}
+	}
+	b.st.GitHubSince = newest
+	return b.save()
+}
+
+// ghPageURL is the github.com page of an API url: .../repos/o/r/pulls/7 -> github.com/o/r/pull/7.
+func ghPageURL(api string) string {
+	return strings.Replace(strings.Replace(api, "://api.github.com/repos/", "://github.com/", 1), "/pulls/", "/pull/", 1)
+}
+
+// ghTasks are the tasks a notification is about: those linking its pull request or issue, or tracking
+// a Jira key its title names.
+func (b *Board) ghTasks(n *ghNotification, keyRe *regexp.Regexp) []*Task {
+	page := ghPageURL(n.Subject.URL)
+	keys := keyRe.FindAllString(n.Subject.Title, -1)
+	var tasks []*Task
+	for _, t := range b.st.Tasks {
+		linked := slices.ContainsFunc(t.Links, func(l map[string]string) bool {
+			return l["url"] == page || strings.HasPrefix(l["url"], page+"/") || strings.HasPrefix(l["url"], page+"#")
+		})
+		if linked || slices.ContainsFunc(keys, func(k string) bool { return slices.Contains(t.Jira, k) }) {
+			tasks = append(tasks, t)
+		}
+	}
+	return tasks
+}
+
+// ghUpdate is the history line for a notification: why it came, the page, and what happened last,
+// the newest comment or the pull request's state.
+func ghUpdate(n *ghNotification) string {
+	text := fmt.Sprintf("%s: %s %s", n.Reason, n.Subject.Title, ghPageURL(n.Subject.URL))
+	if n.Subject.LatestCommentURL == "" {
+		return text
+	}
+	out, err := ghAPI(n.Subject.LatestCommentURL)
+	if err != nil {
+		log.Printf("github: %v", err)
+		return text
+	}
+	var last struct {
+		User   struct{ Login string } `json:"user"`
+		Body   string                 `json:"body"`
+		State  string                 `json:"state"`
+		Merged bool                   `json:"merged"`
+	}
+	if err := json.Unmarshal(out, &last); err != nil {
+		log.Printf("github: %s: %v", n.Subject.LatestCommentURL, err)
+		return text
+	}
+	if n.Subject.LatestCommentURL == n.Subject.URL { // no comment: the subject itself changed
+		if last.Merged {
+			last.State = "merged"
+		}
+		return text + "\nnow " + last.State
+	}
+	body := []rune(last.Body)
+	if len(body) > 500 {
+		body = append(body[:500], '…')
+	}
+	return text + "\n" + last.User.Login + ": " + string(body)
 }
 
 func envDuration(key string) time.Duration {
