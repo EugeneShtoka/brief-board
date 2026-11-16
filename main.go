@@ -74,6 +74,7 @@ type Task struct {
 	Area       string              `json:"area,omitempty"`   // work (default) | personal | a project: an id from BOARD_AREAS, else a folder name under BOARD_PROJECTS
 	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats)
 	Who        string              `json:"who,omitempty"`
+	WaitingFor string              `json:"waitingFor,omitempty"` // what is owed between Eugene and who: a review, an email reply, a Jira answer, info
 	Since      string              `json:"since,omitempty"`
 	Order      int                 `json:"order,omitempty"`
 	Summary    string              `json:"summary,omitempty"`    // the story: what was asked, by whom, what's known
@@ -674,7 +675,7 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 		sb.WriteString("Eugene attached files to this task (task.files): read them, they are part of it.\n")
 	}
 	fmt.Fprintf(&sb, "\n%s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
-		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\"}'   # todo|doing|waiting|done|dropped\n"+
+		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\",\"waitingFor\":\"PR review\"}'   # todo|doing|waiting|done|dropped; waitingFor: what who owes\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n",
 		actionRules, b.selfURL, t.ID)
 	if req.Action == "update" {
