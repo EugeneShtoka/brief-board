@@ -147,6 +147,28 @@ func TestMergePatch(t *testing.T) {
 	}
 }
 
+func TestHandleUpsertLevels(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.Tasks = map[string]*Task{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
+	put := func(body string) int {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), "PUT", "/api/tasks/t1", strings.NewReader(body)))
+		return rec.Code
+	}
+	if code := put(`{"urgency": "high", "importance": "low"}`); code != 200 {
+		t.Fatalf("valid levels: %d", code)
+	}
+	if code := put(`{"urgency": "asap"}`); code != 400 || b.st.Tasks["t1"].Urgency != "high" {
+		t.Errorf("unknown urgency: %d, urgency %q; want 400 and unchanged", code, b.st.Tasks["t1"].Urgency)
+	}
+	if code := put(`{"importance": ""}`); code != 200 || b.st.Tasks["t1"].Importance != "" {
+		t.Errorf("clearing importance: %d, %q", code, b.st.Tasks["t1"].Importance)
+	}
+}
+
 func TestSpawnSessionTerminal(t *testing.T) {
 	dir := t.TempDir()
 	// The terminal gets the session as its argv, run in the task's folder.
