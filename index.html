@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: header (headline, area filter + progress), then two tabs: Tickets (new task, four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions. */
+/* Layout: header (headline, filter + progress), then two tabs: Tickets (new task, four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions. */
 :root {
   --bg: #f3f5f8; --surface: #ffffff; --ink: #172033; --muted: #5b6577; --line: #dde2ea;
   --accent: #2f5bd3; --accent-soft: #e6ecfb;
@@ -81,6 +81,21 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 .pill.warn { background: var(--warn-soft); color: var(--warn); }
 .pill.ok { background: var(--ok-soft); color: var(--ok); }
 .pill.run { background: var(--warn-soft); color: var(--warn); animation: pulse 1.6s ease-in-out infinite; }
+.pill.tag { background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+.untag { all: unset; cursor: pointer; margin-left: 0.25rem; }
+.untag:focus-visible, .link:focus-visible { outline: 0.125rem solid var(--accent); }
+.tagrow { display: flex; flex-wrap: wrap; gap: 0.375rem; align-items: center; }
+/* The filter: a dropdown of checkbox groups; what's unchecked is hidden. */
+.filter { position: relative; display: inline-block; margin-top: 0.625rem; }
+.filter summary { list-style: none; }
+.filter summary::-webkit-details-marker { display: none; }
+.filter summary::after { content: " ▾"; color: var(--muted); }
+.filter .menu { position: absolute; z-index: 10; top: calc(100% + 0.25rem); left: 0; min-width: 16rem; max-height: 70vh; overflow: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.75rem; display: grid; gap: 0.875rem; box-shadow: 0 0.5rem 1.5rem rgb(10 14 24 / .2); }
+.filter fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.25rem; }
+.filter legend { display: flex; gap: 0.625rem; align-items: baseline; width: 100%; padding: 0 0 0.25rem; font: 600 0.75rem var(--body); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.filter legend span { flex: 1; }
+.filter label { display: flex; gap: 0.5rem; align-items: center; font: 0.875rem var(--body); color: var(--ink); cursor: pointer; }
+.link { all: unset; cursor: pointer; color: var(--accent); font: 500 0.75rem var(--body); }
 @keyframes pulse { 50% { opacity: .55; } }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -130,7 +145,7 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
       <h1>Brief Board</h1>
       <p class="headline" id="headline">Tasks from the daily brief appear here once Claude writes them.</p>
       <div class="note" id="note" hidden></div>
-      <label for="areas" style="display:flex;align-items:center;gap:0.5rem;justify-self:start;margin-top:0.625rem">Area<select id="areas"></select></label>
+      <details class="filter" id="filter"><summary class="btn" id="filter-sum">Show: all</summary><div class="menu" id="filter-menu"></div></details>
     </div>
     <div class="progress" aria-label="Today's progress">
       <div class="num" id="pnum">0 / 0 <small>closed today</small></div>
@@ -186,15 +201,25 @@ function laneOf(t) {
   return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
 }
 // Areas: work (the brief's tasks, and anything unmarked), personal, or a project named after its folder in ~/dev.
-let area = "all";
-try { area = localStorage.getItem("area") || "all"; } catch {}
-// The filter is All or one area; it narrows the lanes, the progress summary and History.
-const inArea = (t) => area === "all" || (t.area || "work") === area;
+const areaList = () => [["work", "Work"], ...(cfg().projects || []).map((p) => [p, "Project: " + p]), ["personal", "Personal"]];
+const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sort();
+// The filter narrows the lanes, the progress summary and History by area, group and tag. It keeps what's unchecked,
+// so a new project or tag shows up by default; "" is a task with no group or no tag.
+let hide = { area: [], group: [], tag: [] };
+try { hide = { ...hide, ...JSON.parse(localStorage.getItem("hide")) }; } catch {}
+const filterOpts = () => [["area", "Area", areaList()],
+  ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
+  ["tag", "Tags", [...allTags().map((g) => [g, "#" + g]), ["", "No tag"]]]];
+const filtering = () => Object.values(hide).some((v) => v.length);
+// A tagged task shows while any of its tags is checked.
+const visible = (t) => !hide.area.includes(t.area || "work") && !hide.group.includes(t.group || "")
+  && ((t.tags || []).length ? t.tags.some((g) => !hide.tag.includes(g)) : !hide.tag.includes(""));
 const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
 
 function pills(t) {
   const [gl, gc] = GROUP[t.group] || [t.group || "", ""], out = [];
   if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(t.area)}</span>`);
+  for (const g of t.tags || []) out.push(`<span class="pill tag">#${esc(g)}</span>`);
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
@@ -206,11 +231,19 @@ function pills(t) {
 }
 
 function render() {
-  // A stored area that no longer exists (a removed project) falls back to All.
-  if (area !== "all" && !["work", "personal", ...(cfg().projects || [])].includes(area)) area = "all";
+  const opts = filterOpts();
+  // A hidden value that no longer exists (a removed project, a tag nobody has) is forgotten.
+  for (const [dim, , vals] of opts) hide[dim] = hide[dim].filter((v) => vals.some(([x]) => x === v));
   const by = { todo: [], doing: [], waiting: [], closed: [] };
-  for (const t of state.tasks.filter(inArea)) { const l = laneOf(t); if (l) by[l].push(t); }
-  put($("areas"), `<option value="all" ${area === "all" ? "selected" : ""}>All</option>` + areaOpts(area));
+  for (const t of state.tasks.filter(visible)) { const l = laneOf(t); if (l) by[l].push(t); }
+  // The checkboxes are set after the markup, so a click doesn't rebuild the menu and lose focus.
+  put($("filter-menu"), opts.map(([dim, label, vals]) => `<fieldset><legend><span>${label}</span><button type="button" class="link" data-dim="${dim}" data-to="all">All</button><button type="button" class="link" data-dim="${dim}" data-to="none">None</button></legend>${
+    vals.map(([v, l]) => `<label><input type="checkbox" data-dim="${dim}" value="${esc(v)}">${esc(l)}</label>`).join("")}</fieldset>`).join(""));
+  for (const c of $("filter-menu").querySelectorAll("input")) c.checked = !hide[c.dataset.dim].includes(c.value);
+  put($("filter-sum"), "Show: " + esc(opts.map(([dim, label, vals]) => {
+    const on = vals.filter(([v]) => !hide[dim].includes(v));
+    return on.length === vals.length ? "" : on.length === 1 ? on[0][1] : `${label} ${on.length} of ${vals.length}`;
+  }).filter(Boolean).join(" · ") || "all"));
   for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
     : (a.group === "urgent" ? 0 : 1) - (b.group === "urgent" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
   put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
@@ -222,11 +255,11 @@ function render() {
   put($("pnum"), `${by.closed.length} / ${total} <small>closed today</small>`);
   $("pbar").style.width = total ? `${(100 * by.closed.length) / total}%` : "0";
   const days = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return ymd(d); });
-  const counts = days.map((d) => state.tasks.filter(inArea).filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
+  const counts = days.map((d) => state.tasks.filter(visible).filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
   put($("week"), days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join(""));
 
   $("n-tickets").textContent = total - by.closed.length;
-  $("n-history").textContent = [...state.tasks.filter(inArea).flatMap((t) => t.history || []), ...(area === "all" ? state.log || [] : [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
+  $("n-history").textContent = [...state.tasks.filter(visible).flatMap((t) => t.history || []), ...(filtering() ? [] : state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
 
   const b = state.brief || {};
   if (b.headline) put($("headline"), linkify(b.headline));
@@ -245,6 +278,8 @@ function renderDialog(fresh) {
       <button class="x" id="x" aria-label="Close">×</button></div>
     <div id="d-story" style="display:contents"></div>
     <label for="f-area" style="justify-self:start">Area<select id="f-area">${areaOpts(t.area || "work")}</select></label>
+    <div style="display:grid;gap:0.25rem"><label for="f-tag">Tags</label><div class="tagrow"><span id="d-tags" style="display:contents"></span>
+      <input type="text" id="f-tag" list="tag-list" maxlength="40" placeholder="Add a tag, Enter" style="width:12rem"></div><datalist id="tag-list"></datalist></div>
     <div><h3>History</h3><ol class="tl" id="d-hist" style="margin-top:0.5rem"></ol></div>
     <div class="actions">
       <div id="d-busy" style="display:contents"></div>
@@ -265,6 +300,9 @@ function renderDialog(fresh) {
   put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
     ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
   if (document.activeElement !== $("f-area")) $("f-area").value = t.area || "work";
+  put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">#${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
+  // Suggest every tag in use that this task doesn't have yet.
+  put($("tag-list"), allTags().filter((g) => !(t.tags || []).includes(g)).map((g) => `<option value="${esc(g)}">`).join(""));
   put($("d-hist"), (t.history || []).slice().reverse().map((e) =>
     `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : dm(e.at) + " " + hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text)}</span></span></li>`).join("")
     || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`);
@@ -277,12 +315,12 @@ function renderDialog(fresh) {
     <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>`);
 }
 
-const areaOpts = (sel) => [["work", "Work"], ...(cfg().projects || []).map((p) => [p, "Project: " + p]), ["personal", "Personal"]]
+const areaOpts = (sel) => areaList()
   .map(([v, l]) => `<option value="${esc(v)}" ${v === sel ? "selected" : ""}>${esc(l)}</option>`).join("");
 
-// New task: an id from the title, the area preset from the filter, Eugene as its creator.
+// New task: an id from the title, the area preset from the filter when it shows one area, Eugene as its creator.
 function renderNew() {
-  const pre = area === "all" ? "work" : area;
+  const on = areaList().filter(([v]) => !hide.area.includes(v)), pre = on.length === 1 ? on[0][0] : "work";
   $("dlg-body").innerHTML = `
     <div class="dlg-head"><h2 id="dlg-title">New task</h2><button class="x" id="x" aria-label="Close">×</button></div>
     <form id="new-form" style="display:grid;gap:0.875rem">
@@ -372,8 +410,24 @@ $("lanes").addEventListener("drop", async (e) => {
 });
 $("dlg").addEventListener("click", (e) => {
   if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
+  const u = e.target.closest("[data-untag]");
+  if (u) return setTags(tagsOf().filter((g) => g !== u.dataset.untag));
   const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act, b.dataset.key);
 });
+// Tags are typed or picked from the ones in use; "#Some Tag" is stored as some-tag.
+const tagsOf = () => (state.tasks.find((x) => x.id === openId) || {}).tags || [];
+$("dlg").addEventListener("keydown", (e) => {
+  if (e.target.id !== "f-tag" || e.key !== "Enter") return;
+  e.preventDefault();
+  const g = e.target.value.trim().toLowerCase().replace(/^#+/, "").replace(/\s+/g, "-");
+  e.target.value = "";
+  if (g && !tagsOf().includes(g)) setTags([...tagsOf(), g]);
+});
+async function setTags(tags) {
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the tags."; return; }
+  apply(r);
+}
 $("dlg").addEventListener("close", () => { openId = null; });
 // Moving a task to another area also moves where its next session runs.
 $("dlg").addEventListener("change", async (e) => {
@@ -384,12 +438,25 @@ $("dlg").addEventListener("change", async (e) => {
 });
 $("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); });
 $("new-task").addEventListener("click", () => { openId = null; renderNew(); $("dlg").showModal(); $("n-title").focus(); });
-$("areas").addEventListener("change", (e) => {
-  area = e.target.value;
-  try { localStorage.setItem("area", area); } catch {}
+function setFilter() {
+  try { localStorage.setItem("hide", JSON.stringify(hide)); } catch {}
   render();
   if (!$("log").hidden) loadLog();
+}
+$("filter-menu").addEventListener("change", (e) => {
+  const { dim } = e.target.dataset, v = e.target.value;
+  hide[dim] = e.target.checked ? hide[dim].filter((x) => x !== v) : [...hide[dim], v];
+  setFilter();
 });
+$("filter-menu").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-to]"); if (!b) return;
+  const { dim } = b.dataset;
+  hide[dim] = b.dataset.to === "all" ? [] : filterOpts().find(([d]) => d === dim)[2].map(([v]) => v);
+  setFilter();
+});
+// The dropdown closes on a click outside it and on Escape.
+document.addEventListener("click", (e) => { if (!$("filter").contains(e.target)) $("filter").open = false; });
+$("filter").addEventListener("keydown", (e) => { if (e.key === "Escape" && $("filter").open) { $("filter").open = false; $("filter-sum").focus(); } });
 // The open tab lives in the URL hash, so a reload or a bookmark keeps it.
 function showTab() {
   const hist = location.hash === "#history";
@@ -407,10 +474,11 @@ async function loadLog() {
   const r = await fetch(`api/log?week=${shown}`).catch(() => null);
   if (!r || !r.ok || shown !== week) return;
   const { entries: all, older } = await r.json();
-  // A task's line carries its area when written (older lines take the task's current one); board-level lines (brief, sweep, triage runs) belong to no one area, so only All shows them.
+  // A task's line carries its area when written (older lines take the task's current one), and the task's current group and tags;
+  // board-level lines (brief, sweep, triage runs) belong to no one area, so they show only while nothing is filtered out.
   const tasks = new Map(state.tasks.map((t) => [t.id, t]));
   for (const e of all) if (e.task && !e.area) e.area = (tasks.get(e.task) || {}).area;
-  const entries = all.filter((e) => e.task ? inArea(e) : area === "all");
+  const entries = all.filter((e) => e.task ? visible({ ...tasks.get(e.task), area: e.area }) : !filtering());
   const thisWeek = mondayOf(new Date());
   $("wk-label").textContent = `${dm(week)} – ${dm(addDays(week, 6))}${week === thisWeek ? " · this week" : ""}`;
   $("wk-prev").disabled = !older; $("wk-next").disabled = week >= thisWeek;

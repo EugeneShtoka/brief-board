@@ -74,6 +74,7 @@ type Task struct {
 	Since      string              `json:"since,omitempty"`
 	Order      int                 `json:"order,omitempty"`
 	Summary    string              `json:"summary,omitempty"` // the story: what was asked, by whom, what's known
+	Tags       []string            `json:"tags,omitempty"`    // Eugene's own labels, set on the board
 	Jira       []string            `json:"jira,omitempty"`
 	JiraStatus map[string]string   `json:"jiraStatus,omitempty"` // key -> Jira status name, written by the brief
 	Links      []map[string]string `json:"links,omitempty"`      // {label, url}
