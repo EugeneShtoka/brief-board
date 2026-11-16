@@ -52,19 +52,30 @@ func TestAreas(t *testing.T) {
 		}
 	}
 	b.areas = areas
-	for area, want := range map[string]string{"": work, "work": work, "kith": kith} {
+	for area, want := range map[string]string{"work": work, "kith": kith} {
 		if got, err := b.dirFor(&Task{Area: area}); got != want || err != nil {
 			t.Errorf("dirFor(%q) = %s, %v; want %s", area, got, err, want)
 		}
 	}
 	// No fallback: an unknown area or a missing folder is an error, not home.
-	for _, area := range []string{"nixos", "gone"} {
+	for _, area := range []string{"nixos", "gone", ""} {
 		if got, err := b.dirFor(&Task{Area: area}); err == nil {
 			t.Errorf("dirFor(%q) = %s, want an error", area, got)
 		}
 	}
-	if b.badField(&Task{Area: "kith"}) != "" || b.badField(&Task{Area: "gone"}) == "" {
-		t.Error("badField: want configured areas only")
+	if b.badField(&Task{Area: "kith"}) != "" || b.badField(&Task{Area: "gone"}) == "" || b.badField(&Task{}) == "" {
+		t.Error("badField: want a configured area, required")
+	}
+	// A task saved before areas were required loads as work.
+	b.path = filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(b.path, []byte(`{"tasks": {"old": {"id": "old"}, "k": {"id": "k", "area": "kith"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.load(); err != nil {
+		t.Fatal(err)
+	}
+	if b.st.Tasks["old"].Area != "work" || b.st.Tasks["k"].Area != "kith" {
+		t.Errorf("load: areas %q, %q; want work, kith", b.st.Tasks["old"].Area, b.st.Tasks["k"].Area)
 	}
 }
 
@@ -130,7 +141,7 @@ func TestMergePatch(t *testing.T) {
 
 func TestHandleUpsertLevels(t *testing.T) {
 	dir := t.TempDir()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{"work", "Work", dir}}}
 	b.st.Tasks = map[string]*Task{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
@@ -139,7 +150,10 @@ func TestHandleUpsertLevels(t *testing.T) {
 		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), "PUT", "/api/tasks/t1", strings.NewReader(body)))
 		return rec.Code
 	}
-	if code := put(`{"urgency": "high", "importance": "low"}`); code != 200 {
+	if code := put(`{"urgency": "high"}`); code != 400 {
+		t.Fatalf("a new task with no area: %d, want 400", code)
+	}
+	if code := put(`{"area": "work", "urgency": "high", "importance": "low"}`); code != 200 {
 		t.Fatalf("valid levels: %d", code)
 	}
 	if code := put(`{"urgency": "asap"}`); code != 400 || b.st.Tasks["t1"].Urgency != "high" {

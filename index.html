@@ -235,7 +235,7 @@ const filterOpts = () => [["area", "Area", areaList()],
   ["tag", "Tags", [...allTags().map((g) => [g, "#" + g]), ["", "No tag"]]]];
 const filtering = () => Object.values(hide).some((v) => v.length);
 // A tagged task shows while any of its tags is checked.
-const visible = (t) => !hide.area.includes(t.area || "work") && !hide.group.includes(t.group || "")
+const visible = (t) => !hide.area.includes(t.area) && !hide.group.includes(t.group || "")
   && !hide.urgency.includes(t.urgency || "") && !hide.importance.includes(t.importance || "")
   && ((t.tags || []).length ? t.tags.some((g) => !hide.tag.includes(g)) : !hide.tag.includes(""));
 const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
@@ -306,7 +306,7 @@ function renderDialog(fresh) {
     <div class="dlg-head"><div><h2 id="dlg-title"></h2><div class="meta" id="d-meta"></div></div>
       <button class="x" id="x" aria-label="Close">×</button></div>
     <div id="d-story" style="display:contents"></div>
-    <div class="tagrow" style="gap:0.875rem"><label for="f-area">Area<select id="f-area">${areaOpts(t.area || "work")}</select></label>
+    <div class="tagrow" style="gap:0.875rem"><label for="f-area">Area<select id="f-area">${areaOpts(t.area)}</select></label>
       <label for="f-urgency">Urgency<select id="f-urgency">${levelOpts(t.urgency)}</select></label>
       <label for="f-importance">Importance<select id="f-importance">${levelOpts(t.importance)}</select></label></div>
     <div style="display:grid;gap:0.25rem"><label for="f-tag">Tags</label><div class="tagrow"><span id="d-tags" style="display:contents"></span>
@@ -330,7 +330,7 @@ function renderDialog(fresh) {
   put($("d-meta"), `${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}`);
   put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
     ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
-  if (document.activeElement !== $("f-area")) $("f-area").value = t.area || "work";
+  if (document.activeElement !== $("f-area")) $("f-area").value = t.area;
   if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
   if (document.activeElement !== $("f-importance")) $("f-importance").value = t.importance || "";
   put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">#${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
