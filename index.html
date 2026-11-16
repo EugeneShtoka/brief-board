@@ -104,6 +104,7 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 code.ref { font: 500 0.75rem var(--mono); }
+code { font: 0.9em var(--mono); }
 
 section.log { background: var(--surface); border: 1px solid var(--line); border-radius: 0.625rem; padding: 0.875rem 1rem; display: grid; gap: 0.5rem; }
 section.log h2, dialog h3 { font: 700 1rem var(--display); margin: 0; }
@@ -199,10 +200,15 @@ const preQa = (t) => t.status === "done" ? (t.jira || []).filter((k) => PRE_QA.h
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 // Issue and PR link bases come from the server (BOARD_ISSUE_URL, BOARD_PR_URL); no link when unset.
 const cfg = () => state.config || {};
-const linkify = (s) => esc(s)
+const refs = (s) => esc(s)
   .replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (m) => cfg().issue ? `<a href="${cfg().issue}${m}" target="_blank" rel="noopener"><code class="ref">${m}</code></a>` : `<code class="ref">${m}</code>`)
-  .replace(/(^|[\s(])#(\d{3,5})\b/g, (m, pre, n) => cfg().pr ? `${pre}<a href="${cfg().pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
+  .replace(/(^|[\s(*])#(\d{3,5})\b/g, (m, pre, n) => cfg().pr ? `${pre}<a href="${cfg().pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
   .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+// The markdown the brief writes: `code` and [text](url) are cut out before refs links keys and URLs, **bold** last.
+const linkify = (s) => String(s ?? "").split(/(`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/)
+  .map((p, i) => i % 2 === 0 ? refs(p) : p[0] === "`" ? `<code>${esc(p.slice(1, -1))}</code>`
+    : p.replace(/^\[(.+)\]\((.+)\)$/, (m, t, u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(t)}</a>`))
+  .join("").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
 let state = { brief: {}, tasks: [] }, pend = [], openId = null, today = ymd(new Date()), poll;
 // Set a node's markup only when it changed, so a data update leaves untouched nodes (focus, selection, a drag in progress) alone.
 const put = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
