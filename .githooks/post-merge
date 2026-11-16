@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# After a pull: delete the local branches whose branch on origin is gone (GitHub deletes
+# a PR's branch when it merges). A branch is deleted only when its tip is on its last
+# known origin/<branch>, so commits that were never pushed are never lost; such a
+# branch is kept and named.
+#
+# Enable once per clone:   make hooks   (or: git config core.hooksPath .githooks)
+set -uo pipefail
+
+# Offline or no origin: nothing to compare against, try again on the next pull.
+live=$(git ls-remote --heads origin 2>/dev/null | cut -f2) || exit 0
+
+git for-each-ref --format='%(refname:short) %(upstream)' refs/heads |
+	while read -r branch upstream; do
+		[[ $upstream == refs/remotes/origin/* ]] || continue
+		remote_branch=${upstream#refs/remotes/origin/}
+		grep -qxF "refs/heads/$remote_branch" <<<"$live" && continue
+		if git merge-base --is-ancestor "$branch" "$upstream" 2>/dev/null; then
+			# Fails, and keeps both refs, for a branch checked out here or in a worktree.
+			git branch -D "$branch" && git update-ref -d "$upstream"
+		else
+			echo "post-merge: kept $branch: origin deleted $remote_branch, and its last commits are not known to be pushed"
+		fi
+	done
+exit 0
