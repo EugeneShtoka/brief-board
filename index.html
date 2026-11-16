@@ -219,8 +219,9 @@ function laneOf(t) {
   if (closed(t)) return t.doneAt && ymd(new Date(t.doneAt)) === today ? "closed" : null;
   return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
 }
-// Areas: work (the brief's tasks, and anything unmarked), personal, or a project named after its folder in ~/dev.
-const areaList = () => [["work", "Work"], ...(cfg().projects || []).map((p) => [p, p]), ["personal", "Personal"]];
+// Areas come from the server (BOARD_AREAS, else work, the folders in ~/dev, personal); work holds anything unmarked.
+const areaList = () => (cfg().areas || [{ id: "work", name: "work" }]).map((a) => [a.id, a.name]);
+const areaName = (id) => (areaList().find(([v]) => v === id) || [id, id])[1];
 const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sort();
 // The filter narrows the lanes, the progress summary and History by area, group and tag. It keeps what's unchecked,
 // so a new project or tag shows up by default; "" is a task with no group or no tag.
@@ -237,7 +238,7 @@ const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)
 
 function pills(t) {
   const [gl, gc] = GROUP[t.group] || [t.group || "", ""], out = [];
-  if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(t.area)}</span>`);
+  if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(areaName(t.area))}</span>`);
   for (const g of t.tags || []) out.push(`<span class="pill tag">#${esc(g)}</span>`);
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
@@ -523,7 +524,7 @@ async function loadLog() {
   $("activity").innerHTML = entries.sort((a, b) => b.at.localeCompare(a.at)).map((e) => {
     const d = ymd(new Date(e.at)), head = d === day ? "" : `<li class="day">${d === today ? "Today" : new Date(e.at).toLocaleDateString("en-GB", { weekday: "long" })} ${dm(d)}</li>`;
     day = d;
-    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}${e.area && e.area !== "work" ? ` <span class="pill">${esc(e.area)}</span>` : ""}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
+    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}${e.area && e.area !== "work" ? ` <span class="pill">${esc(areaName(e.area))}</span>` : ""}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
   }).join("") || `<li><time>—</time><span class="hint">Nothing this week.</span></li>`;
 }
 $("wk-prev").addEventListener("click", () => { week = addDays(week, -7); loadLog(); });
