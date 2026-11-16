@@ -183,10 +183,13 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
 
 <script>
 const LANES = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting on others"], ["closed", "Closed today"]];
-const GROUP = { urgent: ["Urgent", "crit"], waiting_on_you: ["Owed reply", "warn"], ready: ["Ready to close", "ok"],
+const GROUP = { waiting_on_you: ["Owed reply", "warn"], ready: ["Ready to close", "ok"],
   waiting_on_others: ["Waiting", ""], roadmap: ["Roadmap", ""], later: ["Later", ""] };
-// Urgency and importance are Eugene's, three levels each; "" is not set.
+// Urgency and importance are Eugene's, three levels each; every task has both, medium unless set.
 const LEVEL = [["high", "High"], ["medium", "Medium"], ["low", "Low"]];
+const STATUS = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting"], ["done", "Done"], ["dropped", "Dropped"]];
+// A task's source is who maintains it; "" is the brief.
+const SOURCE = { "": "Brief", eugene: "Eugene", sweep: "Sweep" };
 const $ = (id) => document.getElementById(id);
 const ymd = (d) => { const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; };
 const hm = (s) => new Date(s).toTimeString().slice(0, 5);
@@ -225,19 +228,24 @@ function laneOf(t) {
 const areaList = () => (cfg().areas || []).map((a) => [a.id, a.name]);
 const areaName = (id) => (areaList().find(([v]) => v === id) || [id, id])[1];
 const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sort();
-// The filter narrows the lanes, the progress summary and History by area, group, urgency, importance and tag. It keeps
-// what's unchecked, so a new project or tag shows up by default; "" is a task with no group, level or tag.
-let hide = { area: [], group: [], urgency: [], importance: [], tag: [] };
+// Every value of a task field in use, sorted; "" is a task without one.
+const allOf = (f) => [...new Set(state.tasks.map((t) => t[f] || ""))].sort();
+// The filter narrows the lanes, the progress summary and History by each task field below and tag. It keeps
+// what's unchecked, so a new project, person or tag shows up by default; "" is a task with no group, source, person or tag.
+let hide = { area: [], status: [], group: [], urgency: [], importance: [], who: [], waitingFor: [], source: [], tag: [] };
 try { hide = { ...hide, ...JSON.parse(localStorage.getItem("hide")) }; } catch {}
-const filterOpts = () => [["area", "Area", areaList()],
+const filterOpts = () => [["area", "Area", areaList()], ["status", "Status", STATUS],
   ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
-  ["urgency", "Urgency", [...LEVEL, ["", "Not set"]]], ["importance", "Importance", [...LEVEL, ["", "Not set"]]],
+  ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
+  ["who", "Who", allOf("who").map((v) => [v, v || "Nobody"])],
+  ["waitingFor", "Waiting for", allOf("waitingFor").map((v) => [v, v || "Nothing owed"])],
+  ["source", "Source", allOf("source").map((v) => [v, SOURCE[v] || v])],
   ["tag", "Tags", [...allTags().map((g) => [g, "#" + g]), ["", "No tag"]]]];
 const filtering = () => Object.values(hide).some((v) => v.length);
-// A tagged task shows while any of its tags is checked.
-const visible = (t) => !hide.area.includes(t.area) && !hide.group.includes(t.group || "")
-  && !hide.urgency.includes(t.urgency || "") && !hide.importance.includes(t.importance || "")
-  && ((t.tags || []).length ? t.tags.some((g) => !hide.tag.includes(g)) : !hide.tag.includes(""));
+// Each filter dim is the task field of that name; a tagged task shows while any of its tags is checked.
+const visible = (t) => Object.entries(hide).every(([dim, off]) => dim === "tag"
+  ? ((t.tags || []).length ? t.tags.some((g) => !off.includes(g)) : !off.includes(""))
+  : !off.includes(t[dim] || ""));
 const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
 
 function pills(t) {
@@ -245,8 +253,8 @@ function pills(t) {
   if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(areaName(t.area))}</span>`);
   for (const g of t.tags || []) out.push(`<span class="pill tag">#${esc(g)}</span>`);
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
-  if (t.urgency) out.push(`<span class="pill ${t.urgency === "high" ? "crit" : ""}">urgency ${esc(t.urgency)}</span>`);
-  if (t.importance) out.push(`<span class="pill ${t.importance === "high" ? "warn" : ""}">importance ${esc(t.importance)}</span>`);
+  if (t.urgency && t.urgency !== "medium") out.push(`<span class="pill ${t.urgency === "high" ? "crit" : ""}">urgency ${esc(t.urgency)}</span>`);
+  if (t.importance && t.importance !== "medium") out.push(`<span class="pill ${t.importance === "high" ? "warn" : ""}">importance ${esc(t.importance)}</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
@@ -271,10 +279,10 @@ function render() {
     return on.length === vals.length ? "" : on.length === 1 ? on[0][1] : `${label} ${on.length} of ${vals.length}`;
   }).filter(Boolean).join(" · ") || "all"));
   for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
-    : (a.group === "urgent" ? 0 : 1) - (b.group === "urgent" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
+    : (a.urgency === "high" ? 0 : 1) - (b.urgency === "high" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
   put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
     // A div, not a <button>: Firefox won't drag buttons.
-    by[k].map((t) => `<div class="card ${t.group === "urgent" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" role="button" tabindex="0" draggable="true" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></div>`).join("")
+    by[k].map((t) => `<div class="card ${t.urgency === "high" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" role="button" tabindex="0" draggable="true" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></div>`).join("")
     || `<div class="empty">${k === "closed" ? "Nothing closed yet today." : "Empty."}</div>`}</section>`).join(""));
 
   const total = by.todo.length + by.doing.length + by.waiting.length + by.closed.length;
@@ -350,8 +358,8 @@ function renderDialog(fresh) {
 
 const areaOpts = (sel) => areaList()
   .map(([v, l]) => `<option value="${esc(v)}" ${v === sel ? "selected" : ""}>${esc(l)}</option>`).join("");
-const levelOpts = (sel) => [["", "Not set"], ...LEVEL]
-  .map(([v, l]) => `<option value="${v}" ${v === (sel || "") ? "selected" : ""}>${l}</option>`).join("");
+const levelOpts = (sel) => LEVEL
+  .map(([v, l]) => `<option value="${v}" ${v === (sel || "medium") ? "selected" : ""}>${l}</option>`).join("");
 
 // New task: an id from the title, the area preset from the filter when it shows one area, Eugene as its creator.
 function renderNew() {

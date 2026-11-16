@@ -99,12 +99,13 @@ func TestAreas(t *testing.T) {
 			t.Errorf("dirFor(%q) = %s, want an error", area, got)
 		}
 	}
-	if b.badField(&Task{Area: "kith"}) != "" || b.badField(&Task{Area: "gone"}) == "" || b.badField(&Task{}) == "" {
+	if b.badField(&Task{Area: "kith", Urgency: "medium", Importance: "medium"}) != "" || b.badField(&Task{Area: "gone"}) == "" || b.badField(&Task{}) == "" {
 		t.Error("badField: want a configured area, required")
 	}
-	// A task saved before areas were required loads as work.
+	// A task saved before areas and levels were required loads as work, medium; the old "urgent" group as high urgency.
 	b.path = filepath.Join(t.TempDir(), "state.json")
-	if err := os.WriteFile(b.path, []byte(`{"tasks": {"old": {"id": "old"}, "k": {"id": "k", "area": "kith"}}}`), 0o600); err != nil {
+	if err := os.WriteFile(b.path, []byte(`{"tasks": {"old": {"id": "old"}, "k": {"id": "k", "area": "kith"},
+		"u": {"id": "u", "group": "urgent"}, "ul": {"id": "ul", "group": "urgent", "urgency": "low"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.load(); err != nil {
@@ -112,6 +113,11 @@ func TestAreas(t *testing.T) {
 	}
 	if b.st.Tasks["old"].Area != "work" || b.st.Tasks["k"].Area != "kith" {
 		t.Errorf("load: areas %q, %q; want work, kith", b.st.Tasks["old"].Area, b.st.Tasks["k"].Area)
+	}
+	for id, want := range map[string]string{"old": "medium", "u": "high", "ul": "low"} {
+		if got := b.st.Tasks[id]; got.Urgency != want || got.Importance != "medium" || got.Group != "" {
+			t.Errorf("load %s: urgency %q, importance %q, group %q; want %s, medium, none", id, got.Urgency, got.Importance, got.Group, want)
+		}
 	}
 }
 
@@ -195,8 +201,11 @@ func TestHandleUpsertLevels(t *testing.T) {
 	if code := put(`{"urgency": "asap"}`); code != 400 || b.st.Tasks["t1"].Urgency != "high" {
 		t.Errorf("unknown urgency: %d, urgency %q; want 400 and unchanged", code, b.st.Tasks["t1"].Urgency)
 	}
-	if code := put(`{"importance": ""}`); code != 200 || b.st.Tasks["t1"].Importance != "" {
-		t.Errorf("clearing importance: %d, %q", code, b.st.Tasks["t1"].Importance)
+	if code := put(`{"importance": ""}`); code != 200 || b.st.Tasks["t1"].Importance != "medium" {
+		t.Errorf("clearing importance: %d, %q; want medium", code, b.st.Tasks["t1"].Importance)
+	}
+	if code := put(`{"group": "urgent"}`); code != 400 {
+		t.Errorf("group urgent: %d, want 400", code)
 	}
 }
 
