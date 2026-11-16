@@ -16,8 +16,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"maps"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
@@ -74,6 +76,7 @@ type Task struct {
 	Links      []map[string]string `json:"links,omitempty"`      // {label, url}
 	Thread     map[string]string   `json:"thread,omitempty"`     // where a reply goes: {room, reply_to, thread}
 	Messages   []map[string]string `json:"messages,omitempty"`   // the story's messages: {label, room, event}, opened in kith
+	Files      []string            `json:"files,omitempty"`      // Eugene's attachments: absolute paths under files/<id> next to the state file
 	DoneAt     *time.Time          `json:"doneAt,omitempty"`
 	UpdatedAt  time.Time           `json:"updatedAt"`
 	History    []Entry             `json:"history"`
@@ -342,7 +345,7 @@ func remarshal(from, to any) error {
 	return nil
 }
 
-// handleUpsert merges the body's fields into the task; history and job are server-owned.
+// handleUpsert merges the body's fields into the task; history, job and files are server-owned.
 func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var patch map[string]json.RawMessage
@@ -352,6 +355,7 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	}
 	delete(patch, "history")
 	delete(patch, "job")
+	delete(patch, "files")
 	delete(patch, "id")
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -415,6 +419,79 @@ func (b *Board) handleNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, t)
+}
+
+const maxAttach = 32 << 20
+
+// handleAttach stores the multipart "file" fields in files/<id>/ next to the state file and lists
+// them on the task, so the next session on it reads them. A file with the same name is replaced.
+func (b *Board) handleAttach(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAttach)
+	if err := r.ParseMultipartForm(maxAttach); err != nil { //nolint:gosec // the body is capped by MaxBytesReader above
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	defer func() { _ = r.MultipartForm.RemoveAll() }()
+	uploads := r.MultipartForm.File["file"]
+	id := r.PathValue("id")
+	// The id and the file names become paths: keep each a single plain name.
+	if len(uploads) == 0 || !filepath.IsLocal(id) || slices.ContainsFunc(uploads, func(fh *multipart.FileHeader) bool {
+		name := filepath.Base(fh.Filename)
+		return name == "." || !filepath.IsLocal(name)
+	}) {
+		writeJSON(w, 400, map[string]string{"error": "need one or more files, each with a plain name"})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.st.Tasks[id]
+	if !ok {
+		writeJSON(w, 404, map[string]string{"error": "no such task"})
+		return
+	}
+	dir := filepath.Join(filepath.Dir(b.path), "files", id)
+	var names []string
+	for _, fh := range uploads {
+		name := filepath.Base(fh.Filename)
+		path := filepath.Join(dir, name)
+		if err := saveUpload(fh, path); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		if !slices.Contains(t.Files, path) {
+			t.Files = append(t.Files, path)
+		}
+		names = append(names, name)
+	}
+	b.note(t, "eugene", "attach", strings.Join(names, ", "))
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, t)
+}
+
+func saveUpload(fh *multipart.FileHeader, path string) error {
+	src, err := fh.Open()
+	if err != nil {
+		return fmt.Errorf("saveUpload: %w", err)
+	}
+	defer func() { _ = src.Close() }()
+	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil { //nolint:gosec // path is checked by handleAttach
+		return fmt.Errorf("saveUpload: %w", err)
+	}
+	dst, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600) //nolint:gosec // path is checked by handleAttach
+	if err != nil {
+		return fmt.Errorf("saveUpload: %w", err)
+	}
+	_, err = io.Copy(dst, src)
+	if cerr := dst.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return fmt.Errorf("saveUpload: %w", err)
+	}
+	return nil
 }
 
 type actRequest struct {
@@ -507,6 +584,9 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	}
 	if req.Action == "qa" {
 		fmt.Fprintf(&sb, "Jira key to move: %s\n", req.Key)
+	}
+	if len(t.Files) > 0 {
+		sb.WriteString("Eugene attached files to this task (task.files): read them, they are part of it.\n")
 	}
 	fmt.Fprintf(&sb, "\n%s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\"}'   # todo|doing|waiting|done|dropped\n"+
@@ -740,6 +820,7 @@ func main() {
 	mux.HandleFunc("PUT /api/brief", b.handleBrief)
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
+	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
 	log.Printf("brief-board on %s, state %s, claude runs in %s", addr, b.path, b.workdir)
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
