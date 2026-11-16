@@ -86,7 +86,7 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 .untag { all: unset; cursor: pointer; margin-left: 0.25rem; }
 .untag:focus-visible, .link:focus-visible { outline: 0.125rem solid var(--accent); }
 .tagrow { display: flex; flex-wrap: wrap; gap: 0.375rem; align-items: center; }
-/* The filter: a dropdown of checkbox groups; what's unchecked is hidden. */
+/* The filter: a dropdown of checkbox groups; what's unchecked is hidden. Each row's "only" shows on hover or focus. */
 .filter { position: relative; display: inline-block; margin-top: 0.625rem; }
 .filter summary { list-style: none; }
 .filter summary::-webkit-details-marker { display: none; }
@@ -95,7 +95,10 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 .filter fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.25rem; }
 .filter legend { display: flex; gap: 0.625rem; align-items: baseline; width: 100%; padding: 0 0 0.25rem; font: 600 0.75rem var(--body); text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
 .filter legend span { flex: 1; }
-.filter label { display: flex; gap: 0.5rem; align-items: center; font: 0.875rem var(--body); color: var(--ink); cursor: pointer; }
+.filter .opt { display: flex; gap: 0.5rem; align-items: center; }
+.filter .opt .link { opacity: 0; }
+.filter .opt:hover .link, .filter .opt .link:focus-visible { opacity: 1; }
+.filter label { flex: 1; display: flex; gap: 0.5rem; align-items: center; font: 0.875rem var(--body); color: var(--ink); cursor: pointer; }
 .link { all: unset; cursor: pointer; color: var(--accent); font: 500 0.75rem var(--body); }
 @keyframes pulse { 50% { opacity: .55; } }
 a { color: var(--accent); text-decoration: none; }
@@ -206,7 +209,7 @@ function laneOf(t) {
   return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
 }
 // Areas: work (the brief's tasks, and anything unmarked), personal, or a project named after its folder in ~/dev.
-const areaList = () => [["work", "Work"], ...(cfg().projects || []).map((p) => [p, "Project: " + p]), ["personal", "Personal"]];
+const areaList = () => [["work", "Work"], ...(cfg().projects || []).map((p) => [p, p]), ["personal", "Personal"]];
 const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sort();
 // The filter narrows the lanes, the progress summary and History by area, group and tag. It keeps what's unchecked,
 // so a new project or tag shows up by default; "" is a task with no group or no tag.
@@ -242,8 +245,8 @@ function render() {
   const by = { todo: [], doing: [], waiting: [], closed: [] };
   for (const t of state.tasks.filter(visible)) { const l = laneOf(t); if (l) by[l].push(t); }
   // The checkboxes are set after the markup, so a click doesn't rebuild the menu and lose focus.
-  put($("filter-menu"), opts.map(([dim, label, vals]) => `<fieldset><legend><span>${label}</span><button type="button" class="link" data-dim="${dim}" data-to="all">All</button><button type="button" class="link" data-dim="${dim}" data-to="none">None</button></legend>${
-    vals.map(([v, l]) => `<label><input type="checkbox" data-dim="${dim}" value="${esc(v)}">${esc(l)}</label>`).join("")}</fieldset>`).join(""));
+  put($("filter-menu"), opts.map(([dim, label, vals]) => `<fieldset><legend><span>${label}</span><button type="button" class="link" data-dim="${dim}" data-to="all">All</button></legend>${
+    vals.map(([v, l]) => `<div class="opt"><label><input type="checkbox" data-dim="${dim}" value="${esc(v)}">${esc(l)}</label><button type="button" class="link" data-dim="${dim}" data-to="only" data-v="${esc(v)}" aria-label="Only ${esc(l)}">only</button></div>`).join("")}</fieldset>`).join(""));
   for (const c of $("filter-menu").querySelectorAll("input")) c.checked = !hide[c.dataset.dim].includes(c.value);
   put($("filter-sum"), "Show: " + esc(opts.map(([dim, label, vals]) => {
     const on = vals.filter(([v]) => !hide[dim].includes(v));
@@ -456,7 +459,8 @@ $("filter-menu").addEventListener("change", (e) => {
 $("filter-menu").addEventListener("click", (e) => {
   const b = e.target.closest("[data-to]"); if (!b) return;
   const { dim } = b.dataset;
-  hide[dim] = b.dataset.to === "all" ? [] : filterOpts().find(([d]) => d === dim)[2].map(([v]) => v);
+  // "only" hides every other value of its group.
+  hide[dim] = b.dataset.to === "all" ? [] : filterOpts().find(([d]) => d === dim)[2].map(([v]) => v).filter((v) => v !== b.dataset.v);
   setFilter();
 });
 // The dropdown closes on a click outside it and on Escape.
