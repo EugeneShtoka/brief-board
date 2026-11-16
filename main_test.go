@@ -102,10 +102,13 @@ func TestAreas(t *testing.T) {
 	if b.badField(&Task{Area: "kith", Urgency: "medium", Importance: "medium"}) != "" || b.badField(&Task{Area: "gone"}) == "" || b.badField(&Task{}) == "" {
 		t.Error("badField: want a configured area, required")
 	}
-	// A task saved before areas and levels were required loads as work, medium; the old "urgent" group as high urgency.
+	// A task saved before areas and levels were required loads as work, medium; the gone groups as levels and status:
+	// "urgent" high urgency, "later" low, "waiting_on_others" an open task waiting (a closed one stays closed).
 	b.path = filepath.Join(t.TempDir(), "state.json")
 	if err := os.WriteFile(b.path, []byte(`{"tasks": {"old": {"id": "old"}, "k": {"id": "k", "area": "kith"},
-		"u": {"id": "u", "group": "urgent"}, "ul": {"id": "ul", "group": "urgent", "urgency": "low"}}}`), 0o600); err != nil {
+		"u": {"id": "u", "group": "urgent"}, "ul": {"id": "ul", "group": "urgent", "urgency": "low"},
+		"l": {"id": "l", "group": "later"}, "w": {"id": "w", "group": "waiting_on_others", "status": "todo"},
+		"wd": {"id": "wd", "group": "waiting_on_others", "status": "done"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.load(); err != nil {
@@ -114,10 +117,13 @@ func TestAreas(t *testing.T) {
 	if b.st.Tasks["old"].Area != "work" || b.st.Tasks["k"].Area != "kith" {
 		t.Errorf("load: areas %q, %q; want work, kith", b.st.Tasks["old"].Area, b.st.Tasks["k"].Area)
 	}
-	for id, want := range map[string]string{"old": "medium", "u": "high", "ul": "low"} {
+	for id, want := range map[string]string{"old": "medium", "u": "high", "ul": "low", "l": "low", "w": "medium"} {
 		if got := b.st.Tasks[id]; got.Urgency != want || got.Importance != "medium" || got.Group != "" {
 			t.Errorf("load %s: urgency %q, importance %q, group %q; want %s, medium, none", id, got.Urgency, got.Importance, got.Group, want)
 		}
+	}
+	if w, wd := b.st.Tasks["w"], b.st.Tasks["wd"]; w.Status != "waiting" || wd.Status != "done" || wd.Group != "" {
+		t.Errorf("load waiting_on_others: status %q, %q, group %q; want waiting, done, none", w.Status, wd.Status, wd.Group)
 	}
 }
 
@@ -204,8 +210,10 @@ func TestHandleUpsertLevels(t *testing.T) {
 	if code := put(`{"importance": ""}`); code != 200 || b.st.Tasks["t1"].Importance != "medium" {
 		t.Errorf("clearing importance: %d, %q; want medium", code, b.st.Tasks["t1"].Importance)
 	}
-	if code := put(`{"group": "urgent"}`); code != 400 {
-		t.Errorf("group urgent: %d, want 400", code)
+	for _, g := range []string{"urgent", "later", "waiting_on_others"} {
+		if code := put(`{"group": "` + g + `"}`); code != 400 {
+			t.Errorf("group %s: %d, want 400", g, code)
+		}
 	}
 }
 
