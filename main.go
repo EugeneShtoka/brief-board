@@ -79,7 +79,7 @@ type Task struct {
 	JiraStatus map[string]string   `json:"jiraStatus,omitempty"` // key -> Jira status name, written by the brief
 	Links      []map[string]string `json:"links,omitempty"`      // {label, url}
 	Thread     map[string]string   `json:"thread,omitempty"`     // where a reply goes: {room, reply_to, thread}
-	Messages   []map[string]string `json:"messages,omitempty"`   // the story's messages: {label, room, event}, opened in kith
+	Messages   []map[string]string `json:"messages,omitempty"`   // the story's messages: {label, room, event, url}, opened at url, else in kith
 	Files      []string            `json:"files,omitempty"`      // Eugene's attachments: absolute paths under files/<id> next to the state file
 	DoneAt     *time.Time          `json:"doneAt,omitempty"`
 	UpdatedAt  time.Time           `json:"updatedAt"`
