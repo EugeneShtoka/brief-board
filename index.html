@@ -245,7 +245,7 @@ function pills(t) {
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
   if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + hm(t.doneAt) : ""}</span>`);
   else if (carried(t) > 0) out.push(`<span class="pill ${carried(t) >= 3 ? "crit" : ""}">carried ${carried(t)}d</span>`);
-  if (t.who) out.push(`<span>${esc(t.who)}</span>`);
+  if (t.who || t.waitingFor) out.push(`<span>${esc([t.who, t.waitingFor].filter(Boolean).join(": "))}</span>`);
   return out.join("");
 }
 
