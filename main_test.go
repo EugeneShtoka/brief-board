@@ -85,3 +85,24 @@ func TestMergePatch(t *testing.T) {
 		t.Error("a jiraStatus that is not a map was accepted")
 	}
 }
+
+func TestSpawnSessionTerminal(t *testing.T) {
+	dir := t.TempDir()
+	// The terminal gets the session as its argv, run in the task's folder.
+	b := &Board{claude: "claude", terminal: []string{"sh", "-c", `printf '%s\n' "$PWD" "$@" > args.tmp && mv args.tmp args`, "sh"}}
+	pane, err := b.spawnSession(dir, "s1", "do it")
+	if err != nil || pane != "" {
+		t.Fatalf("spawnSession = %q, %v; want no pane, no error", pane, err)
+	}
+	var out []byte
+	for range 100 {
+		if out, err = os.ReadFile(filepath.Join(dir, "args")); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\ndo it\n"
+	if string(out) != want {
+		t.Errorf("terminal got\n%s\nwant\n%s", out, want)
+	}
+}

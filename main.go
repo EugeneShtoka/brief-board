@@ -4,6 +4,9 @@
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
 // BOARD_WORKDIR (where work sessions run), BOARD_PROJECTS (~/dev: each subfolder but work is a project area),
 // BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
+// BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
+// run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
+// BOARD_SESSION_IN (tab | window: a wezterm session's new tab in the window last used, or its own window),
 // BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page).
 // Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
 package main
@@ -100,6 +103,8 @@ type Board struct {
 	home     string
 	projects string // folder whose subfolders are the project areas
 	claude   string
+	terminal []string // BOARD_TERMINAL; empty is the wezterm mux
+	window   bool     // wezterm: a session gets its own window, not a tab
 	selfURL  string
 	triage   chan struct{} // one Jira triage at a time
 	wake     chan struct{} // nudges scheduleBrief out of its sleep
@@ -534,7 +539,7 @@ func (b *Board) start(t *Task, req actRequest) {
 	}
 	if err == nil {
 		t.Job.Session = t.ID + "-" + req.Action
-		t.Job.Pane, err = spawnSession(b.claude, b.dirFor(t), t.Job.Session, prompt)
+		t.Job.Pane, err = b.spawnSession(b.dirFor(t), t.Job.Session, prompt)
 	}
 	if err != nil {
 		now := time.Now()
@@ -542,18 +547,47 @@ func (b *Board) start(t *Task, req actRequest) {
 		b.note(t, "claude", req.Action, "Could not start a session: "+err.Error())
 		return
 	}
-	b.note(t, "claude", "session", fmt.Sprintf("Started session %q in wezterm pane %s: attach in wezterm, or on claude.ai/code (remote control).", t.Job.Session, t.Job.Pane))
+	where := "your terminal"
+	if t.Job.Pane != "" {
+		where = "wezterm pane " + t.Job.Pane
+	}
+	b.note(t, "claude", "session", fmt.Sprintf("Started session %q in %s: attach there, or on claude.ai/code (remote control).", t.Job.Session, where))
 }
 
-// spawnSession opens an interactive Claude Code session in a new wezterm mux window and returns its pane id.
-// The pane closes when Claude exits, so a live pane means a live session.
-func spawnSession(claude, dir, name, prompt string) (string, error) {
+// spawnSession opens an interactive Claude Code session and returns its wezterm pane id ("" in another terminal).
+// In wezterm the pane closes when Claude exits, so a live pane means a live session.
+func (b *Board) spawnSession(dir, name, prompt string) (string, error) {
+	// zsh -lic gives the session the user's login env; the service's own PATH is bare.
+	// claude and the prompt reach zsh as "$0" and "$@", never as shell text.
+	session := []string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name, prompt}
+	if len(b.terminal) > 0 {
+		// shortcut: no pane to watch, so a session that dies without reporting keeps its task busy,
+		// and a terminal that stays our child dies with a board restart; track its process if another terminal gets real use.
+		cmd := exec.CommandContext(context.Background(), b.terminal[0], slices.Concat(b.terminal[1:], session)...) //nolint:gosec // BOARD_TERMINAL is the service's own setting
+		cmd.Dir = dir
+		if err := cmd.Start(); err != nil {
+			return "", fmt.Errorf("spawn: %w", err)
+		}
+		go func() { _ = cmd.Wait() }() // reap it; its exit says nothing about the session
+		return "", nil
+	}
+	spawn := []string{"cli", "spawn", "--cwd", dir}
+	if b.window {
+		spawn = append(spawn, "--new-window")
+	}
+	pane, err := wezterm(slices.Concat(spawn, []string{"--"}, session))
+	if err != nil && !b.window {
+		// No GUI attached to take the tab (wezterm cli picks the last-focused client's window): open a mux window.
+		pane, err = wezterm(slices.Concat(spawn, []string{"--new-window", "--"}, session))
+	}
+	return pane, err
+}
+
+// wezterm runs wezterm with args and returns its trimmed output.
+func wezterm(args []string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	// zsh -lic gives the session the user's login env; the mux server's own PATH is bare.
-	// claude and the prompt reach zsh as "$0" and "$@", never as shell text.
-	out, err := exec.CommandContext(ctx, "wezterm", "cli", "spawn", "--new-window", "--cwd", dir, "--", //nolint:gosec // see above
-		"zsh", "-lic", `exec "$0" "$@"`, claude, "--permission-mode", "auto", "--remote-control", name, "-n", name, prompt).Output()
+	out, err := exec.CommandContext(ctx, "wezterm", args...).Output() //nolint:gosec // args are the session's, passed as argv
 	if err != nil {
 		if ee, ok := errors.AsType[*exec.ExitError](err); ok {
 			return "", fmt.Errorf("spawn: %w: %s", err, strings.TrimSpace(string(ee.Stderr)))
@@ -690,6 +724,8 @@ func main() {
 		home:     home,
 		projects: env("BOARD_PROJECTS", filepath.Join(home, "dev")),
 		claude:   env("BOARD_CLAUDE", "claude"),
+		terminal: strings.Fields(os.Getenv("BOARD_TERMINAL")),
+		window:   os.Getenv("BOARD_SESSION_IN") == "window",
 		selfURL:  env("BOARD_URL", "http://localhost"+addr),
 		triage:   make(chan struct{}, 1),
 		wake:     make(chan struct{}, 1),
