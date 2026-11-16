@@ -155,3 +155,28 @@ func TestHandleAttach(t *testing.T) {
 		t.Errorf("name ..: %d, want 400", code)
 	}
 }
+
+func TestReapSessions(t *testing.T) {
+	// The mux lists pane 7 only.
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "wezterm"), []byte("#!/bin/sh\necho '[{\"pane_id\":7}]'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.Tasks = map[string]*Task{
+		"live": {ID: "live", Job: &Job{Action: "act", Status: "running", Session: "s1", Pane: "7"}},
+		"dead": {ID: "dead", Job: &Job{Action: "act", Status: "running", Session: "s2", Pane: "17"}},
+	}
+	b.reapSessions()
+	if got := b.st.Tasks["live"].Job.Status; got != "running" {
+		t.Errorf("live pane's job = %q, want running", got)
+	}
+	if got := b.st.Tasks["dead"].Job.Status; got != "failed" {
+		t.Errorf("gone pane's job = %q, want failed", got)
+	}
+	if _, err := os.Stat(b.path); err != nil {
+		t.Errorf("reaping did not save: %v", err)
+	}
+}

@@ -713,6 +713,22 @@ func (b *Board) busy(t *Task) bool {
 	return false
 }
 
+// reapSessions fails every session job whose pane is gone, so the board corrects itself without waiting
+// for a button press on that task.
+func (b *Board) reapSessions() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	reaped := false
+	for _, t := range b.st.Tasks {
+		if t.Job != nil && t.Job.Status == "running" && t.Job.Pane != "" && !b.busy(t) {
+			reaped = true
+		}
+	}
+	if reaped {
+		b.saveOrLog()
+	}
+}
+
 func (b *Board) logf(kind, format string, args ...any) {
 	e := Entry{At: time.Now(), Actor: "claude", Kind: kind, Text: fmt.Sprintf(format, args...)}
 	b.st.Log = append(b.st.Log, e)
@@ -838,6 +854,11 @@ func main() {
 	}
 	b.failInterrupted()
 	b.saveOrLog()
+	go func() {
+		for ; ; time.Sleep(time.Minute) {
+			b.reapSessions()
+		}
+	}()
 
 	// BOARD_JIRA_ROOM: the kith room the Jira bot posts in; BOARD_ISSUE_KEY: the key pattern in it.
 	if room := os.Getenv("BOARD_JIRA_ROOM"); room != "" {
