@@ -2,9 +2,10 @@
 // (wezterm mux, remote control) on a task when a button is pressed (reply, clarify, act). Drop is handled here.
 //
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
-// BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "roadmap", "jiraRoom"}, the board's areas and the folders
-// their sessions run in; work's is also where the brief runs; roadmap: the files the roadmap run reads, see defaultRoadmap;
-// jiraRoom: the kith room the area's Jira bot posts in, see watchJira),
+// BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery"}, the board's areas and
+// the folders their sessions run in; work's is also where the brief runs; roadmap: the files the roadmap run reads, see
+// defaultRoadmap; jiraRoom: the kith room the area's Jira bot posts in, see watchJira; briefEvery: how often the area is
+// briefed, a Go duration, default BOARD_BRIEF_EVERY, unset or 0 only by the board's button, see scheduleBrief),
 // BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
@@ -103,7 +104,8 @@ type State struct {
 	JiraSeen map[string][]string `json:"jiraSeenIn,omitempty"`
 	// GitHubSince is the newest GitHub notification's updated_at seen; empty until the first poll sets a baseline.
 	GitHubSince string `json:"githubSince,omitempty"`
-	BriefRun    *Job   `json:"briefRun,omitempty"`
+	// Briefs is, per area id, its last brief run.
+	Briefs map[string]*Job `json:"briefs,omitempty"`
 }
 
 const logCap = 200
@@ -119,12 +121,12 @@ type Board struct {
 	terminal []string // BOARD_TERMINAL; empty is the wezterm mux
 	window   bool     // wezterm: a session gets its own window, not a tab
 	selfURL  string
-	triage   chan struct{} // one Jira triage at a time
-	wake     chan struct{} // nudges scheduleBrief out of its sleep
-	rerun    bool          // a brief ran while kith was down: run it again now
-	ghETag   string        // pollGitHub's own: the ETag of its last notifications answer
-	clean    bool          // BOARD_CLEAN_MERGED
-	areas    []Area        // BOARD_AREAS
+	triage   chan struct{}   // one Jira triage at a time
+	wake     chan struct{}   // nudges scheduleBrief out of its sleep
+	rerun    map[string]bool // area ids to brief now: the board's button, or a brief that ran while kith was down
+	ghETag   string          // pollGitHub's own: the ETag of its last notifications answer
+	clean    bool            // BOARD_CLEAN_MERGED
+	areas    []Area          // BOARD_AREAS
 }
 
 // areaRe keeps an area id a plain lowercase name.
@@ -132,13 +134,15 @@ var areaRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // Area is one area of the board: its id (what a task stores), the name the page shows, the folder its sessions run in,
 // the globs, relative to that folder, of the files the roadmap run reads for its next items, and the kith room its Jira
-// bot posts in, if it has a Jira.
+// bot posts in, if it has a Jira, and how often it is briefed.
 type Area struct {
-	ID       string   `json:"id"`
-	Name     string   `json:"name"`
-	Dir      string   `json:"dir"`
-	Roadmap  []string `json:"roadmap"`
-	JiraRoom string   `json:"jiraRoom,omitempty"`
+	ID         string        `json:"id"`
+	Name       string        `json:"name"`
+	Dir        string        `json:"dir"`
+	Roadmap    []string      `json:"roadmap"`
+	JiraRoom   string        `json:"jiraRoom,omitempty"`
+	BriefEvery string        `json:"briefEvery,omitempty"`
+	every      time.Duration // BriefEvery, parsed; 0 is never on schedule
 }
 
 // defaultRoadmap is an area's roadmap when BOARD_AREAS gives it none; "roadmap": [] reads no files.
@@ -181,6 +185,12 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		a.Name = cmp.Or(a.Name, a.ID)
 		if a.Roadmap == nil {
 			a.Roadmap = defaultRoadmap
+		}
+		if every := cmp.Or(a.BriefEvery, os.Getenv("BOARD_BRIEF_EVERY")); every != "" {
+			var err error
+			if a.every, err = time.ParseDuration(every); err != nil {
+				return nil, fmt.Errorf("parseAreas: %s: briefEvery: %w", a.ID, err)
+			}
 		}
 		if a.Dir == "~" || strings.HasPrefix(a.Dir, "~/") {
 			a.Dir = filepath.Join(b.home, a.Dir[1:])
@@ -355,7 +365,7 @@ func (b *Board) handleState(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(tasks, func(i, j int) bool {
 		return tasks[i].Order < tasks[j].Order || tasks[i].Order == tasks[j].Order && tasks[i].ID < tasks[j].ID
 	})
-	writeJSON(w, 200, map[string]any{"brief": b.st.Brief, "tasks": tasks, "log": b.st.Log, "briefRun": b.st.BriefRun,
+	writeJSON(w, 200, map[string]any{"brief": b.st.Brief, "tasks": tasks, "log": b.st.Log, "briefs": b.st.Briefs,
 		"config": map[string]any{"issue": os.Getenv("BOARD_ISSUE_URL"), "pr": os.Getenv("BOARD_PR_URL"), "areas": b.areas}})
 }
 
@@ -375,20 +385,35 @@ func (b *Board) handleBrief(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, body)
 }
 
-// handleBriefRun runs the scheduled brief now, from the board's button.
+// handleBriefRun briefs the areas the board's button names ({"areas": [ids]}, the ones the filter shows) now;
+// an area with nothing to brief, or whose brief is running, is left out.
 func (b *Board) handleBriefRun(w http.ResponseWriter, r *http.Request) {
-	if envDuration("BOARD_BRIEF_EVERY") <= 0 {
-		writeJSON(w, 409, map[string]string{"error": "the brief is not scheduled here (BOARD_BRIEF_EVERY)"})
+	var body struct {
+		Areas []string `json:"areas"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.Areas) == 0 {
+		writeJSON(w, 400, map[string]string{"error": "areas: required, the ids of the areas to brief"})
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.st.BriefRun != nil && b.st.BriefRun.Status == "running" {
-		writeJSON(w, 409, map[string]string{"error": "a brief is already running"})
+	var ids []string
+	for _, id := range body.Areas {
+		i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == id })
+		if i < 0 {
+			writeJSON(w, 400, map[string]string{"error": "areas: no area " + id + " in BOARD_AREAS"})
+			return
+		}
+		if b.briefs(&b.areas[i]) && !b.briefing(id) {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		writeJSON(w, 409, map[string]string{"error": "nothing to brief: those areas have no brief, or theirs is running"})
 		return
 	}
-	b.briefNow()
-	writeJSON(w, 202, map[string]string{"status": "queued"})
+	b.briefNow(ids...)
+	writeJSON(w, 202, map[string]any{"status": "queued", "areas": ids})
 }
 
 // mergePatch returns t with patch's fields over it. jiraStatus merges per key, so updating one
@@ -931,8 +956,10 @@ func (b *Board) failInterrupted() {
 			b.note(t, "claude", t.Job.Action, "Interrupted: the board restarted while this was running.")
 		}
 	}
-	if b.st.BriefRun != nil && b.st.BriefRun.Status == "running" {
-		b.st.BriefRun.Status = "failed"
+	for _, j := range b.st.Briefs {
+		if j.Status == "running" {
+			j.Status = "failed"
+		}
 	}
 }
 
@@ -1006,9 +1033,11 @@ func main() {
 	}
 	// BOARD_GITHUB_POLL: how often to read GitHub notifications (via gh) onto the tasks they are about; unset is off.
 	go b.watchGitHub(keyRe, envDuration("BOARD_GITHUB_POLL"))
-	if every := envDuration("BOARD_BRIEF_EVERY"); every > 0 {
-		go b.scheduleBrief(every)
-		log.Printf("brief every %s", every)
+	go b.scheduleBrief()
+	for _, a := range b.areas {
+		if a.every > 0 && b.briefs(&a) {
+			log.Printf("briefing %s every %s", a.ID, a.every)
+		}
 	}
 
 	log.Printf("brief-board on %s, state %s, claude runs in %s", addr, b.path, b.workdir)

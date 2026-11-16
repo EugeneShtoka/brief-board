@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -143,23 +144,34 @@ func (b *Board) watchJira(server string, area *Area, keyRe *regexp.Regexp, every
 	}
 }
 
-// kithBack runs when kith reads work again (keyring unlocked, kithd back). A brief that started
+// kithBack runs when kith reads work again (keyring unlocked, kithd back). An area's brief that started
 // after the last good read may have run without chat, so it asks scheduleBrief to run it again.
 func (b *Board) kithBack(lastOK time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !b.lastBrief().After(lastOK) {
+	var ids []string
+	for _, a := range b.areas {
+		if b.lastBrief(a.ID).After(lastOK) {
+			ids = append(ids, a.ID)
+		}
+	}
+	if len(ids) == 0 {
 		return false
 	}
-	b.logf("kith", "kith reads work again; re-running the brief that ran while it was down")
+	b.logf("kith", "kith reads work again; re-running the briefs that ran while it was down: %s", strings.Join(ids, ", "))
 	b.saveOrLog()
-	b.briefNow()
+	b.briefNow(ids...)
 	return true
 }
 
-// briefNow asks scheduleBrief to run the brief now. The caller holds b.mu.
-func (b *Board) briefNow() {
-	b.rerun = true
+// briefNow asks scheduleBrief to brief these areas now. The caller holds b.mu.
+func (b *Board) briefNow(ids ...string) {
+	if b.rerun == nil {
+		b.rerun = map[string]bool{}
+	}
+	for _, id := range ids {
+		b.rerun[id] = true
+	}
 	select {
 	case b.wake <- struct{}{}:
 	default:
@@ -240,44 +252,26 @@ Never send messages and never change Jira. Your final message is one line: what 
 	b.saveOrLog()
 }
 
-// scheduleBrief runs the brief skill whenever the last brief is older than every.
-func (b *Board) scheduleBrief(every time.Duration) {
+// scheduleBrief briefs each area whose last brief is older than its briefEvery, or that briefNow named. An area's brief is
+// the brief skill for work, the sweep (mail, calendar, personal chats) for personal, and the roadmap run for its roadmap
+// files; the areas due together share one roadmap run.
+func (b *Board) scheduleBrief() {
 	for {
 		b.mu.Lock()
-		last := b.lastBrief()
-		due := (time.Since(last) >= every || b.rerun) && (b.st.BriefRun == nil || b.st.BriefRun.Status != "running")
-		if due {
-			b.rerun = false
-			b.st.BriefRun = &Job{Action: "brief", Status: "running", StartedAt: time.Now()}
+		due := b.dueBriefs()
+		if len(due) > 0 {
+			if b.st.Briefs == nil {
+				b.st.Briefs = map[string]*Job{}
+			}
+			for _, id := range due {
+				b.st.Briefs[id] = &Job{Action: "brief", Status: "running", StartedAt: time.Now()}
+			}
 			b.saveOrLog()
 		}
 		b.mu.Unlock()
-		if due {
-			status, text := runClaude(b.claude, b.workdir, `Use the brief skill. This is a scheduled run from the Brief Board and nobody is watching:
-do the sweep, save the history file and sync the board (step 5), but take no actions and send nothing.
-Your final message is the brief's opening paragraph.`)
-			b.mu.Lock()
-			now := time.Now()
-			b.st.BriefRun.Status, b.st.BriefRun.EndedAt = status, &now
-			b.logf("brief", "%s: %s", status, text)
-			b.saveOrLog()
-			b.mu.Unlock()
 
-			// Mail, calendar and personal chats: a global skill, so it runs from home, not the work repo.
-			status, text = runClaude(b.claude, b.home, `Use the sweep skill. This is a scheduled run from the Brief Board and nobody is watching:
-sync the board, but take no actions and send nothing. Your final message is one line: what changed on the board.`)
-			b.mu.Lock()
-			b.logf("sweep", "%s: %s", status, text)
-			b.saveOrLog()
-			b.mu.Unlock()
-
-			if prompt := b.roadmapPrompt(); prompt != "" {
-				status, text = runClaude(b.claude, b.home, prompt)
-				b.mu.Lock()
-				b.logf("roadmap", "%s: %s", status, text)
-				b.saveOrLog()
-				b.mu.Unlock()
-			}
+		if len(due) > 0 {
+			b.runBriefs(due)
 		}
 		select {
 		case <-b.wake:
@@ -286,22 +280,97 @@ sync the board, but take no actions and send nothing. Your final message is one 
 	}
 }
 
-// roadmapPrompt asks Claude to keep one task per next item of the areas' roadmap files; "" when no area has one.
-func (b *Board) roadmapPrompt() string {
-	var files strings.Builder
+// runBriefs runs the briefs of the due areas, one Claude run after another, and ends each area's brief run with its
+// status: failed if any of its Claude runs failed.
+func (b *Board) runBriefs(due []string) {
+	status := map[string]string{}
+	run := func(kind, dir, prompt string, ids ...string) {
+		s, text := runClaude(b.claude, dir, prompt)
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		b.logf(kind, "%s: %s", s, text)
+		b.saveOrLog()
+		for _, id := range ids {
+			if status[id] != "failed" {
+				status[id] = s
+			}
+		}
+	}
+	if slices.Contains(due, "work") {
+		run("brief", b.workdir, `Use the brief skill. This is a scheduled run from the Brief Board and nobody is watching:
+do the sweep, save the history file and sync the board (step 5), but take no actions and send nothing.
+Your final message is the brief's opening paragraph.`, "work")
+	}
+	if slices.Contains(due, "personal") {
+		// A global skill, so it runs from home, not the work repo.
+		run("sweep", b.home, `Use the sweep skill. This is a scheduled run from the Brief Board and nobody is watching:
+sync the board, but take no actions and send nothing. Your final message is one line: what changed on the board.`, "personal")
+	}
+	if prompt, ids := b.roadmapPrompt(due); prompt != "" {
+		run("roadmap", b.home, prompt, ids...)
+	}
+
+	b.mu.Lock()
+	now := time.Now()
+	for _, id := range due {
+		b.st.Briefs[id].Status, b.st.Briefs[id].EndedAt = cmp.Or(status[id], "ok"), &now
+	}
+	b.saveOrLog()
+	b.mu.Unlock()
+}
+
+// dueBriefs is the areas to brief now: named by briefNow, or last briefed longer ago than their briefEvery; an area with
+// no brief, or whose brief is running, is left out; a name for one that is running waits. The caller holds b.mu.
+func (b *Board) dueBriefs() []string {
+	var due []string
 	for i := range b.areas {
+		a := &b.areas[i]
+		switch {
+		case !b.briefs(a):
+			delete(b.rerun, a.ID)
+		case b.briefing(a.ID): // a name waits for the running brief to end
+		case b.rerun[a.ID] || a.every > 0 && time.Since(b.lastBrief(a.ID)) >= a.every:
+			delete(b.rerun, a.ID)
+			due = append(due, a.ID)
+		}
+	}
+	return due
+}
+
+// briefs says whether a has a brief: the brief skill (work), the sweep (personal) or roadmap files.
+func (b *Board) briefs(a *Area) bool {
+	return a.ID == "work" || a.ID == "personal" || len(a.roadmapFiles()) > 0
+}
+
+// briefing says whether the area's brief is running. The caller holds b.mu.
+func (b *Board) briefing(id string) bool {
+	return b.st.Briefs[id] != nil && b.st.Briefs[id].Status == "running"
+}
+
+// roadmapPrompt asks Claude to keep one task per next item of the roadmap files of the areas ids names, and returns the
+// areas that have files; "" when none has.
+func (b *Board) roadmapPrompt(ids []string) (string, []string) {
+	var files strings.Builder
+	var with []string
+	for i := range b.areas {
+		if !slices.Contains(ids, b.areas[i].ID) {
+			continue
+		}
 		for _, f := range b.areas[i].roadmapFiles() {
 			fmt.Fprintf(&files, "- area %q: %s\n", b.areas[i].ID, f)
+			if !slices.Contains(with, b.areas[i].ID) {
+				with = append(with, b.areas[i].ID)
+			}
 		}
 	}
 	if files.Len() == 0 {
-		return ""
+		return "", nil
 	}
 	return fmt.Sprintf(`Keep Eugene's Brief Board (%s) in step with his roadmap files. This is a scheduled run and nobody is watching.
 
 The files, by the board area their tasks belong to:
 %s
-1. GET /api/state. The tasks with source "roadmap" are yours; touch no other task.
+1. GET /api/state. The tasks with source "roadmap" in these areas are yours; touch no other task.
 2. Read each file and find its next to-do items: what it puts now or next (a Now/Next section, unchecked boxes, the
    top of an ordered list), not the whole backlog, at most five per file. Read only these files.
 3. PUT /api/tasks/roadmap-<area>-<short slug of the item> (JSON, fields merge) for each one: source "roadmap", that area,
@@ -314,16 +383,16 @@ The files, by the board area their tasks belong to:
    git commit -m "Roadmap: <item> done" -- <file>, never pushed. An untracked file is just edited.
    A dropped task: leave the file alone, and don't make the task again.
 
-Your final message is one line: what changed on the board and in which files.`, b.selfURL, files.String())
+Your final message is one line: what changed on the board and in which files.`, b.selfURL, files.String()), with
 }
 
-// lastBrief is when the last brief started: a scheduled run, or the brief Claude last pushed.
-func (b *Board) lastBrief() time.Time {
+// lastBrief is when the area's last brief started: a scheduled run, or for work also the brief Claude last pushed.
+func (b *Board) lastBrief(id string) time.Time {
 	var last time.Time
-	if b.st.BriefRun != nil {
-		last = b.st.BriefRun.StartedAt
+	if j := b.st.Briefs[id]; j != nil {
+		last = j.StartedAt
 	}
-	if at, ok := b.st.Brief["at"].(string); ok {
+	if at, ok := b.st.Brief["at"].(string); ok && id == "work" {
 		if t, err := time.Parse(time.RFC3339, at); err == nil && t.After(last) {
 			last = t
 		}

@@ -297,12 +297,17 @@ function render() {
 
   const b = state.brief || {};
   if (b.headline) put($("headline"), linkify(b.headline));
-  const run = state.briefRun;
-  $("date").textContent = b.at ? `${dm(b.at)} ${hm(b.at)}` : "None yet";
-  // The scheduled run only shows while it runs or after it failed; a good run already shows as the brief above.
-  $("brun").hidden = !run || run.status === "ok";
-  $("brun").textContent = !run ? "" : run.status === "running" ? `Running since ${hm(run.startedAt)}…` : `Scheduled run ${run.status} ${dm(run.startedAt)} ${hm(run.startedAt)}`;
-  $("run-brief").disabled = run?.status === "running";
+  // Each shown area's last brief (work's is also the brief Claude last pushed), newest on top; the button briefs the shown areas.
+  const shown = areaList().filter(([v]) => !hide.area.includes(v));
+  const runs = shown.map(([v, l]) => {
+    const run = (state.briefs || {})[v], at = v === "work" && b.at && (!run || new Date(b.at) > new Date(run.startedAt)) ? b.at : run?.startedAt;
+    return at && { l, at, status: at === run?.startedAt ? run.status : "ok" };
+  }).filter(Boolean).sort((x, y) => new Date(y.at) - new Date(x.at));
+  $("date").textContent = runs.length ? `${dm(runs[0].at)} ${hm(runs[0].at)}` : "None yet";
+  $("brun").hidden = !runs.length;
+  put($("brun"), runs.map((x) => `${esc(x.l)} ${dm(x.at)} ${hm(x.at)}${x.status === "running" ? " running…" : x.status === "failed" ? " failed" : ""}`).join("<br>"));
+  $("run-brief").textContent = hide.area.length ? `Brief ${shown.length === 1 ? shown[0][1] : shown.length + " areas"} now` : "Run brief now";
+  $("run-brief").disabled = !shown.length;
   if (openId) renderDialog(false);
 }
 
@@ -496,7 +501,8 @@ $("dlg").addEventListener("change", async (e) => {
 $("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); });
 $("run-brief").addEventListener("click", async () => {
   $("run-brief").disabled = true;
-  const r = await fetch("api/brief/run", { method: "POST" }).catch(() => null);
+  const areas = areaList().map(([v]) => v).filter((v) => !hide.area.includes(v));
+  const r = await fetch("api/brief/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ areas }) }).catch(() => null);
   if (!r || !r.ok) { $("note").hidden = false; $("note").textContent = `Couldn't start the brief: ${r ? (await r.json().catch(() => ({}))).error || r.status : "no server"}.`; $("run-brief").disabled = false; return; }
   refresh();
 });
