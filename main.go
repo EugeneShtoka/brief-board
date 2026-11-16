@@ -8,7 +8,8 @@
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
 // BOARD_SESSION_IN (tab | window: a wezterm session's new tab in the window last used, or its own window),
 // BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page),
-// BOARD_PRUNE_WORKTREES (1: a task moving to done removes its merged pull requests' worktrees, see pruneWorktree).
+// BOARD_CLEAN_MERGED (1: a task moving to done with a merged pull request closes its session and removes the
+// pull request's worktree, see cleanMerged).
 // Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
 package main
 
@@ -118,7 +119,7 @@ type Board struct {
 	wake     chan struct{} // nudges scheduleBrief out of its sleep
 	rerun    bool          // a brief ran while kith was down: run it again now
 	ghETag   string        // pollGitHub's own: the ETag of its last notifications answer
-	prune    bool          // BOARD_PRUNE_WORKTREES
+	clean    bool          // BOARD_CLEAN_MERGED
 }
 
 // areaRe keeps an area a plain folder name, since it picks the folder a session runs in.
@@ -881,7 +882,7 @@ func main() {
 		claude:   env("BOARD_CLAUDE", "claude"),
 		terminal: strings.Fields(os.Getenv("BOARD_TERMINAL")),
 		window:   os.Getenv("BOARD_SESSION_IN") == "window",
-		prune:    os.Getenv("BOARD_PRUNE_WORKTREES") == "1",
+		clean:    os.Getenv("BOARD_CLEAN_MERGED") == "1",
 		selfURL:  env("BOARD_URL", "http://localhost"+addr),
 		triage:   make(chan struct{}, 1),
 		wake:     make(chan struct{}, 1),

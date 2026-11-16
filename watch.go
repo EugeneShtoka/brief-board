@@ -397,7 +397,7 @@ func taskPulls(t *Task) []string {
 	return pulls
 }
 
-// ghPull is the part of a pull request settleMerged and pruneMerged read.
+// ghPull is the part of a pull request settleMerged and cleanMerged read.
 type ghPull struct {
 	State    string `json:"state"` // open | closed
 	Merged   bool   `json:"merged"`
@@ -468,16 +468,34 @@ func (b *Board) settleMerged(checks []settleCheck, since string) {
 	}
 }
 
-// doneNow is t moving to done: with BOARD_PRUNE_WORKTREES, the worktrees of its merged pull
-// requests go (see pruneMerged); callers hold mu.
+// doneNow is t moving to done: with BOARD_CLEAN_MERGED, what its merged pull requests leave behind
+// goes (see cleanMerged); callers hold mu.
 func (b *Board) doneNow(t *Task) {
-	if pages := taskPulls(t); b.prune && len(pages) > 0 {
-		go b.pruneMerged(t.ID, b.dirFor(t), pages)
+	pages := taskPulls(t)
+	if !b.clean || len(pages) == 0 {
+		return
 	}
+	pane := ""
+	// A session still running has not reported yet: it may be mid-work, so it stays.
+	if t.Job != nil && t.Job.Status != "running" {
+		pane = t.Job.Pane
+	}
+	go b.cleanMerged(t.ID, b.dirFor(t), pane, pages)
 }
 
-// pruneMerged runs pruneWorktree in dir for each merged pull request of pages and notes what it did on task id.
-func (b *Board) pruneMerged(id, dir string, pages []string) {
+// cleanMerged runs once a task is done: if one of its pull requests (pages) is merged, it closes the
+// task's session (its wezterm pane, "" for none), then runs pruneWorktree in dir for each merged one,
+// noting on task id what it did.
+func (b *Board) cleanMerged(id, dir, pane string, pages []string) {
+	say := func(text string) {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if t := b.st.Tasks[id]; t != nil {
+			b.note(t, "board", "cleanup", text)
+			b.saveOrLog()
+		}
+	}
+	var merged []ghPull
 	for _, page := range pages {
 		out, err := ghAPI(ghAPIURL(page))
 		var p ghPull
@@ -485,25 +503,33 @@ func (b *Board) pruneMerged(id, dir string, pages []string) {
 			err = json.Unmarshal(out, &p)
 		}
 		if err != nil {
-			log.Printf("github: prune %s: %v", id, err)
+			log.Printf("github: clean %s: %v", id, err)
 			continue
 		}
-		if !p.Merged {
-			continue
+		if p.Merged {
+			merged = append(merged, p)
 		}
+	}
+	if len(merged) == 0 {
+		return
+	}
+	if pane != "" && paneAlive(pane) {
+		if _, err := wezterm([]string{"cli", "kill-pane", "--pane-id", pane}); err != nil {
+			log.Printf("github: clean %s: %v", id, err)
+		} else {
+			say("closed its session (wezterm pane " + pane + "): its pull request is merged")
+			// shortcut: a session slower than this to exit keeps its worktree (noted as in use); poll inUse if that shows up.
+			time.Sleep(time.Second)
+		}
+	}
+	for _, p := range merged {
 		text, err := pruneWorktree(dir, p.Head.Ref, p.Head.SHA)
 		if err != nil {
-			log.Printf("github: prune %s: %v", id, err)
+			log.Printf("github: clean %s: %v", id, err)
 		}
-		if text == "" {
-			continue
+		if text != "" {
+			say(text)
 		}
-		b.mu.Lock()
-		if t := b.st.Tasks[id]; t != nil {
-			b.note(t, "board", "worktree", text)
-			b.saveOrLog()
-		}
-		b.mu.Unlock()
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -264,7 +265,10 @@ func TestPullsDone(t *testing.T) {
 	}
 }
 
-func TestPruneWorktree(t *testing.T) {
+// gitRepo is a fresh repo with one commit, and tree, which makes .worktrees/name on a new branch name
+// with one commit and returns its path and tip (the merged head).
+func gitRepo(t *testing.T) (repo string, run func(dir string, args ...string) string, tree func(name string) (string, string)) {
+	t.Helper()
 	// Run as a git hook (pre-push), GIT_DIR and friends would point every git call at the real repo.
 	for _, kv := range os.Environ() {
 		if k, _, _ := strings.Cut(kv, "="); strings.HasPrefix(k, "GIT_") {
@@ -280,7 +284,7 @@ func TestPruneWorktree(t *testing.T) {
 		t.Setenv(k+"_NAME", "t")
 		t.Setenv(k+"_EMAIL", "t@t")
 	}
-	run := func(dir string, args ...string) string {
+	run = func(dir string, args ...string) string {
 		t.Helper()
 		out, err := git(dir, args...)
 		if err != nil {
@@ -288,16 +292,20 @@ func TestPruneWorktree(t *testing.T) {
 		}
 		return strings.TrimSpace(out)
 	}
-	repo := t.TempDir()
+	repo = t.TempDir()
 	run(repo, "init", "-q", "-b", "main")
 	run(repo, "commit", "-q", "--allow-empty", "-m", "init")
-	// tree makes .worktrees/name on branch name with one commit; its tip is the merged head.
-	tree := func(name string) (string, string) {
+	tree = func(name string) (string, string) {
 		path := filepath.Join(repo, ".worktrees", name)
 		run(repo, "worktree", "add", "-q", path, "-b", name)
 		run(path, "commit", "-q", "--allow-empty", "-m", name)
 		return path, run(path, "rev-parse", "HEAD")
 	}
+	return repo, run, tree
+}
+
+func TestPruneWorktree(t *testing.T) {
+	repo, run, tree := gitRepo(t)
 
 	path, sha := tree("merged")
 	if got, err := pruneWorktree(repo, "merged", sha); err != nil || got != "removed .worktrees/merged and branch merged, merged" {
@@ -342,5 +350,47 @@ func TestPruneWorktree(t *testing.T) {
 		if _, err := os.Stat(p); err != nil {
 			t.Errorf("kept worktree gone: %v", err)
 		}
+	}
+}
+
+func TestCleanMerged(t *testing.T) {
+	repo, _, tree := gitRepo(t)
+	path, sha := tree("feature")
+	// The session's shell sits in the worktree until its pane is killed.
+	shell := exec.CommandContext(t.Context(), "sleep", "30")
+	shell.Dir = path
+	if err := shell.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = shell.Wait() }()
+	defer func() { _ = shell.Process.Kill() }()
+
+	bin, dir := t.TempDir(), t.TempDir()
+	killed := filepath.Join(dir, "killed")
+	for name, script := range map[string]string{
+		"gh":      `echo '{"state":"closed","merged":true,"head":{"ref":"feature","sha":"` + sha + `"}}'`,
+		"wezterm": `case "$2" in list) echo '[{"pane_id":7}]';; kill-pane) echo "$@" >` + killed + `; kill ` + strconv.Itoa(shell.Process.Pid) + `;; esac`,
+	} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.Tasks = map[string]*Task{"t": {ID: "t", Job: &Job{Status: "ok", Pane: "7"}}}
+
+	b.cleanMerged("t", repo, "7", []string{"https://github.com/o/r/pull/1"})
+	if got, _ := os.ReadFile(killed); string(got) != "cli kill-pane --pane-id 7\n" {
+		t.Errorf("wezterm got %q, want the pane killed", got)
+	}
+	var notes []string
+	for _, e := range b.st.Tasks["t"].History {
+		notes = append(notes, e.Text)
+	}
+	if want := []string{
+		"closed its session (wezterm pane 7): its pull request is merged",
+		"removed .worktrees/feature and branch feature, merged",
+	}; !slices.Equal(notes, want) {
+		t.Errorf("notes = %q, want %q", notes, want)
 	}
 }
