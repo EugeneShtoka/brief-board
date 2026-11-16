@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-/* Layout: header (headline + progress), then two tabs: Tickets (area filter, new task, four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions. */
+/* Layout: header (headline, area filter + progress), then two tabs: Tickets (new task, four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions. */
 :root {
   --bg: #f3f5f8; --surface: #ffffff; --ink: #172033; --muted: #5b6577; --line: #dde2ea;
   --accent: #2f5bd3; --accent-soft: #e6ecfb;
@@ -117,11 +117,6 @@ textarea:focus, input:focus { outline: 0.125rem solid var(--accent); outline-off
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 .hint { font-size: 0.75rem; color: var(--muted); }
 .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; justify-content: space-between; }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 0.5rem; overflow: hidden; }
-.seg button { all: unset; cursor: pointer; font: 500 0.8125rem var(--body); color: var(--muted); padding: 0.375rem 0.75rem; }
-.seg button + button { border-left: 1px solid var(--line); }
-.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); }
-.seg button:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: -0.125rem; }
 select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem 0.625rem; }
 .err { font-size: 0.8125rem; color: var(--crit); }
 @media (prefers-reduced-motion: reduce) { .bar > span { transition: none; } .pill.run { animation: none; } }
@@ -135,6 +130,7 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
       <h1>Brief Board</h1>
       <p class="headline" id="headline">Tasks from the daily brief appear here once Claude writes them.</p>
       <div class="note" id="note" hidden></div>
+      <label for="areas" style="display:flex;align-items:center;gap:0.5rem;justify-self:start;margin-top:0.625rem">Area<select id="areas"></select></label>
     </div>
     <div class="progress" aria-label="Today's progress">
       <div class="num" id="pnum">0 / 0 <small>closed today</small></div>
@@ -147,7 +143,6 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
     <button class="tab" role="tab" id="tab-history" aria-controls="log">History <span class="count" id="n-history"></span></button>
   </div>
   <div class="toolbar" id="toolbar">
-    <div class="seg" role="group" aria-label="Area" id="areas"></div>
     <button class="btn" id="new-task">+ New task</button>
   </div>
   <div class="lanes" id="lanes" role="tabpanel" aria-labelledby="tab-tickets"></div>
@@ -191,16 +186,15 @@ function laneOf(t) {
   return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
 }
 // Areas: work (the brief's tasks, and anything unmarked), personal, or a project named after its folder in ~/dev.
-const AREAS = [["all", "All"], ["work", "Work"], ["projects", "Projects"], ["personal", "Personal"]];
-const kindOf = (t) => !t.area || t.area === "work" ? "work" : t.area === "personal" ? "personal" : "projects";
 let area = "all";
 try { area = localStorage.getItem("area") || "all"; } catch {}
-const inArea = (t) => area === "all" || kindOf(t) === area;
+// The filter is All or one area; it narrows the lanes, the progress summary and History.
+const inArea = (t) => area === "all" || (t.area || "work") === area;
 const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
 
 function pills(t) {
   const [gl, gc] = GROUP[t.group] || [t.group || "", ""], out = [];
-  if (kindOf(t) !== "work") out.push(`<span class="pill">${esc(t.area)}</span>`);
+  if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(t.area)}</span>`);
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
@@ -212,9 +206,11 @@ function pills(t) {
 }
 
 function render() {
+  // A stored area that no longer exists (a removed project) falls back to All.
+  if (area !== "all" && !["work", "personal", ...(cfg().projects || [])].includes(area)) area = "all";
   const by = { todo: [], doing: [], waiting: [], closed: [] };
   for (const t of state.tasks.filter(inArea)) { const l = laneOf(t); if (l) by[l].push(t); }
-  put($("areas"), AREAS.map(([k, label]) => `<button data-area="${k}" aria-pressed="${k === area}">${label}</button>`).join(""));
+  put($("areas"), `<option value="all" ${area === "all" ? "selected" : ""}>All</option>` + areaOpts(area));
   for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
     : (a.group === "urgent" ? 0 : 1) - (b.group === "urgent" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
   put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
@@ -230,7 +226,7 @@ function render() {
   put($("week"), days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join(""));
 
   $("n-tickets").textContent = total - by.closed.length;
-  $("n-history").textContent = [...state.tasks.flatMap((t) => t.history || []), ...(state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
+  $("n-history").textContent = [...state.tasks.filter(inArea).flatMap((t) => t.history || []), ...(area === "all" ? state.log || [] : [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
 
   const b = state.brief || {};
   if (b.headline) put($("headline"), linkify(b.headline));
@@ -286,8 +282,7 @@ const areaOpts = (sel) => [["work", "Work"], ...(cfg().projects || []).map((p) =
 
 // New task: an id from the title, the area preset from the filter, Eugene as its creator.
 function renderNew() {
-  const projects = cfg().projects || [];
-  const pre = area === "projects" ? projects[0] : area === "all" ? "work" : area;
+  const pre = area === "all" ? "work" : area;
   $("dlg-body").innerHTML = `
     <div class="dlg-head"><h2 id="dlg-title">New task</h2><button class="x" id="x" aria-label="Close">×</button></div>
     <form id="new-form" style="display:grid;gap:0.875rem">
@@ -389,11 +384,11 @@ $("dlg").addEventListener("change", async (e) => {
 });
 $("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); });
 $("new-task").addEventListener("click", () => { openId = null; renderNew(); $("dlg").showModal(); $("n-title").focus(); });
-$("areas").addEventListener("click", (e) => {
-  const b = e.target.closest("[data-area]"); if (!b) return;
-  area = b.dataset.area;
+$("areas").addEventListener("change", (e) => {
+  area = e.target.value;
   try { localStorage.setItem("area", area); } catch {}
   render();
+  if (!$("log").hidden) loadLog();
 });
 // The open tab lives in the URL hash, so a reload or a bookmark keeps it.
 function showTab() {
@@ -411,7 +406,11 @@ async function loadLog() {
   const shown = week;
   const r = await fetch(`api/log?week=${shown}`).catch(() => null);
   if (!r || !r.ok || shown !== week) return;
-  const { entries, older } = await r.json();
+  const { entries: all, older } = await r.json();
+  // A task's line carries its area when written (older lines take the task's current one); board-level lines (brief, sweep, triage runs) belong to no one area, so only All shows them.
+  const tasks = new Map(state.tasks.map((t) => [t.id, t]));
+  for (const e of all) if (e.task && !e.area) e.area = (tasks.get(e.task) || {}).area;
+  const entries = all.filter((e) => e.task ? inArea(e) : area === "all");
   const thisWeek = mondayOf(new Date());
   $("wk-label").textContent = `${dm(week)} – ${dm(addDays(week, 6))}${week === thisWeek ? " · this week" : ""}`;
   $("wk-prev").disabled = !older; $("wk-next").disabled = week >= thisWeek;
@@ -419,7 +418,7 @@ async function loadLog() {
   $("activity").innerHTML = entries.sort((a, b) => b.at.localeCompare(a.at)).map((e) => {
     const d = ymd(new Date(e.at)), head = d === day ? "" : `<li class="day">${d === today ? "Today" : new Date(e.at).toLocaleDateString("en-GB", { weekday: "long" })} ${dm(d)}</li>`;
     day = d;
-    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
+    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}${e.area && e.area !== "work" ? ` <span class="pill">${esc(e.area)}</span>` : ""}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
   }).join("") || `<li><time>—</time><span class="hint">Nothing this week.</span></li>`;
 }
 $("wk-prev").addEventListener("click", () => { week = addDays(week, -7); loadLog(); });
