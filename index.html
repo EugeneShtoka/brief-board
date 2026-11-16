@@ -183,8 +183,7 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
 
 <script>
 const LANES = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting on others"], ["closed", "Closed today"]];
-const GROUP = { waiting_on_you: ["Owed reply", "warn"], ready: ["Ready to close", "ok"],
-  waiting_on_others: ["Waiting", ""], roadmap: ["Roadmap", ""], later: ["Later", ""] };
+const GROUP = { waiting_on_you: ["Owed reply", "warn"], ready: ["Ready to close", "ok"], roadmap: ["Roadmap", ""] };
 // Urgency and importance are Eugene's, three levels each; every task has both, medium unless set.
 const LEVEL = [["high", "High"], ["medium", "Medium"], ["low", "Low"]];
 const STATUS = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting"], ["done", "Done"], ["dropped", "Dropped"]];

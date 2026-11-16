@@ -70,7 +70,7 @@ type Job struct {
 type Task struct {
 	ID         string              `json:"id"`
 	Title      string              `json:"title"`
-	Group      string              `json:"group"`            // waiting_on_you | ready | waiting_on_others | roadmap | later; urgency says what is urgent
+	Group      string              `json:"group"`            // waiting_on_you | ready | roadmap; urgency and status say what is urgent, later or waiting
 	Status     string              `json:"status"`           // todo | doing | waiting | done | dropped
 	Area       string              `json:"area,omitempty"`   // an id from BOARD_AREAS, required
 	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats) | roadmap (an area's roadmap files)
@@ -223,11 +223,21 @@ func (b *Board) load() error {
 	if err := json.Unmarshal(data, &b.st); err != nil {
 		return fmt.Errorf("load: %w", err)
 	}
-	// A task's area is required; ones from before that are work. The old "urgent" group is high urgency.
+	// A task's area is required; ones from before that are work. The gone groups load as what replaced them.
 	for _, t := range b.st.Tasks {
 		t.Area = cmp.Or(t.Area, "work")
-		if t.Group == "urgent" {
-			t.Group, t.Urgency = "", cmp.Or(t.Urgency, "high")
+		switch t.Group {
+		case "urgent":
+			t.Urgency = cmp.Or(t.Urgency, "high")
+		case "later":
+			t.Urgency = cmp.Or(t.Urgency, "low")
+		case "waiting_on_others":
+			if t.Status == "todo" || t.Status == "doing" {
+				t.Status = "waiting"
+			}
+		}
+		if goneGroups[t.Group] != "" {
+			t.Group = ""
 		}
 		defaultLevels(t)
 	}
@@ -437,14 +447,17 @@ func defaultLevels(t *Task) {
 	t.Urgency, t.Importance = cmp.Or(t.Urgency, "medium"), cmp.Or(t.Importance, "medium")
 }
 
+// goneGroups are the groups a field now says, each with what to set instead.
+var goneGroups = map[string]string{"urgent": `urgency "high"`, "later": `urgency "low"`, "waiting_on_others": `status "waiting"`}
+
 // badField says what is wrong with a merged task's area, group or levels, or "".
 func (b *Board) badField(t *Task) string {
 	levels := []string{"high", "medium", "low"}
 	switch {
 	case !slices.ContainsFunc(b.areas, func(a Area) bool { return a.ID == t.Area }):
 		return "area: required, an id from BOARD_AREAS"
-	case t.Group == "urgent":
-		return `group: "urgent" is gone, set urgency "high"`
+	case goneGroups[t.Group] != "":
+		return fmt.Sprintf("group: %q is gone, set %s", t.Group, goneGroups[t.Group])
 	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
 		return "urgency, importance: want high, medium or low"
 	}
