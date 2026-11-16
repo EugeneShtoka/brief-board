@@ -54,7 +54,7 @@ type LogEntry struct {
 	Entry
 	Task  string `json:"task,omitempty"`
 	Title string `json:"title,omitempty"`
-	Area  string `json:"area,omitempty"` // the task's area when it was written, work spelled out
+	Area  string `json:"area,omitempty"` // the task's area when it was written
 }
 
 type Job struct {
@@ -71,7 +71,7 @@ type Task struct {
 	Title      string              `json:"title"`
 	Group      string              `json:"group"`            // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
 	Status     string              `json:"status"`           // todo | doing | waiting | done | dropped
-	Area       string              `json:"area,omitempty"`   // an id from BOARD_AREAS; "" is work
+	Area       string              `json:"area,omitempty"`   // an id from BOARD_AREAS, required
 	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats)
 	Who        string              `json:"who,omitempty"`
 	WaitingFor string              `json:"waitingFor,omitempty"` // what is owed between Eugene and who: a review, an email reply, a Jira answer, info
@@ -136,8 +136,8 @@ type Area struct {
 	Dir  string `json:"dir"`
 }
 
-// parseAreas reads BOARD_AREAS, a JSON list of areas, each with its folder; work is required, since a task
-// with no area is work and the brief runs there. A missing name is the id; a dir of "~" or "~/..." is at home.
+// parseAreas reads BOARD_AREAS, a JSON list of areas, each with its folder; work is required, since tasks from
+// before areas were required are work, and the brief runs there. A missing name is the id; a dir of "~" or "~/..." is at home.
 func (b *Board) parseAreas(conf string) ([]Area, error) {
 	var areas []Area
 	if conf == "" {
@@ -169,13 +169,12 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 
 // dirFor is the folder a session on t runs in: its area's; an unknown area or a missing folder is an error.
 func (b *Board) dirFor(t *Task) (string, error) {
-	id := cmp.Or(t.Area, "work")
-	i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == id })
+	i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == t.Area })
 	if i < 0 {
-		return "", fmt.Errorf("dirFor: no area %q in BOARD_AREAS", id)
+		return "", fmt.Errorf("dirFor: no area %q in BOARD_AREAS", t.Area)
 	}
 	if fi, err := os.Stat(b.areas[i].Dir); err != nil || !fi.IsDir() {
-		return "", fmt.Errorf("dirFor: area %s: %s is not a folder", id, b.areas[i].Dir)
+		return "", fmt.Errorf("dirFor: area %s: %s is not a folder", t.Area, b.areas[i].Dir)
 	}
 	return b.areas[i].Dir, nil
 }
@@ -198,6 +197,10 @@ func (b *Board) load() error {
 	}
 	if err := json.Unmarshal(data, &b.st); err != nil {
 		return fmt.Errorf("load: %w", err)
+	}
+	// A task's area is required; ones from before that are work.
+	for _, t := range b.st.Tasks {
+		t.Area = cmp.Or(t.Area, "work")
 	}
 	return nil
 }
@@ -229,7 +232,7 @@ func (b *Board) note(t *Task, actor, kind, text string) {
 	e := Entry{At: time.Now(), Actor: actor, Kind: kind, Text: text}
 	t.History = append(t.History, e)
 	t.UpdatedAt = time.Now()
-	b.archive(&LogEntry{Entry: e, Task: t.ID, Title: t.Title, Area: cmp.Or(t.Area, "work")})
+	b.archive(&LogEntry{Entry: e, Task: t.ID, Title: t.Title, Area: t.Area})
 }
 
 // weekOf is the local Monday that starts t's week, as YYYY-MM-DD; it names the week's log file.
@@ -404,8 +407,8 @@ func remarshal(from, to any) error {
 func (b *Board) badField(t *Task) string {
 	levels := []string{"", "high", "medium", "low"}
 	switch {
-	case t.Area != "" && !slices.ContainsFunc(b.areas, func(a Area) bool { return a.ID == t.Area }):
-		return "area: want an id from BOARD_AREAS"
+	case !slices.ContainsFunc(b.areas, func(a Area) bool { return a.ID == t.Area }):
+		return "area: required, an id from BOARD_AREAS"
 	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
 		return "urgency, importance: want high, medium or low"
 	}
@@ -444,7 +447,7 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		b.note(&next, "eugene", "created", "Added on the board.")
 	}
 	if ok && next.Area != t.Area {
-		b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "claude"), "area", cmp.Or(t.Area, "work")+" → "+cmp.Or(next.Area, "work"))
+		b.note(&next, cmp.Or(r.URL.Query().Get("actor"), "claude"), "area", t.Area+" → "+next.Area)
 	}
 	if _, set := patch["status"]; set && next.Status != prevStatus {
 		setStatus(&next, next.Status)
@@ -983,7 +986,7 @@ func (b *Board) seedLog() error {
 	var all []LogEntry
 	for _, t := range b.st.Tasks {
 		for _, e := range t.History {
-			all = append(all, LogEntry{Entry: e, Task: t.ID, Title: t.Title, Area: cmp.Or(t.Area, "work")})
+			all = append(all, LogEntry{Entry: e, Task: t.ID, Title: t.Title, Area: t.Area})
 		}
 	}
 	for _, e := range b.st.Log {
