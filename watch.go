@@ -150,14 +150,19 @@ func (b *Board) kithBack(lastOK time.Time) bool {
 	if !b.lastBrief().After(lastOK) {
 		return false
 	}
-	b.rerun = true
 	b.logf("kith", "kith reads work again; re-running the brief that ran while it was down")
 	b.saveOrLog()
+	b.briefNow()
+	return true
+}
+
+// briefNow asks scheduleBrief to run the brief now. The caller holds b.mu.
+func (b *Board) briefNow() {
+	b.rerun = true
 	select {
 	case b.wake <- struct{}{}:
 	default:
 	}
-	return true
 }
 
 func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
