@@ -5,9 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -306,13 +308,13 @@ func (b *Board) watchGitHub(keyRe *regexp.Regexp, every time.Duration) {
 	}
 }
 
-// ghAPI is gh api's answer for args (the path last), as the gh user.
+// ghAPI is gh api's answer for args (the path last), as the gh user; what it printed comes back on an error too.
 func ghAPI(args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "gh", append([]string{"api"}, args...)...).Output() //nolint:gosec // argv, no shell; GitHub's own urls
 	if err != nil {
-		return nil, fmt.Errorf("gh api %s: %w", args[len(args)-1], err)
+		return out, fmt.Errorf("gh api %s: %w", args[len(args)-1], err)
 	}
 	return out, nil
 }
@@ -328,17 +330,19 @@ func (b *Board) pollGitHub(keyRe *regexp.Regexp) error {
 	}
 	b.mu.Unlock()
 	// all=true: a notification already read on github.com still reaches the board.
-	out, err := ghAPI("--paginate", "notifications?all=true&since="+since)
-	if err != nil {
+	query := "notifications?all=true&since=" + since
+	// A 304 to If-None-Match is free of GitHub's rate limit (If-Modified-Since gets a 200 here), so polling often costs nothing.
+	head, err := ghAPI("-i", "-H", "If-None-Match: "+b.ghETag, query)
+	status, etag, perr := ghStatus(head)
+	if perr == nil && status == http.StatusNotModified { // gh exits 1 on a 304
+		return nil
+	}
+	if err = errors.Join(err, perr); err != nil {
 		return fmt.Errorf("pollGitHub: %w", err)
 	}
-	var all []ghNotification
-	for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); { // --paginate prints one array per page
-		var page []ghNotification
-		if err := dec.Decode(&page); err != nil {
-			return fmt.Errorf("pollGitHub: %w", err)
-		}
-		all = append(all, page...)
+	all, err := ghNotifications(query)
+	if err != nil {
+		return fmt.Errorf("pollGitHub: %w", err)
 	}
 	slices.SortFunc(all, func(x, y ghNotification) int { return strings.Compare(x.UpdatedAt, y.UpdatedAt) })
 	newest := since
@@ -364,7 +368,35 @@ func (b *Board) pollGitHub(keyRe *regexp.Regexp) error {
 		}
 	}
 	b.st.GitHubSince = newest
+	b.ghETag = etag
 	return b.save()
+}
+
+// ghNotifications reads every page of a notifications query.
+func ghNotifications(query string) ([]ghNotification, error) {
+	out, err := ghAPI("--paginate", query)
+	if err != nil {
+		return nil, err
+	}
+	var all []ghNotification
+	for dec := json.NewDecoder(bytes.NewReader(out)); dec.More(); { // --paginate prints one array per page
+		var page []ghNotification
+		if err := dec.Decode(&page); err != nil {
+			return nil, fmt.Errorf("ghNotifications: %w", err)
+		}
+		all = append(all, page...)
+	}
+	return all, nil
+}
+
+// ghStatus is the status and ETag of a gh api -i answer.
+func ghStatus(out []byte) (int, string, error) {
+	resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(out)), nil)
+	if err != nil {
+		return 0, "", fmt.Errorf("ghStatus: %w", err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, resp.Header.Get("Etag"), nil
 }
 
 // ghPageURL is the github.com page of an API url: .../repos/o/r/pulls/7 -> github.com/o/r/pull/7.

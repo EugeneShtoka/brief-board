@@ -202,3 +202,10 @@ func TestGhTasks(t *testing.T) {
 		t.Errorf("ghTasks = %v, want %v", ids, want)
 	}
 }
+
+func TestGhStatus(t *testing.T) {
+	status, etag, err := ghStatus([]byte("HTTP/2.0 304 Not Modified\r\nEtag: W/\"abc\"\r\nX-Poll-Interval: 60\r\n\r\n"))
+	if err != nil || status != http.StatusNotModified || etag != `W/"abc"` {
+		t.Errorf("ghStatus = %d %q %v, want 304 W/\"abc\"", status, etag, err)
+	}
+}

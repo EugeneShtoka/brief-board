@@ -116,6 +116,7 @@ type Board struct {
 	triage   chan struct{} // one Jira triage at a time
 	wake     chan struct{} // nudges scheduleBrief out of its sleep
 	rerun    bool          // a brief ran while kith was down: run it again now
+	ghETag   string        // pollGitHub's own: the ETag of its last notifications answer
 }
 
 // areaRe keeps an area a plain folder name, since it picks the folder a session runs in.
