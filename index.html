@@ -124,7 +124,7 @@ dialog::backdrop { background: rgb(10 14 24 / .45); }
 .refs { display: flex; flex-wrap: wrap; gap: 0.5rem 0.875rem; font-size: 0.8125rem; }
 .actions { border-top: 1px solid var(--line); padding-top: 0.875rem; display: grid; gap: 0.625rem; }
 label { font: 500 0.75rem var(--body); color: var(--muted); display: grid; gap: 0.25rem; }
-textarea, input[type=text], input[type=file] { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem 0.625rem; width: 100%; }
+textarea, input[type=text] { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem 0.625rem; width: 100%; }
 textarea { min-height: 4.5rem; resize: vertical; }
 textarea:focus, input:focus { outline: 0.125rem solid var(--accent); outline-offset: 0; border-color: transparent; }
 .btns { display: flex; flex-wrap: wrap; gap: 0.5rem; }
@@ -198,7 +198,7 @@ const linkify = (s) => esc(s)
   .replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (m) => cfg().issue ? `<a href="${cfg().issue}${m}" target="_blank" rel="noopener"><code class="ref">${m}</code></a>` : `<code class="ref">${m}</code>`)
   .replace(/(^|[\s(])#(\d{3,5})\b/g, (m, pre, n) => cfg().pr ? `${pre}<a href="${cfg().pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
   .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
-let state = { brief: {}, tasks: [] }, openId = null, today = ymd(new Date()), poll;
+let state = { brief: {}, tasks: [] }, pend = [], openId = null, today = ymd(new Date()), poll;
 // Set a node's markup only when it changed, so a data update leaves untouched nodes (focus, selection, a drag in progress) alone.
 const put = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
 
@@ -281,7 +281,7 @@ function render() {
 function renderDialog(fresh) {
   const t = state.tasks.find((x) => x.id === openId);
   if (!t) return;
-  if (fresh) $("dlg-body").innerHTML = `
+  if (fresh) { pend = []; $("dlg-body").innerHTML = `
     <div class="dlg-head"><div><h2 id="dlg-title"></h2><div class="meta" id="d-meta"></div></div>
       <button class="x" id="x" aria-label="Close">×</button></div>
     <div id="d-story" style="display:contents"></div>
@@ -292,11 +292,11 @@ function renderDialog(fresh) {
     <div class="actions">
       <div id="d-busy" style="display:contents"></div>
       <label for="f-comment">Guidance for Claude (optional; for Clarify, what to clarify)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
-      <label for="f-files">Files for Claude (optional; attached when you press a button)<input type="file" id="f-files" multiple></label>
+      ${filesField("Files for Claude, attached when you press a button")}
       <div class="btns" id="d-btns"></div>
       <div class="hint">Reply sends right away. Act and Clarify open a Claude session on this task (wezterm, or claude.ai/code); its report lands in the history.</div>
       <div class="err" id="f-err" hidden></div>
-    </div>`;
+    </div>`; }
   const busy = running(t);
   const js = t.jiraStatus || {}, late = preQa(t);
   const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
@@ -329,13 +329,14 @@ const areaOpts = (sel) => areaList()
 // New task: an id from the title, the area preset from the filter when it shows one area, Eugene as its creator.
 function renderNew() {
   const on = areaList().filter(([v]) => !hide.area.includes(v)), pre = on.length === 1 ? on[0][0] : "work";
+  pend = [];
   $("dlg-body").innerHTML = `
     <div class="dlg-head"><h2 id="dlg-title">New task</h2><button class="x" id="x" aria-label="Close">×</button></div>
     <form id="new-form" style="display:grid;gap:0.875rem">
       <label for="n-title">Title<input type="text" id="n-title" required maxlength="200"></label>
       <label for="n-area">Area<select id="n-area">${areaOpts(pre)}</select></label>
       <label for="n-summary">The story (what, for whom, by when; Claude reads this when you press Act)<textarea id="n-summary"></textarea></label>
-      <label for="n-files">Files (optional; Claude reads them too)<input type="file" id="n-files" multiple></label>
+      ${filesField("Files Claude reads too")}
       <div class="btns"><button class="btn primary" type="submit">Add</button></div>
       <div class="err" id="f-err" hidden></div>
     </form>`;
@@ -347,17 +348,20 @@ async function addTask(e) {
   const body = { title, area: $("n-area").value, summary: $("n-summary").value.trim(), status: "todo", since: today, source: "eugene" };
   const r = await fetch(`api/tasks/${id}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't add the task."; return; }
-  const failed = await attach(id, $("n-files"));
+  const failed = await attach(id);
   await apply(r);
   openId = id; renderDialog(true);
   if (failed) { $("f-err").hidden = false; $("f-err").textContent = "Added the task. " + failed; }
 }
 
-// attach uploads the input's files to the task; it returns why that failed, or "".
-async function attach(id, input) {
-  if (!input.files.length) return "";
+// Files wait in pend, shown as removable chips, until attach uploads them to the task; it returns why that failed, or "".
+const filesField = (what) => `<div class="tagrow"><button type="button" class="btn" id="f-pick" title="${what}">📎 Attach files</button>
+  <span id="f-list" style="display:contents"></span><input type="file" id="f-files" multiple hidden></div>`;
+const showFiles = () => put($("f-list"), pend.map((f, i) => `<span class="pill tag">${esc(f.name)}<button type="button" class="untag" data-unfile="${i}" aria-label="Remove ${esc(f.name)}">×</button></span>`).join(""));
+async function attach(id) {
+  if (!pend.length) return "";
   const fd = new FormData();
-  for (const f of input.files) fd.append("file", f);
+  for (const f of pend) fd.append("file", f);
   const r = await fetch(`api/tasks/${encodeURIComponent(id)}/files`, { method: "POST", body: fd }).catch(() => null);
   return r && r.ok ? "" : (r && (await r.json().catch(() => ({}))).error) || "Couldn't attach the files.";
 }
@@ -384,7 +388,7 @@ async function act(action, key) {
   const comment = $("f-comment").value.trim(), err = $("f-err");
   if (action === "clarify" && !comment) { err.hidden = false; err.textContent = "Say what to clarify."; return; }
   err.hidden = true;
-  const failed = await attach(openId, $("f-files"));
+  const failed = await attach(openId);
   if (failed) { err.hidden = false; err.textContent = failed; return; }
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/act`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action, comment, key }) });
   const body = await r.json().catch(() => ({}));
@@ -420,6 +424,9 @@ $("dlg").addEventListener("click", (e) => {
   if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
   const u = e.target.closest("[data-untag]");
   if (u) return setTags(tagsOf().filter((g) => g !== u.dataset.untag));
+  if (e.target.id === "f-pick") return $("f-files").click();
+  const f = e.target.closest("[data-unfile]");
+  if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
   const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act, b.dataset.key);
 });
 // Tags are typed or picked from the ones in use; "#Some Tag" is stored as some-tag.
@@ -439,6 +446,7 @@ async function setTags(tags) {
 $("dlg").addEventListener("close", () => { openId = null; });
 // Moving a task to another area also moves where its next session runs.
 $("dlg").addEventListener("change", async (e) => {
+  if (e.target.id === "f-files") { pend.push(...e.target.files); e.target.value = ""; return showFiles(); }
   if (e.target.id !== "f-area" || !openId) return;
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ area: e.target.value }) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the area."; return; }
