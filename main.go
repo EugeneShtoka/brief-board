@@ -514,6 +514,7 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defaultLevels(&next)
+	linkPulls(&next, next.Summary)
 	if bad := b.badField(&next); bad != "" {
 		writeJSON(w, 400, map[string]string{"error": bad})
 		return
@@ -557,6 +558,7 @@ func (b *Board) handleNote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	b.note(t, e.Actor, e.Kind, e.Text)
+	linkPulls(t, e.Text)
 	// A session's report on its action ends the job; the session itself stays open.
 	if j := t.Job; j != nil && j.Status == "running" && j.Session != "" && e.Actor == "claude" && e.Kind == j.Action {
 		now := time.Now()

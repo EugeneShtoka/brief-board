@@ -494,7 +494,19 @@ func (b *Board) pollGitHub(keyRe *regexp.Regexp) error {
 	return err
 }
 
-var pullRe = regexp.MustCompile(`^https://github\.com/[^/]+/[^/]+/pull/\d+`)
+var pullRe = regexp.MustCompile(`https://github\.com/[^/\s]+/[^/\s]+/pull/\d+`)
+
+// linkPulls adds to t's links each pull request page text names that t doesn't link yet, so the
+// GitHub notifications about it reach t (see ghTasks).
+func linkPulls(t *Task, text string) {
+	have := taskPulls(t)
+	for _, p := range pullRe.FindAllString(text, -1) {
+		if !slices.Contains(have, p) {
+			have = append(have, p)
+			t.Links = append(t.Links, map[string]string{"label": "PR #" + p[strings.LastIndex(p, "/")+1:], "url": p})
+		}
+	}
+}
 
 // taskPulls are the github.com pages of the pull requests t links, once each.
 func taskPulls(t *Task) []string {
@@ -536,7 +548,8 @@ func pullsDone(pulls []ghPull) bool {
 
 // settleMerged moves each open task to done once pullsDone holds for the pull requests it links, when the
 // notification's own pull request closed after since: a reopened task, or one linking long-merged pull
-// requests as context, stays open through later comments on them. No Claude runs.
+// requests as context, stays open through later comments on them. A task waiting for more than their
+// review (see endsWithPulls) only gets a note. No Claude runs.
 func (b *Board) settleMerged(checks []settleCheck, since string) {
 	for _, c := range checks {
 		b.mu.Lock()
@@ -568,7 +581,10 @@ func (b *Board) settleMerged(checks []settleCheck, since string) {
 		}
 		b.mu.Lock()
 		// Re-checked: Eugene may have moved it while GitHub answered.
-		if t := b.st.Tasks[c.id]; t != nil && t.Status != "done" && t.Status != "dropped" {
+		if t := b.st.Tasks[c.id]; t != nil && t.Status == "waiting" && !endsWithPulls(t.WaitingFor) {
+			b.note(t, "github", "update", "Its pull requests are merged or closed; still waiting for "+t.WaitingFor)
+			b.saveOrLog()
+		} else if t != nil && t.Status != "done" && t.Status != "dropped" {
 			b.note(t, "github", "status", t.Status+" → done: its pull requests are merged or closed")
 			setStatus(t, "done")
 			b.doneNow(t)
@@ -576,6 +592,15 @@ func (b *Board) settleMerged(checks []settleCheck, since string) {
 		}
 		b.mu.Unlock()
 	}
+}
+
+var reviewRe = regexp.MustCompile(`(?i)^(PR|pull request)\b`)
+
+// endsWithPulls is whether what a waiting task waits for ends with its pull requests: nothing, or their
+// review ("PR review", "PR #27 review"). Anything else (a deploy, an answer, a check on prod) keeps the
+// task open once they merge.
+func endsWithPulls(waitingFor string) bool {
+	return waitingFor == "" || reviewRe.MatchString(waitingFor)
 }
 
 // doneNow is t moving to done: with BOARD_CLEAN_MERGED, what its merged pull requests leave behind
