@@ -418,6 +418,38 @@ func TestPullsDone(t *testing.T) {
 	}
 }
 
+func TestPullsShipped(t *testing.T) {
+	onMain, onDev, closed := ghPull{Merged: true, Shipped: true}, ghPull{Merged: true}, ghPull{State: "closed"}
+	for _, c := range []struct {
+		pulls []ghPull
+		want  bool
+	}{
+		{[]ghPull{onMain, closed}, true},
+		{[]ghPull{onMain, onDev}, false},
+	} {
+		if got := pullsShipped(c.pulls); got != c.want {
+			t.Errorf("pullsShipped(%v) = %v, want %v", c.pulls, got, c.want)
+		}
+	}
+}
+
+func TestReleased(t *testing.T) {
+	p := ghPull{MergedAt: "2026-11-16T18:10:27Z"}
+	before, after, open := ghPull{MergedAt: "2026-11-16T17:00:00Z"}, ghPull{MergedAt: "2026-11-16T18:48:30Z"}, ghPull{}
+	for _, c := range []struct {
+		releases []ghPull
+		want     bool
+	}{
+		{[]ghPull{before, open}, false},
+		{[]ghPull{before, after}, true},
+		{nil, false},
+	} {
+		if got := released(&p, c.releases); got != c.want {
+			t.Errorf("released(%v) = %v, want %v", c.releases, got, c.want)
+		}
+	}
+}
+
 // gitRepo is a fresh repo with one commit, and tree, which makes .worktrees/name on a new branch name
 // with one commit and returns its path and tip (the merged head).
 func gitRepo(t *testing.T) (repo string, run func(dir string, args ...string) string, tree func(name string) (string, string)) {

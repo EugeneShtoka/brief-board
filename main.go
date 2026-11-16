@@ -86,6 +86,7 @@ type Task struct {
 	Jira       []string            `json:"jira,omitempty"`
 	JiraStatus map[string]string   `json:"jiraStatus,omitempty"` // key -> Jira status name, written by the brief
 	Links      []map[string]string `json:"links,omitempty"`      // {label, url}
+	Shipping   bool                `json:"shipping,omitempty"`   // its merged pull requests are not on the default branch yet; each GitHub poll re-checks it
 	Thread     map[string]string   `json:"thread,omitempty"`     // where a reply goes: {room, reply_to, thread}
 	Messages   []map[string]string `json:"messages,omitempty"`   // the story's messages: {label, room, event, url}, opened at url, else in kith
 	Files      []string            `json:"files,omitempty"`      // Eugene's attachments: absolute paths under files/<id> next to the state file
@@ -348,6 +349,7 @@ func (b *Board) handleLog(w http.ResponseWriter, r *http.Request) {
 func setStatus(t *Task, status string) {
 	t.Status = status
 	if status == "done" || status == "dropped" {
+		t.Shipping = false
 		if t.DoneAt == nil {
 			now := time.Now()
 			t.DoneAt = &now
