@@ -308,7 +308,9 @@ The files, by the board area their tasks belong to:
    done, with a note (POST /api/tasks/<id>/notes {actor: "claude", kind: "note", text}) saying why.
 4. A roadmap task Eugene marked done whose item the file still lists as open: mark it done in the file, the way that
    file marks done items (tick its box, move it to a done section, or remove it), change nothing else in the file,
-   commit nothing, and note it on the task. A dropped task: leave the file alone, and don't make the task again.
+   and note it on the task. A file git tracks (git ls-files --error-unmatch) gets that edit committed on its own:
+   git commit -m "Roadmap: <item> done" -- <file>, never pushed. An untracked file is just edited.
+   A dropped task: leave the file alone, and don't make the task again.
 
 Your final message is one line: what changed on the board and in which files.`, b.selfURL, files.String())
 }

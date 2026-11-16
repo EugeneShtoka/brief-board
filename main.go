@@ -652,7 +652,8 @@ const actionRules = `What each action means:
 - act: do the task itself, as far as it can be done safely now. Follow the CLAUDE.md, skills and memory of the
   folder you run in, which the task's area picks (in the be repo: branch from development, pre-PR checklist, PR
   review post). Never merge, push to main, deploy or touch prod data. A task with source "roadmap" came from the
-  roadmap file its summary names: once the work is done, mark its item done there, the way that file marks done items.
+  roadmap file its summary names: once the work is done, mark its item done there, the way that file marks done items,
+  in the work's own commit when git tracks the file, or just edited when it doesn't.
 - qa: the task is done but its Jira ticket is still before QA. Transition that one key to "QA - Staging"
   (read its transitions first). A sub-task that has no QA state goes straight to Done. Change nothing else, then
   record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.
