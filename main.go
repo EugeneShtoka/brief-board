@@ -46,6 +46,7 @@ type LogEntry struct {
 	Entry
 	Task  string `json:"task,omitempty"`
 	Title string `json:"title,omitempty"`
+	Area  string `json:"area,omitempty"` // the task's area when it was written, work spelled out
 }
 
 type Job struct {
@@ -186,7 +187,7 @@ func (b *Board) note(t *Task, actor, kind, text string) {
 	e := Entry{At: time.Now(), Actor: actor, Kind: kind, Text: text}
 	t.History = append(t.History, e)
 	t.UpdatedAt = time.Now()
-	b.archive(&LogEntry{Entry: e, Task: t.ID, Title: t.Title})
+	b.archive(&LogEntry{Entry: e, Task: t.ID, Title: t.Title, Area: cmp.Or(t.Area, "work")})
 }
 
 // weekOf is the local Monday that starts t's week, as YYYY-MM-DD; it names the week's log file.
@@ -756,7 +757,7 @@ func (b *Board) seedLog() error {
 	var all []LogEntry
 	for _, t := range b.st.Tasks {
 		for _, e := range t.History {
-			all = append(all, LogEntry{Entry: e, Task: t.ID, Title: t.Title})
+			all = append(all, LogEntry{Entry: e, Task: t.ID, Title: t.Title, Area: cmp.Or(t.Area, "work")})
 		}
 	}
 	for _, e := range b.st.Log {

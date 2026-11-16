@@ -392,9 +392,10 @@ async function loadLog() {
   const r = await fetch(`api/log?week=${shown}`).catch(() => null);
   if (!r || !r.ok || shown !== week) return;
   const { entries: all, older } = await r.json();
-  // Board-level lines (brief, sweep, triage runs) belong to no one area, so only All shows them.
+  // A task's line carries its area when written (older lines take the task's current one); board-level lines (brief, sweep, triage runs) belong to no one area, so only All shows them.
   const tasks = new Map(state.tasks.map((t) => [t.id, t]));
-  const entries = all.filter((e) => e.task ? inArea(tasks.get(e.task) || {}) : area === "all");
+  for (const e of all) if (e.task && !e.area) e.area = (tasks.get(e.task) || {}).area;
+  const entries = all.filter((e) => e.task ? inArea(e) : area === "all");
   const thisWeek = mondayOf(new Date());
   $("wk-label").textContent = `${dm(week)} – ${dm(addDays(week, 6))}${week === thisWeek ? " · this week" : ""}`;
   $("wk-prev").disabled = !older; $("wk-next").disabled = week >= thisWeek;
@@ -402,7 +403,7 @@ async function loadLog() {
   $("activity").innerHTML = entries.sort((a, b) => b.at.localeCompare(a.at)).map((e) => {
     const d = ymd(new Date(e.at)), head = d === day ? "" : `<li class="day">${d === today ? "Today" : new Date(e.at).toLocaleDateString("en-GB", { weekday: "long" })} ${dm(d)}</li>`;
     day = d;
-    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
+    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}${e.area && e.area !== "work" ? ` <span class="pill">${esc(e.area)}</span>` : ""}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
   }).join("") || `<li><time>—</time><span class="hint">Nothing this week.</span></li>`;
 }
 $("wk-prev").addEventListener("click", () => { week = addDays(week, -7); loadLog(); });
