@@ -133,10 +133,10 @@ script-check:
 deadcode:
 	bash scripts/deadcode-check.sh
 
-# Enable the tracked pre-commit/pre-push hooks for this clone.
+# Enable the tracked pre-commit/pre-push/post-merge hooks for this clone.
 hooks:
 	git config core.hooksPath .githooks
-	@echo "hooks enabled: secrets + fmt + vet before a commit, secrets + make quick before a push."
+	@echo "hooks enabled: secrets + fmt + vet before a commit, secrets + make quick before a push, gone branches deleted after a pull."
 	@echo "Install gitleaks for full secret-scan coverage:"
 	@echo "  https://github.com/gitleaks/gitleaks"
 
