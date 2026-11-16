@@ -125,13 +125,13 @@ type feedMessage struct {
 	Body    string `json:"body"`
 }
 
-// watchJira polls the Jira feed room and hands each new update to Claude, per ticket.
-func (b *Board) watchJira(server, room string, keyRe *regexp.Regexp, every time.Duration) {
+// watchJira polls an area's Jira feed room and hands each new update to Claude, per ticket.
+func (b *Board) watchJira(server string, area *Area, keyRe *regexp.Regexp, every time.Duration) {
 	var lastOK time.Time
 	failing := false
 	for {
-		if err := b.pollJira(server, room, keyRe); err != nil {
-			log.Printf("jira feed: %v", err)
+		if err := b.pollJira(server, area, keyRe); err != nil {
+			log.Printf("jira feed %s: %v", area.ID, err)
 			failing = true
 		} else {
 			if failing {
@@ -166,8 +166,8 @@ func (b *Board) briefNow() {
 	}
 }
 
-func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
-	text, err := mcpCall(server, "read_room", map[string]any{"room": room, "limit": 50})
+func (b *Board) pollJira(server string, area *Area, keyRe *regexp.Regexp) error {
+	text, err := mcpCall(server, "read_room", map[string]any{"room": area.JiraRoom, "limit": 50})
 	if err != nil {
 		return err
 	}
@@ -179,13 +179,14 @@ func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	baseline := b.st.JiraSeen == nil
+	seen, ok := b.st.JiraSeen[area.JiraRoom]
+	baseline := !ok
 	ids := make([]string, 0, len(read.Messages))
 	byKey := map[string][]string{}
 	var keys []string
 	for _, m := range read.Messages {
 		ids = append(ids, m.EventID)
-		if baseline || slices.Contains(b.st.JiraSeen, m.EventID) {
+		if baseline || slices.Contains(seen, m.EventID) {
 			continue
 		}
 		for _, key := range keyRe.FindAllString(m.Body, -1) {
@@ -197,7 +198,7 @@ func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
 			}
 		}
 	}
-	b.st.JiraSeen = ids
+	b.st.JiraSeen[area.JiraRoom] = ids
 	for _, key := range keys {
 		update := strings.Join(byKey[key], "\n")
 		var tracked bool
@@ -212,26 +213,27 @@ func (b *Board) pollJira(server, room string, keyRe *regexp.Regexp) error {
 			}
 		}
 		if !tracked {
-			go b.triageKey(key, update)
+			go b.triageKey(area, key, update)
 		}
 	}
 	return b.save()
 }
 
-// triageKey asks Claude whether an untracked ticket belongs on the board, one at a time.
-func (b *Board) triageKey(key, update string) {
+// triageKey asks Claude, in the area's folder, whether an untracked ticket belongs on the board, one at a time.
+func (b *Board) triageKey(area *Area, key, update string) {
 	b.triage <- struct{}{}
 	defer func() { <-b.triage }()
 	prompt := fmt.Sprintf(`A Jira update mentions %[1]s, which has no task on Eugene's Brief Board (%[2]s). Nobody is watching this run.
 
 The update: %[3]s
 
-Look %[1]s up in Jira. If it concerns Eugene's work (assigned to him, mentions or asks him, a ticket he reported,
-commented on or is blocked by), add it to the board in the brief skill's format (step 5 of .claude/skills/brief/SKILL.md):
+Look %[1]s up in this folder's Jira. If it concerns Eugene (assigned to him, mentions or asks him, a ticket he reported,
+commented on or is blocked by), add it to the board with area %[4]q, in the brief skill's format (step 5 of
+.claude/skills/brief/SKILL.md in the work area's folder, %[5]s):
   curl -s -X PUT %[2]s/api/tasks/<slug> -H 'Content-Type: application/json' -d '{...}'
 with the whole story in summary, jira, jiraStatus, and messages when chat is involved. Otherwise change nothing.
-Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update)
-	status, text := runClaude(b.claude, b.workdir, prompt)
+Never send messages and never change Jira. Your final message is one line: what you decided and why.`, key, b.selfURL, update, area.ID, b.workdir)
+	status, text := runClaude(b.claude, area.Dir, prompt)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("triage", "%s (%s): %s", key, status, text)

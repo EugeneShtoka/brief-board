@@ -76,8 +76,8 @@ func TestAreas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, defaultRoadmap}, {"kith", "Kith", kith, defaultRoadmap},
-		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap}, {"personal", "Personal", "/home", defaultRoadmap}}
+	want := []Area{{"work", "Work", work, defaultRoadmap, ""}, {"kith", "Kith", kith, defaultRoadmap, ""},
+		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, ""}, {"personal", "Personal", "/home", defaultRoadmap, ""}}
 	if !reflect.DeepEqual(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
