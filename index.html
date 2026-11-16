@@ -181,6 +181,8 @@ const linkify = (s) => esc(s)
   .replace(/(^|[\s(])#(\d{3,5})\b/g, (m, pre, n) => cfg().pr ? `${pre}<a href="${cfg().pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
   .replace(/(^|\s)(https?:\/\/[^\s<]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
 let state = { brief: {}, tasks: [] }, openId = null, today = ymd(new Date()), poll;
+// Set a node's markup only when it changed, so a data update leaves untouched nodes (focus, selection, a drag in progress) alone.
+const put = (el, html) => { if (el._html !== html) { el._html = html; el.innerHTML = html; } };
 
 const closed = (t) => t.status === "done" || t.status === "dropped";
 const running = (t) => t.job && t.job.status === "running";
@@ -212,68 +214,71 @@ function pills(t) {
 function render() {
   const by = { todo: [], doing: [], waiting: [], closed: [] };
   for (const t of state.tasks.filter(inArea)) { const l = laneOf(t); if (l) by[l].push(t); }
-  $("areas").innerHTML = AREAS.map(([k, label]) => `<button data-area="${k}" aria-pressed="${k === area}">${label}</button>`).join("");
+  put($("areas"), AREAS.map(([k, label]) => `<button data-area="${k}" aria-pressed="${k === area}">${label}</button>`).join(""));
   for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
     : (a.group === "urgent" ? 0 : 1) - (b.group === "urgent" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
-  $("lanes").innerHTML = LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
+  put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
     // A div, not a <button>: Firefox won't drag buttons.
     by[k].map((t) => `<div class="card ${t.group === "urgent" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" role="button" tabindex="0" draggable="true" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></div>`).join("")
-    || `<div class="empty">${k === "closed" ? "Nothing closed yet today." : "Empty."}</div>`}</section>`).join("");
+    || `<div class="empty">${k === "closed" ? "Nothing closed yet today." : "Empty."}</div>`}</section>`).join(""));
 
   const total = by.todo.length + by.doing.length + by.waiting.length + by.closed.length;
-  $("pnum").innerHTML = `${by.closed.length} / ${total} <small>closed today</small>`;
+  put($("pnum"), `${by.closed.length} / ${total} <small>closed today</small>`);
   $("pbar").style.width = total ? `${(100 * by.closed.length) / total}%` : "0";
   const days = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return ymd(d); });
   const counts = days.map((d) => state.tasks.filter(inArea).filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
-  $("week").innerHTML = days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join("");
+  put($("week"), days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join(""));
 
   $("n-tickets").textContent = total - by.closed.length;
   $("n-history").textContent = [...state.tasks.flatMap((t) => t.history || []), ...(state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
 
   const b = state.brief || {};
-  if (b.headline) $("headline").innerHTML = linkify(b.headline);
+  if (b.headline) put($("headline"), linkify(b.headline));
   const run = state.briefRun;
   $("date").textContent = (b.at ? `Brief ${dm(b.at)} ${hm(b.at)}` : new Date().toDateString())
     + (run ? ` · auto-brief ${run.status === "running" ? "running since " + hm(run.startedAt) : run.status + " " + dm(run.startedAt) + " " + hm(run.startedAt)}` : "");
   if (openId) renderDialog(false);
 }
 
+// The dialog's inputs are built once when it opens; data updates patch only the live parts around them, so typing is never interrupted.
 function renderDialog(fresh) {
   const t = state.tasks.find((x) => x.id === openId);
   if (!t) return;
+  if (fresh) $("dlg-body").innerHTML = `
+    <div class="dlg-head"><div><h2 id="dlg-title"></h2><div class="meta" id="d-meta"></div></div>
+      <button class="x" id="x" aria-label="Close">×</button></div>
+    <div id="d-story" style="display:contents"></div>
+    <label for="f-area" style="justify-self:start">Area<select id="f-area">${areaOpts(t.area || "work")}</select></label>
+    <div><h3>History</h3><ol class="tl" id="d-hist" style="margin-top:0.5rem"></ol></div>
+    <div class="actions">
+      <div id="d-busy" style="display:contents"></div>
+      <label for="f-comment">Guidance for Claude (optional; for Clarify, what to clarify)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
+      <label for="f-files">Files for Claude (optional; attached when you press a button)<input type="file" id="f-files" multiple></label>
+      <div class="btns" id="d-btns"></div>
+      <div class="hint">Reply sends right away. Act and Clarify open a Claude session on this task (wezterm, or claude.ai/code); its report lands in the history.</div>
+      <div class="err" id="f-err" hidden></div>
+    </div>`;
   const busy = running(t);
-  // Keep what Eugene is typing across live refreshes.
-  const keep = fresh ? {} : { comment: $("f-comment")?.value, files: $("f-files")?.files };
   const js = t.jiraStatus || {}, late = preQa(t);
   const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
     ...(t.messages || []).map((m) => kithLink(m.label || "message", m.room, m.event)),
     ...(t.thread && t.thread.room ? [kithLink(t.thread.reply_to ? "reply goes here" : "reply room", t.thread.room, t.thread.reply_to)] : []),
     ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
-  $("dlg-body").innerHTML = `
-    <div class="dlg-head"><div><h2 id="dlg-title">${esc(t.title)}</h2><div class="meta">${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}</div></div>
-      <button class="x" id="x" aria-label="Close">×</button></div>
-    ${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
-    ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}
-    <label for="f-area" style="justify-self:start">Area<select id="f-area">${areaOpts(t.area || "work")}</select></label>
-    <div><h3>History</h3><ol class="tl" style="margin-top:0.5rem">${(t.history || []).slice().reverse().map((e) =>
-      `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : dm(e.at) + " " + hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text)}</span></span></li>`).join("")
-      || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`}</ol></div>
-    <div class="actions">
-      ${busy ? `<div class="pill run" style="justify-self:start">Claude is working on “${esc(t.job.action)}” since ${hm(t.job.startedAt)}</div>` : ""}
-      <label for="f-comment">Guidance for Claude (optional; for Clarify, what to clarify)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
-      <label for="f-files">Files for Claude (optional; attached when you press a button)<input type="file" id="f-files" multiple></label>
-      <div class="btns">
-        ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
-        <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
-        <button class="btn" data-act="clarify" ${busy ? "disabled" : ""}>Clarify</button>
-        ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
-        <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>
-      </div>
-      <div class="hint">Reply sends right away. Act and Clarify open a Claude session on this task (wezterm, or claude.ai/code); its report lands in the history.</div>
-      <div class="err" id="f-err" hidden></div>
-    </div>`;
-  if (keep.comment) $("f-comment").value = keep.comment;
-  if (keep.files) $("f-files").files = keep.files;
+  put($("dlg-title"), esc(t.title));
+  put($("d-meta"), `${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}`);
+  put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
+    ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
+  if (document.activeElement !== $("f-area")) $("f-area").value = t.area || "work";
+  put($("d-hist"), (t.history || []).slice().reverse().map((e) =>
+    `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : dm(e.at) + " " + hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text)}</span></span></li>`).join("")
+    || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`);
+  put($("d-busy"), busy ? `<div class="pill run" style="justify-self:start">Claude is working on “${esc(t.job.action)}” since ${hm(t.job.startedAt)}</div>` : "");
+  put($("d-btns"), `
+    ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
+    <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
+    <button class="btn" data-act="clarify" ${busy ? "disabled" : ""}>Clarify</button>
+    ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
+    <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>`);
 }
 
 const areaOpts = (sel) => [["work", "Work"], ...(cfg().projects || []).map((p) => [p, "Project: " + p]), ["personal", "Personal"]]
@@ -302,7 +307,7 @@ async function addTask(e) {
   const r = await fetch(`api/tasks/${id}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't add the task."; return; }
   const failed = await attach(id, $("n-files"));
-  await refresh();
+  await apply(r);
   openId = id; renderDialog(true);
   if (failed) { $("f-err").hidden = false; $("f-err").textContent = "Added the task. " + failed; }
 }
@@ -325,6 +330,13 @@ async function refresh() {
     if (!$("log").hidden) loadLog();
   } catch (e) { $("note").hidden = false; $("note").textContent = "Can't reach the board server; what's shown may be out of date."; }
   clearTimeout(poll); poll = setTimeout(refresh, state.tasks.some(running) ? 3000 : 15 * 60000);
+}
+
+// Apply the task a write returned to the local data; the poll picks up everything else.
+async function apply(r) {
+  const t = await r.json(), i = state.tasks.findIndex((x) => x.id === t.id);
+  if (i < 0) state.tasks.push(t); else state.tasks[i] = t;
+  render(); return t;
 }
 
 async function act(action, key) {
@@ -361,7 +373,7 @@ $("lanes").addEventListener("drop", async (e) => {
   if (!t || laneOf(t) === l.dataset.lane) return;
   const r = await fetch(`api/tasks/${encodeURIComponent(t.id)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: LANE_STATUS[l.dataset.lane] }) }).catch(() => null);
   if (!r || !r.ok) { $("note").hidden = false; $("note").textContent = `Couldn't move “${t.title}”.`; return; }
-  refresh();
+  apply(r);
 });
 $("dlg").addEventListener("click", (e) => {
   if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
@@ -373,7 +385,7 @@ $("dlg").addEventListener("change", async (e) => {
   if (e.target.id !== "f-area" || !openId) return;
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ area: e.target.value }) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the area."; return; }
-  refresh();
+  apply(r);
 });
 $("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); });
 $("new-task").addEventListener("click", () => { openId = null; renderNew(); $("dlg").showModal(); $("n-title").focus(); });
