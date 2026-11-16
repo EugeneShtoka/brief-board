@@ -316,7 +316,9 @@ function render() {
     const run = (state.briefs || {})[v], at = v === "work" && b.at && (!run || new Date(b.at) > new Date(run.startedAt)) ? b.at : run?.startedAt;
     return at && { l, at, status: at === run?.startedAt ? run.status : "ok" };
   }).filter(Boolean).sort((x, y) => new Date(y.at) - new Date(x.at));
-  $("date").textContent = runs.length ? `${dm(runs[0].at)} ${hm(runs[0].at)}` : "None yet";
+  // The headline time is the oldest of them: how stale the least fresh shown area is.
+  const oldest = runs[runs.length - 1];
+  $("date").textContent = oldest ? `${dm(oldest.at)} ${hm(oldest.at)}` : "None yet";
   $("brun").hidden = !runs.length;
   put($("brun"), runs.map((x) => `${esc(x.l)} ${dm(x.at)} ${hm(x.at)}${x.status === "running" ? " running…" : x.status === "failed" ? " failed" : ""}`).join("<br>"));
   $("run-brief").textContent = hide.area.length ? `Brief ${shown.length === 1 ? shown[0][1] : shown.length + " areas"} now` : "Run brief now";
