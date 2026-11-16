@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strconv"
@@ -33,6 +34,40 @@ func TestWeekOf(t *testing.T) {
 	}
 }
 
+func TestRoadmap(t *testing.T) {
+	kith, empty := t.TempDir(), t.TempDir()
+	for _, f := range []string{"ROADMAP.md", "planning/roadmap.md", "notes.md"} {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(kith, f)), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(kith, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := &Board{home: "/home", selfURL: "http://board"}
+	var err error
+	b.areas, err = b.parseAreas(`[{"id": "work", "dir": "` + empty + `", "roadmap": []}, {"id": "kith", "dir": "` + kith + `"},
+		{"id": "plans", "dir": "` + kith + `", "roadmap": ["*/roadmap.md", "ROADMAP.md", "planning/*.md", "["]}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := b.areas[1].roadmapFiles(), []string{filepath.Join(kith, "ROADMAP.md")}; !slices.Equal(got, want) {
+		t.Errorf("default roadmapFiles = %v, want %v", got, want)
+	}
+	// Each file once, in glob order; a bad glob matches nothing.
+	plan := filepath.Join(kith, "planning", "roadmap.md")
+	if got, want := b.areas[2].roadmapFiles(), []string{plan, filepath.Join(kith, "ROADMAP.md")}; !slices.Equal(got, want) {
+		t.Errorf("roadmapFiles = %v, want %v", got, want)
+	}
+	if p := b.roadmapPrompt(); !strings.Contains(p, `area "plans": `+plan) || strings.Contains(p, `area "work"`) {
+		t.Errorf("roadmapPrompt lists the wrong files:\n%s", p)
+	}
+	b.areas = b.areas[:1]
+	if p := b.roadmapPrompt(); p != "" {
+		t.Errorf("roadmapPrompt with no files = %q, want none", p)
+	}
+}
+
 func TestAreas(t *testing.T) {
 	work, kith := t.TempDir(), t.TempDir()
 	b := &Board{home: "/home"}
@@ -41,8 +76,9 @@ func TestAreas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, ""}, {"kith", "Kith", kith, ""}, {"nixos", "nixos", "/home/dev/nixos", ""}, {"personal", "Personal", "/home", ""}}
-	if !slices.Equal(areas, want) {
+	want := []Area{{"work", "Work", work, defaultRoadmap, ""}, {"kith", "Kith", kith, defaultRoadmap, ""},
+		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, ""}, {"personal", "Personal", "/home", defaultRoadmap, ""}}
+	if !reflect.DeepEqual(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
 	for _, bad := range []string{``, `{}`, `[{"id": "Kith", "dir": "/"}]`, `[{"id": "work", "dir": "/"}, {"id": "work", "dir": "/"}]`,
@@ -141,7 +177,7 @@ func TestMergePatch(t *testing.T) {
 
 func TestHandleUpsertLevels(t *testing.T) {
 	dir := t.TempDir()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{"work", "Work", dir, ""}}}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
 	b.st.Tasks = map[string]*Task{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)

@@ -2,8 +2,9 @@
 // (wezterm mux, remote control) on a task when a button is pressed (reply, clarify, act). Drop is handled here.
 //
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
-// BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "jiraRoom"}, the board's areas and the folders their
-// sessions run in; work's is also where the brief runs; jiraRoom: the kith room the area's Jira bot posts in, see watchJira),
+// BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "roadmap", "jiraRoom"}, the board's areas and the folders
+// their sessions run in; work's is also where the brief runs; roadmap: the files the roadmap run reads, see defaultRoadmap;
+// jiraRoom: the kith room the area's Jira bot posts in, see watchJira),
 // BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
@@ -72,7 +73,7 @@ type Task struct {
 	Group      string              `json:"group"`            // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
 	Status     string              `json:"status"`           // todo | doing | waiting | done | dropped
 	Area       string              `json:"area,omitempty"`   // an id from BOARD_AREAS, required
-	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats)
+	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats) | roadmap (an area's roadmap files)
 	Who        string              `json:"who,omitempty"`
 	WaitingFor string              `json:"waitingFor,omitempty"` // what is owed between Eugene and who: a review, an email reply, a Jira answer, info
 	Since      string              `json:"since,omitempty"`
@@ -130,12 +131,31 @@ type Board struct {
 var areaRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // Area is one area of the board: its id (what a task stores), the name the page shows, the folder its sessions run in,
-// and the kith room its Jira bot posts in, if it has a Jira.
+// the globs, relative to that folder, of the files the roadmap run reads for its next items, and the kith room its Jira
+// bot posts in, if it has a Jira.
 type Area struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Dir      string `json:"dir"`
-	JiraRoom string `json:"jiraRoom,omitempty"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Dir      string   `json:"dir"`
+	Roadmap  []string `json:"roadmap"`
+	JiraRoom string   `json:"jiraRoom,omitempty"`
+}
+
+// defaultRoadmap is an area's roadmap when BOARD_AREAS gives it none; "roadmap": [] reads no files.
+var defaultRoadmap = []string{"roadmap.md", "ROADMAP.md", "roadmap.txt", "plan.md", "PLAN.md", "plan.txt", "todo.md", "TODO.md", "todo.txt"}
+
+// roadmapFiles is the files a's roadmap globs match, each once.
+func (a *Area) roadmapFiles() []string {
+	var files []string
+	for _, g := range a.Roadmap {
+		matches, _ := filepath.Glob(filepath.Join(a.Dir, g)) // the only error is a bad pattern, which matches nothing
+		for _, f := range matches {
+			if fi, err := os.Stat(f); err == nil && fi.Mode().IsRegular() && !slices.Contains(files, f) {
+				files = append(files, f)
+			}
+		}
+	}
+	return files
 }
 
 // parseAreas reads BOARD_AREAS, a JSON list of areas, each with its folder; work is required, since tasks from
@@ -159,6 +179,9 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		}
 		seen[a.ID] = true
 		a.Name = cmp.Or(a.Name, a.ID)
+		if a.Roadmap == nil {
+			a.Roadmap = defaultRoadmap
+		}
 		if a.Dir == "~" || strings.HasPrefix(a.Dir, "~/") {
 			a.Dir = filepath.Join(b.home, a.Dir[1:])
 		}
@@ -631,7 +654,9 @@ const actionRules = `What each action means:
   in the thread where the item came from and send it. Otherwise investigate (Jira, chat, code, public API) and answer it yourself.
 - act: do the task itself, as far as it can be done safely now. Follow the CLAUDE.md, skills and memory of the
   folder you run in, which the task's area picks (in the be repo: branch from development, pre-PR checklist, PR
-  review post). Never merge, push to main, deploy or touch prod data.
+  review post). Never merge, push to main, deploy or touch prod data. A task with source "roadmap" came from the
+  roadmap file its summary names: once the work is done, mark its item done there, the way that file marks done items,
+  in the work's own commit when git tracks the file, or just edited when it doesn't.
 - qa: the task is done but its Jira ticket is still before QA. Transition that one key to "QA - Staging"
   (read its transitions first). A sub-task that has no QA state goes straight to Done. Change nothing else, then
   record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.
@@ -963,7 +988,7 @@ func main() {
 	for _, a := range b.areas {
 		if a.JiraRoom != "" {
 			every := cmp.Or(envDuration("BOARD_JIRA_POLL"), 2*time.Minute)
-			go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), a, keyRe, every)
+			go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), &a, keyRe, every)
 			log.Printf("watching %q for %s's Jira updates every %s", a.JiraRoom, a.ID, every)
 		}
 	}
