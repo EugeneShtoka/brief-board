@@ -59,30 +59,35 @@ func TestRoadmap(t *testing.T) {
 	if got, want := b.areas[2].roadmapFiles(), []string{plan, filepath.Join(kith, "ROADMAP.md")}; !slices.Equal(got, want) {
 		t.Errorf("roadmapFiles = %v, want %v", got, want)
 	}
-	if p := b.roadmapPrompt(); !strings.Contains(p, `area "plans": `+plan) || strings.Contains(p, `area "work"`) {
-		t.Errorf("roadmapPrompt lists the wrong files:\n%s", p)
+	if p, ids := b.roadmapPrompt([]string{"work", "plans"}); !strings.Contains(p, `area "plans": `+plan) || strings.Contains(p, `area "work"`) || !slices.Equal(ids, []string{"plans"}) {
+		t.Errorf("roadmapPrompt lists the wrong files, for %v:\n%s", ids, p)
 	}
-	b.areas = b.areas[:1]
-	if p := b.roadmapPrompt(); p != "" {
-		t.Errorf("roadmapPrompt with no files = %q, want none", p)
+	// Only the areas asked for.
+	if p, ids := b.roadmapPrompt([]string{"kith"}); strings.Contains(p, `area "plans"`) || !slices.Equal(ids, []string{"kith"}) {
+		t.Errorf("roadmapPrompt(kith) for %v:\n%s", ids, p)
+	}
+	if p, ids := b.roadmapPrompt([]string{"work"}); p != "" || ids != nil {
+		t.Errorf("roadmapPrompt with no files = %q, %v; want none", p, ids)
 	}
 }
 
 func TestAreas(t *testing.T) {
 	work, kith := t.TempDir(), t.TempDir()
 	b := &Board{home: "/home"}
-	areas, err := b.parseAreas(`[{"id": "work", "name": "Work", "dir": "` + work + `"}, {"id": "kith", "name": "Kith", "dir": "` + kith + `"},
-		{"id": "nixos", "dir": "~/dev/nixos"}, {"id": "personal", "name": "Personal", "dir": "~"}]`)
+	t.Setenv("BOARD_BRIEF_EVERY", "6h") // an area without briefEvery's
+	areas, err := b.parseAreas(`[{"id": "work", "name": "Work", "dir": "` + work + `"}, {"id": "kith", "name": "Kith", "dir": "` + kith + `", "briefEvery": "1h"},
+		{"id": "nixos", "dir": "~/dev/nixos"}, {"id": "personal", "name": "Personal", "dir": "~", "briefEvery": "0"}]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, defaultRoadmap, ""}, {"kith", "Kith", kith, defaultRoadmap, ""},
-		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, ""}, {"personal", "Personal", "/home", defaultRoadmap, ""}}
+	want := []Area{{"work", "Work", work, defaultRoadmap, "", "", 6 * time.Hour}, {"kith", "Kith", kith, defaultRoadmap, "", "1h", time.Hour},
+		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, "", "", 6 * time.Hour}, {"personal", "Personal", "/home", defaultRoadmap, "", "0", 0}}
 	if !reflect.DeepEqual(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
 	for _, bad := range []string{``, `{}`, `[{"id": "Kith", "dir": "/"}]`, `[{"id": "work", "dir": "/"}, {"id": "work", "dir": "/"}]`,
-		`[{"name": "no id", "dir": "/"}]`, `[{"id": "work"}]`, `[{"id": "kith", "dir": "/"}]`} {
+		`[{"name": "no id", "dir": "/"}]`, `[{"id": "work"}]`, `[{"id": "kith", "dir": "/"}]`,
+		`[{"id": "work", "dir": "/", "briefEvery": "daily"}]`} {
 		if _, err := b.parseAreas(bad); err == nil {
 			t.Errorf("parseAreas(%s) took it", bad)
 		}
@@ -130,37 +135,64 @@ func TestAreas(t *testing.T) {
 func TestKithBack(t *testing.T) {
 	dir := t.TempDir()
 	lastOK := time.Now()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, wake: make(chan struct{}, 1)}
-	b.st.BriefRun = &Job{StartedAt: lastOK.Add(-time.Hour)}
-	if b.kithBack(lastOK) || b.rerun {
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, wake: make(chan struct{}, 1),
+		areas: []Area{{ID: "work"}, {ID: "personal"}}}
+	b.st.Briefs = map[string]*Job{"work": {StartedAt: lastOK.Add(-time.Hour)}}
+	if b.kithBack(lastOK) || len(b.rerun) != 0 {
 		t.Error("a brief from before the outage was re-run")
 	}
-	b.st.BriefRun.StartedAt = lastOK.Add(time.Minute) // ran while kith was down
-	if !b.kithBack(lastOK) || !b.rerun || len(b.wake) != 1 {
-		t.Error("a brief from during the outage was not re-run")
+	b.st.Briefs["personal"] = &Job{StartedAt: lastOK.Add(time.Minute)} // ran while kith was down
+	if !b.kithBack(lastOK) || !maps.Equal(b.rerun, map[string]bool{"personal": true}) || len(b.wake) != 1 {
+		t.Errorf("re-run %v; want only the brief from during the outage", b.rerun)
 	}
 	b.kithBack(lastOK) // a second nudge must not block on the full channel
 }
 
 func TestHandleBriefRun(t *testing.T) {
-	t.Setenv("BOARD_BRIEF_EVERY", "")
-	b := &Board{wake: make(chan struct{}, 1)}
-	run := func() int {
+	kith := t.TempDir()
+	if err := os.WriteFile(filepath.Join(kith, "roadmap.md"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b := &Board{wake: make(chan struct{}, 1), areas: []Area{{ID: "work"}, {ID: "kith", Dir: kith, Roadmap: defaultRoadmap},
+		{ID: "nixos", Dir: t.TempDir(), Roadmap: defaultRoadmap}}}
+	run := func(body string) int {
 		rec := httptest.NewRecorder()
-		b.handleBriefRun(rec, httptest.NewRequestWithContext(t.Context(), "POST", "/api/brief/run", nil))
+		b.handleBriefRun(rec, httptest.NewRequestWithContext(t.Context(), "POST", "/api/brief/run", strings.NewReader(body)))
 		return rec.Code
 	}
-	if code := run(); code != 409 || b.rerun {
-		t.Errorf("unscheduled: %d, rerun %v; want 409 and no run", code, b.rerun)
+	for body, want := range map[string]int{``: 400, `{"areas": []}`: 400, `{"areas": ["gone"]}`: 400, `{"areas": ["nixos"]}`: 409} {
+		if code := run(body); code != want || len(b.rerun) != 0 {
+			t.Errorf("%s: %d, rerun %v; want %d and no run", body, code, b.rerun, want)
+		}
 	}
-	t.Setenv("BOARD_BRIEF_EVERY", "6h")
-	b.st.BriefRun = &Job{Status: "running"}
-	if code := run(); code != 409 || b.rerun {
+	b.st.Briefs = map[string]*Job{"work": {Status: "running"}}
+	if code := run(`{"areas": ["work"]}`); code != 409 || len(b.rerun) != 0 {
 		t.Errorf("while running: %d, rerun %v; want 409 and no run", code, b.rerun)
 	}
-	b.st.BriefRun.Status = "ok"
-	if code := run(); code != 202 || !b.rerun || len(b.wake) != 1 {
-		t.Errorf("run: %d, rerun %v, wake %d; want 202 and a nudge", code, b.rerun, len(b.wake))
+	// Only the areas asked for, and of them only those with a brief that isn't running.
+	if code := run(`{"areas": ["work", "kith", "nixos"]}`); code != 202 || !maps.Equal(b.rerun, map[string]bool{"kith": true}) || len(b.wake) != 1 {
+		t.Errorf("run: %d, rerun %v, wake %d; want 202 and kith nudged", code, b.rerun, len(b.wake))
+	}
+}
+
+func TestDueBriefs(t *testing.T) {
+	kith := t.TempDir()
+	if err := os.WriteFile(filepath.Join(kith, "roadmap.md"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	b := &Board{areas: []Area{{ID: "work", every: 6 * time.Hour}, {ID: "personal", every: time.Hour}, {ID: "kith", Dir: kith, Roadmap: defaultRoadmap},
+		{ID: "nixos", Dir: t.TempDir(), Roadmap: defaultRoadmap, every: time.Hour}}}
+	b.st.Brief = map[string]any{"at": now.Add(-time.Hour).Format(time.RFC3339)} // the brief work pushed counts as its last
+	b.st.Briefs = map[string]*Job{"personal": {StartedAt: now.Add(-2 * time.Hour)}}
+	if got := b.dueBriefs(); !slices.Equal(got, []string{"personal"}) {
+		t.Errorf("on schedule: %v, want personal", got)
+	}
+	// kith has no schedule but is named; nixos has nothing to brief; a running one's name waits for it to end.
+	b.st.Briefs["personal"].Status = "running"
+	b.briefNow("kith", "nixos", "personal")
+	if got := b.dueBriefs(); !slices.Equal(got, []string{"kith"}) || !maps.Equal(b.rerun, map[string]bool{"personal": true}) {
+		t.Errorf("named: %v, left %v; want kith, personal waiting", got, b.rerun)
 	}
 }
 
