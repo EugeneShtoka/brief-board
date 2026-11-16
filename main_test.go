@@ -33,57 +33,38 @@ func TestWeekOf(t *testing.T) {
 	}
 }
 
-func TestDirFor(t *testing.T) {
-	projects := t.TempDir()
-	if err := os.Mkdir(filepath.Join(projects, "kith"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	work := t.TempDir()
-	b := &Board{workdir: work, home: "/home", projects: projects}
-	for area, want := range map[string]string{
-		"":         work,
-		"work":     work,
-		"personal": "/home",
-		"kith":     filepath.Join(projects, "kith"),
-		"gone":     "/home", // a project with no folder runs at home
-	} {
-		if got := b.dirFor(&Task{Area: area}); got != want {
-			t.Errorf("dirFor(%q) = %s, want %s", area, got, want)
-		}
-	}
-	for _, bad := range []string{"..", "../etc", "a/b", "Kith", ""} {
-		if areaRe.MatchString(bad) {
-			t.Errorf("areaRe accepts %q", bad)
-		}
-	}
-}
-
-func TestParseAreas(t *testing.T) {
-	projects := t.TempDir()
-	b := &Board{workdir: "/work", home: "/home", projects: projects}
-	areas, err := b.parseAreas(`[{"id": "work", "name": "Work"}, {"id": "kith", "name": "Kith", "dir": "~/src/kith"}, {"id": "nixos"}, {"id": "personal", "name": "Personal", "dir": "~"}]`)
+func TestAreas(t *testing.T) {
+	work, kith := t.TempDir(), t.TempDir()
+	b := &Board{home: "/home"}
+	areas, err := b.parseAreas(`[{"id": "work", "name": "Work", "dir": "` + work + `"}, {"id": "kith", "name": "Kith", "dir": "` + kith + `"},
+		{"id": "nixos", "dir": "~/dev/nixos"}, {"id": "personal", "name": "Personal", "dir": "~"}]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", "/work"}, {"kith", "Kith", "/home/src/kith"}, {"nixos", "nixos", filepath.Join(projects, "nixos")}, {"personal", "Personal", "/home"}}
+	want := []Area{{"work", "Work", work}, {"kith", "Kith", kith}, {"nixos", "nixos", "/home/dev/nixos"}, {"personal", "Personal", "/home"}}
 	if !slices.Equal(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
-	for _, bad := range []string{`{}`, `[{"id": "Kith"}]`, `[{"id": "a"}, {"id": "a"}]`, `[{"name": "no id"}]`} {
+	for _, bad := range []string{``, `{}`, `[{"id": "Kith", "dir": "/"}]`, `[{"id": "work", "dir": "/"}, {"id": "work", "dir": "/"}]`,
+		`[{"name": "no id", "dir": "/"}]`, `[{"id": "work"}]`, `[{"id": "kith", "dir": "/"}]`} {
 		if _, err := b.parseAreas(bad); err == nil {
 			t.Errorf("parseAreas(%s) took it", bad)
 		}
 	}
-	// A configured list replaces the folder scan, and dirFor follows it.
-	if err := os.Mkdir(filepath.Join(projects, "nixos"), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	b.areas = areas
-	if got := b.dirFor(&Task{Area: "nixos"}); got != filepath.Join(projects, "nixos") {
-		t.Errorf("dirFor(nixos) = %s", got)
+	for area, want := range map[string]string{"": work, "work": work, "kith": kith} {
+		if got, err := b.dirFor(&Task{Area: area}); got != want || err != nil {
+			t.Errorf("dirFor(%q) = %s, %v; want %s", area, got, err, want)
+		}
 	}
-	if got := b.dirFor(&Task{Area: "kith"}); got != "/home" {
-		t.Errorf("dirFor(kith) with no folder = %s, want /home", got)
+	// No fallback: an unknown area or a missing folder is an error, not home.
+	for _, area := range []string{"nixos", "gone"} {
+		if got, err := b.dirFor(&Task{Area: area}); err == nil {
+			t.Errorf("dirFor(%q) = %s, want an error", area, got)
+		}
+	}
+	if b.badField(&Task{Area: "kith"}) != "" || b.badField(&Task{Area: "gone"}) == "" {
+		t.Error("badField: want configured areas only")
 	}
 }
 

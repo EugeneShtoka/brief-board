@@ -2,8 +2,8 @@
 // (wezterm mux, remote control) on a task when a button is pressed (reply, clarify, act). Drop is handled here.
 //
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
-// BOARD_WORKDIR (where work sessions run), BOARD_PROJECTS (~/dev: each subfolder but work is a project area),
-// BOARD_AREAS (a JSON list of {"id", "name", "dir"} that replaces that folder list, work and personal included),
+// BOARD_AREAS (required: a JSON list of {"id", "name", "dir"}, the board's areas and the folders their sessions run in;
+// work's is also where the brief and triage run),
 // BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
@@ -71,7 +71,7 @@ type Task struct {
 	Title      string              `json:"title"`
 	Group      string              `json:"group"`            // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
 	Status     string              `json:"status"`           // todo | doing | waiting | done | dropped
-	Area       string              `json:"area,omitempty"`   // work (default) | personal | a project: an id from BOARD_AREAS, else a folder name under BOARD_PROJECTS
+	Area       string              `json:"area,omitempty"`   // an id from BOARD_AREAS; "" is work
 	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats)
 	Who        string              `json:"who,omitempty"`
 	WaitingFor string              `json:"waitingFor,omitempty"` // what is owed between Eugene and who: a review, an email reply, a Jira answer, info
@@ -114,7 +114,6 @@ type Board struct {
 	st       State
 	workdir  string
 	home     string
-	projects string // folder whose subfolders are the project areas
 	claude   string
 	terminal []string // BOARD_TERMINAL; empty is the wezterm mux
 	window   bool     // wezterm: a session gets its own window, not a tab
@@ -124,10 +123,10 @@ type Board struct {
 	rerun    bool          // a brief ran while kith was down: run it again now
 	ghETag   string        // pollGitHub's own: the ETag of its last notifications answer
 	clean    bool          // BOARD_CLEAN_MERGED
-	areas    []Area        // BOARD_AREAS; nil lists the folders under projects
+	areas    []Area        // BOARD_AREAS
 }
 
-// areaRe keeps an area a plain folder name, since it picks the folder a session runs in.
+// areaRe keeps an area id a plain lowercase name.
 var areaRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // Area is one area of the board: its id (what a task stores), the name the page shows, and the folder its sessions run in.
@@ -137,10 +136,13 @@ type Area struct {
 	Dir  string `json:"dir"`
 }
 
-// parseAreas reads BOARD_AREAS, a JSON list of areas. A missing name is the id; a missing dir is the work dir
-// for work, home for personal, else the id's folder under BOARD_PROJECTS; a dir of "~" or "~/..." is at home.
+// parseAreas reads BOARD_AREAS, a JSON list of areas, each with its folder; work is required, since a task
+// with no area is work and the brief runs there. A missing name is the id; a dir of "~" or "~/..." is at home.
 func (b *Board) parseAreas(conf string) ([]Area, error) {
 	var areas []Area
+	if conf == "" {
+		return nil, errors.New("parseAreas: BOARD_AREAS is not set")
+	}
 	if err := json.Unmarshal([]byte(conf), &areas); err != nil {
 		return nil, fmt.Errorf("parseAreas: %w", err)
 	}
@@ -150,50 +152,32 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		if !areaRe.MatchString(a.ID) || seen[a.ID] {
 			return nil, fmt.Errorf("parseAreas: id %q: want a unique lowercase folder-like name", a.ID)
 		}
+		if a.Dir == "" {
+			return nil, fmt.Errorf("parseAreas: %s: no dir", a.ID)
+		}
 		seen[a.ID] = true
 		a.Name = cmp.Or(a.Name, a.ID)
 		if a.Dir == "~" || strings.HasPrefix(a.Dir, "~/") {
 			a.Dir = filepath.Join(b.home, a.Dir[1:])
 		}
-		a.Dir = cmp.Or(a.Dir, b.defaultDir(a.ID))
+	}
+	if !seen["work"] {
+		return nil, errors.New("parseAreas: no work area")
 	}
 	return areas, nil
 }
 
-func (b *Board) defaultDir(id string) string {
-	switch id {
-	case "work":
-		return b.workdir
-	case "personal":
-		return b.home
-	}
-	return filepath.Join(b.projects, id)
-}
-
-// areaList is BOARD_AREAS when set, else work, each folder under b.projects but work, and personal, all named by id.
-func (b *Board) areaList() []Area {
-	if b.areas != nil {
-		return b.areas
-	}
-	out := []Area{{"work", "work", b.workdir}}
-	entries, _ := os.ReadDir(b.projects)
-	for _, e := range entries {
-		if e.IsDir() && e.Name() != "work" && areaRe.MatchString(e.Name()) {
-			out = append(out, Area{e.Name(), e.Name(), filepath.Join(b.projects, e.Name())})
-		}
-	}
-	return append(out, Area{"personal", "personal", b.home})
-}
-
-// dirFor is where a session on t runs: its area's folder, or home when the area or its folder is gone.
-func (b *Board) dirFor(t *Task) string {
+// dirFor is the folder a session on t runs in: its area's; an unknown area or a missing folder is an error.
+func (b *Board) dirFor(t *Task) (string, error) {
 	id := cmp.Or(t.Area, "work")
-	for _, a := range b.areaList() {
-		if fi, err := os.Stat(a.Dir); a.ID == id && err == nil && fi.IsDir() {
-			return a.Dir
-		}
+	i := slices.IndexFunc(b.areas, func(a Area) bool { return a.ID == id })
+	if i < 0 {
+		return "", fmt.Errorf("dirFor: no area %q in BOARD_AREAS", id)
 	}
-	return b.home
+	if fi, err := os.Stat(b.areas[i].Dir); err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("dirFor: area %s: %s is not a folder", id, b.areas[i].Dir)
+	}
+	return b.areas[i].Dir, nil
 }
 
 func env(k, def string) string {
@@ -340,7 +324,7 @@ func (b *Board) handleState(w http.ResponseWriter, r *http.Request) {
 		return tasks[i].Order < tasks[j].Order || tasks[i].Order == tasks[j].Order && tasks[i].ID < tasks[j].ID
 	})
 	writeJSON(w, 200, map[string]any{"brief": b.st.Brief, "tasks": tasks, "log": b.st.Log, "briefRun": b.st.BriefRun,
-		"config": map[string]any{"issue": os.Getenv("BOARD_ISSUE_URL"), "pr": os.Getenv("BOARD_PR_URL"), "areas": b.areaList()}})
+		"config": map[string]any{"issue": os.Getenv("BOARD_ISSUE_URL"), "pr": os.Getenv("BOARD_PR_URL"), "areas": b.areas}})
 }
 
 func (b *Board) handleBrief(w http.ResponseWriter, r *http.Request) {
@@ -417,11 +401,11 @@ func remarshal(from, to any) error {
 }
 
 // badField says what is wrong with a merged task's area or levels, or "".
-func badField(t *Task) string {
+func (b *Board) badField(t *Task) string {
 	levels := []string{"", "high", "medium", "low"}
 	switch {
-	case t.Area != "" && !areaRe.MatchString(t.Area):
-		return "area: want work, personal or a project folder name"
+	case t.Area != "" && !slices.ContainsFunc(b.areas, func(a Area) bool { return a.ID == t.Area }):
+		return "area: want an id from BOARD_AREAS"
 	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
 		return "urgency, importance: want high, medium or low"
 	}
@@ -452,7 +436,7 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	if bad := badField(&next); bad != "" {
+	if bad := b.badField(&next); bad != "" {
 		writeJSON(w, 400, map[string]string{"error": bad})
 		return
 	}
@@ -701,7 +685,10 @@ func (b *Board) start(t *Task, req actRequest) {
 	}
 	if err == nil {
 		t.Job.Session = t.ID + "-" + req.Action
-		t.Job.Pane, err = b.spawnSession(b.dirFor(t), t.Job.Session, prompt)
+		var dir string
+		if dir, err = b.dirFor(t); err == nil {
+			t.Job.Pane, err = b.spawnSession(dir, t.Job.Session, prompt)
+		}
 	}
 	if err != nil {
 		now := time.Now()
@@ -931,9 +918,7 @@ func main() {
 	addr := env("BOARD_ADDR", ":8787")
 	b := &Board{
 		path:     env("BOARD_STATE", filepath.Join(home, ".local", "state", "brief-board", "state.json")),
-		workdir:  env("BOARD_WORKDIR", home),
 		home:     home,
-		projects: env("BOARD_PROJECTS", filepath.Join(home, "dev")),
 		claude:   env("BOARD_CLAUDE", "claude"),
 		terminal: strings.Fields(os.Getenv("BOARD_TERMINAL")),
 		window:   os.Getenv("BOARD_SESSION_IN") == "window",
@@ -942,17 +927,13 @@ func main() {
 		triage:   make(chan struct{}, 1),
 		wake:     make(chan struct{}, 1),
 	}
-	if conf := os.Getenv("BOARD_AREAS"); conf != "" {
-		areas, err := b.parseAreas(conf)
-		if err != nil {
-			log.Fatal(err)
-		}
-		b.areas = areas
-		for _, a := range areas {
-			if a.ID == "work" {
-				b.workdir = a.Dir // the brief and triage run in the work area too
-			}
-		}
+	areas, err := b.parseAreas(os.Getenv("BOARD_AREAS"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	b.areas = areas
+	if b.workdir, err = b.dirFor(&Task{Area: "work"}); err != nil {
+		log.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(b.path), 0o700); err != nil {
 		log.Fatal(err)

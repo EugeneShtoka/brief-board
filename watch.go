@@ -480,7 +480,12 @@ func (b *Board) doneNow(t *Task) {
 	if t.Job != nil && t.Job.Status != "running" {
 		pane = t.Job.Pane
 	}
-	go b.cleanMerged(t.ID, b.dirFor(t), pane, pages)
+	dir, err := b.dirFor(t)
+	if err != nil {
+		b.note(t, "board", "cleanup", "No cleanup: "+err.Error())
+		return
+	}
+	go b.cleanMerged(t.ID, dir, pane, pages)
 }
 
 // cleanMerged runs once a task is done: if one of its pull requests (pages) is merged, it closes the
