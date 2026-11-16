@@ -69,7 +69,7 @@ type Job struct {
 type Task struct {
 	ID         string              `json:"id"`
 	Title      string              `json:"title"`
-	Group      string              `json:"group"`            // urgent | waiting_on_you | ready | waiting_on_others | roadmap | later
+	Group      string              `json:"group"`            // waiting_on_you | ready | waiting_on_others | roadmap | later; urgency says what is urgent
 	Status     string              `json:"status"`           // todo | doing | waiting | done | dropped
 	Area       string              `json:"area,omitempty"`   // an id from BOARD_AREAS, required
 	Source     string              `json:"source,omitempty"` // who maintains it: "" the brief | eugene | sweep (mail, calendar, personal chats)
@@ -79,8 +79,8 @@ type Task struct {
 	Order      int                 `json:"order,omitempty"`
 	Summary    string              `json:"summary,omitempty"`    // the story: what was asked, by whom, what's known
 	Tags       []string            `json:"tags,omitempty"`       // Eugene's own labels, set on the board
-	Urgency    string              `json:"urgency,omitempty"`    // high | medium | low; "" is not set
-	Importance string              `json:"importance,omitempty"` // high | medium | low; "" is not set
+	Urgency    string              `json:"urgency,omitempty"`    // high | medium | low, medium unless set
+	Importance string              `json:"importance,omitempty"` // high | medium | low, medium unless set
 	Jira       []string            `json:"jira,omitempty"`
 	JiraStatus map[string]string   `json:"jiraStatus,omitempty"` // key -> Jira status name, written by the brief
 	Links      []map[string]string `json:"links,omitempty"`      // {label, url}
@@ -198,9 +198,13 @@ func (b *Board) load() error {
 	if err := json.Unmarshal(data, &b.st); err != nil {
 		return fmt.Errorf("load: %w", err)
 	}
-	// A task's area is required; ones from before that are work.
+	// A task's area is required; ones from before that are work. The old "urgent" group is high urgency.
 	for _, t := range b.st.Tasks {
 		t.Area = cmp.Or(t.Area, "work")
+		if t.Group == "urgent" {
+			t.Group, t.Urgency = "", cmp.Or(t.Urgency, "high")
+		}
+		defaultLevels(t)
 	}
 	return nil
 }
@@ -403,12 +407,19 @@ func remarshal(from, to any) error {
 	return nil
 }
 
-// badField says what is wrong with a merged task's area or levels, or "".
+// defaultLevels sets an unset urgency or importance to medium: every task has both.
+func defaultLevels(t *Task) {
+	t.Urgency, t.Importance = cmp.Or(t.Urgency, "medium"), cmp.Or(t.Importance, "medium")
+}
+
+// badField says what is wrong with a merged task's area, group or levels, or "".
 func (b *Board) badField(t *Task) string {
-	levels := []string{"", "high", "medium", "low"}
+	levels := []string{"high", "medium", "low"}
 	switch {
 	case !slices.ContainsFunc(b.areas, func(a Area) bool { return a.ID == t.Area }):
 		return "area: required, an id from BOARD_AREAS"
+	case t.Group == "urgent":
+		return `group: "urgent" is gone, set urgency "high"`
 	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
 		return "urgency, importance: want high, medium or low"
 	}
@@ -439,6 +450,7 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
+	defaultLevels(&next)
 	if bad := b.badField(&next); bad != "" {
 		writeJSON(w, 400, map[string]string{"error": bad})
 		return
