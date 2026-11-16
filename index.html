@@ -185,6 +185,8 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
 const LANES = [["todo", "To do"], ["doing", "In progress"], ["waiting", "Waiting on others"], ["closed", "Closed today"]];
 const GROUP = { urgent: ["Urgent", "crit"], waiting_on_you: ["Owed reply", "warn"], ready: ["Ready to close", "ok"],
   waiting_on_others: ["Waiting", ""], roadmap: ["Roadmap", ""], later: ["Later", ""] };
+// Urgency and importance are Eugene's, three levels each; "" is not set.
+const LEVEL = [["high", "High"], ["medium", "Medium"], ["low", "Low"]];
 const $ = (id) => document.getElementById(id);
 const ymd = (d) => { const z = (n) => String(n).padStart(2, "0"); return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`; };
 const hm = (s) => new Date(s).toTimeString().slice(0, 5);
@@ -222,16 +224,18 @@ function laneOf(t) {
 // Areas: work (the brief's tasks, and anything unmarked), personal, or a project named after its folder in ~/dev.
 const areaList = () => [["work", "Work"], ...(cfg().projects || []).map((p) => [p, p]), ["personal", "Personal"]];
 const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sort();
-// The filter narrows the lanes, the progress summary and History by area, group and tag. It keeps what's unchecked,
-// so a new project or tag shows up by default; "" is a task with no group or no tag.
-let hide = { area: [], group: [], tag: [] };
+// The filter narrows the lanes, the progress summary and History by area, group, urgency, importance and tag. It keeps
+// what's unchecked, so a new project or tag shows up by default; "" is a task with no group, level or tag.
+let hide = { area: [], group: [], urgency: [], importance: [], tag: [] };
 try { hide = { ...hide, ...JSON.parse(localStorage.getItem("hide")) }; } catch {}
 const filterOpts = () => [["area", "Area", areaList()],
   ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
+  ["urgency", "Urgency", [...LEVEL, ["", "Not set"]]], ["importance", "Importance", [...LEVEL, ["", "Not set"]]],
   ["tag", "Tags", [...allTags().map((g) => [g, "#" + g]), ["", "No tag"]]]];
 const filtering = () => Object.values(hide).some((v) => v.length);
 // A tagged task shows while any of its tags is checked.
 const visible = (t) => !hide.area.includes(t.area || "work") && !hide.group.includes(t.group || "")
+  && !hide.urgency.includes(t.urgency || "") && !hide.importance.includes(t.importance || "")
   && ((t.tags || []).length ? t.tags.some((g) => !hide.tag.includes(g)) : !hide.tag.includes(""));
 const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
 
@@ -240,6 +244,8 @@ function pills(t) {
   if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(t.area)}</span>`);
   for (const g of t.tags || []) out.push(`<span class="pill tag">#${esc(g)}</span>`);
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
+  if (t.urgency) out.push(`<span class="pill ${t.urgency === "high" ? "crit" : ""}">urgency ${esc(t.urgency)}</span>`);
+  if (t.importance) out.push(`<span class="pill ${t.importance === "high" ? "warn" : ""}">importance ${esc(t.importance)}</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
@@ -299,7 +305,9 @@ function renderDialog(fresh) {
     <div class="dlg-head"><div><h2 id="dlg-title"></h2><div class="meta" id="d-meta"></div></div>
       <button class="x" id="x" aria-label="Close">×</button></div>
     <div id="d-story" style="display:contents"></div>
-    <label for="f-area" style="justify-self:start">Area<select id="f-area">${areaOpts(t.area || "work")}</select></label>
+    <div class="tagrow" style="gap:0.875rem"><label for="f-area">Area<select id="f-area">${areaOpts(t.area || "work")}</select></label>
+      <label for="f-urgency">Urgency<select id="f-urgency">${levelOpts(t.urgency)}</select></label>
+      <label for="f-importance">Importance<select id="f-importance">${levelOpts(t.importance)}</select></label></div>
     <div style="display:grid;gap:0.25rem"><label for="f-tag">Tags</label><div class="tagrow"><span id="d-tags" style="display:contents"></span>
       <input type="text" id="f-tag" list="tag-list" maxlength="40" placeholder="Add a tag, Enter" style="width:12rem"></div><datalist id="tag-list"></datalist></div>
     <div><h3>History</h3><ol class="tl" id="d-hist" style="margin-top:0.5rem"></ol></div>
@@ -322,6 +330,8 @@ function renderDialog(fresh) {
   put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
     ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
   if (document.activeElement !== $("f-area")) $("f-area").value = t.area || "work";
+  if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
+  if (document.activeElement !== $("f-importance")) $("f-importance").value = t.importance || "";
   put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">#${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
   // Suggest every tag in use that this task doesn't have yet.
   put($("tag-list"), allTags().filter((g) => !(t.tags || []).includes(g)).map((g) => `<option value="${esc(g)}">`).join(""));
@@ -339,6 +349,8 @@ function renderDialog(fresh) {
 
 const areaOpts = (sel) => areaList()
   .map(([v, l]) => `<option value="${esc(v)}" ${v === sel ? "selected" : ""}>${esc(l)}</option>`).join("");
+const levelOpts = (sel) => [["", "Not set"], ...LEVEL]
+  .map(([v, l]) => `<option value="${v}" ${v === (sel || "") ? "selected" : ""}>${l}</option>`).join("");
 
 // New task: an id from the title, the area preset from the filter when it shows one area, Eugene as its creator.
 function renderNew() {
@@ -348,7 +360,10 @@ function renderNew() {
     <div class="dlg-head"><h2 id="dlg-title">New task</h2><button class="x" id="x" aria-label="Close">×</button></div>
     <form id="new-form" style="display:grid;gap:0.875rem">
       <label for="n-title">Title<input type="text" id="n-title" required maxlength="200"></label>
-      <label for="n-area">Area<select id="n-area">${areaOpts(pre)}</select></label>
+      <div class="tagrow" style="gap:0.875rem"><label for="n-area">Area<select id="n-area">${areaOpts(pre)}</select></label>
+        <label for="n-urgency">Urgency<select id="n-urgency">${levelOpts("")}</select></label>
+        <label for="n-importance">Importance<select id="n-importance">${levelOpts("")}</select></label></div>
+      <label for="n-tags">Tags (comma-separated)<input type="text" id="n-tags" maxlength="200" placeholder="e.g. infra, q4"></label>
       <label for="n-summary">The story (what, for whom, by when; Claude reads this when you press Act)<textarea id="n-summary"></textarea></label>
       ${filesField("Files Claude reads too")}
       <div class="btns"><button class="btn primary" type="submit">Add</button></div>
@@ -359,7 +374,8 @@ async function addTask(e) {
   e.preventDefault();
   const title = $("n-title").value.trim(); if (!title) return;
   const id = "m-" + (title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "task") + "-" + Date.now().toString(36);
-  const body = { title, area: $("n-area").value, summary: $("n-summary").value.trim(), status: "todo", since: today, source: "eugene" };
+  const body = { title, area: $("n-area").value, summary: $("n-summary").value.trim(), status: "todo", since: today, source: "eugene",
+    urgency: $("n-urgency").value, importance: $("n-importance").value, tags: [...new Set($("n-tags").value.split(",").map(tagOf).filter(Boolean))] };
   const r = await fetch(`api/tasks/${id}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't add the task."; return; }
   const failed = await attach(id);
@@ -445,10 +461,11 @@ $("dlg").addEventListener("click", (e) => {
 });
 // Tags are typed or picked from the ones in use; "#Some Tag" is stored as some-tag.
 const tagsOf = () => (state.tasks.find((x) => x.id === openId) || {}).tags || [];
+const tagOf = (s) => s.trim().toLowerCase().replace(/^#+/, "").replace(/\s+/g, "-");
 $("dlg").addEventListener("keydown", (e) => {
   if (e.target.id !== "f-tag" || e.key !== "Enter") return;
   e.preventDefault();
-  const g = e.target.value.trim().toLowerCase().replace(/^#+/, "").replace(/\s+/g, "-");
+  const g = tagOf(e.target.value);
   e.target.value = "";
   if (g && !tagsOf().includes(g)) setTags([...tagsOf(), g]);
 });
@@ -461,9 +478,10 @@ $("dlg").addEventListener("close", () => { openId = null; });
 // Moving a task to another area also moves where its next session runs.
 $("dlg").addEventListener("change", async (e) => {
   if (e.target.id === "f-files") { pend.push(...e.target.files); e.target.value = ""; return showFiles(); }
-  if (e.target.id !== "f-area" || !openId) return;
-  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ area: e.target.value }) }).catch(() => null);
-  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the area."; return; }
+  const field = { "f-area": "area", "f-urgency": "urgency", "f-importance": "importance" }[e.target.id];
+  if (!field || !openId) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [field]: e.target.value }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = `Couldn't change the ${field}.`; return; }
   apply(r);
 });
 $("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); });

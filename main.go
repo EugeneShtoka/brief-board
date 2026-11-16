@@ -75,8 +75,10 @@ type Task struct {
 	Who        string              `json:"who,omitempty"`
 	Since      string              `json:"since,omitempty"`
 	Order      int                 `json:"order,omitempty"`
-	Summary    string              `json:"summary,omitempty"` // the story: what was asked, by whom, what's known
-	Tags       []string            `json:"tags,omitempty"`    // Eugene's own labels, set on the board
+	Summary    string              `json:"summary,omitempty"`    // the story: what was asked, by whom, what's known
+	Tags       []string            `json:"tags,omitempty"`       // Eugene's own labels, set on the board
+	Urgency    string              `json:"urgency,omitempty"`    // high | medium | low; "" is not set
+	Importance string              `json:"importance,omitempty"` // high | medium | low; "" is not set
 	Jira       []string            `json:"jira,omitempty"`
 	JiraStatus map[string]string   `json:"jiraStatus,omitempty"` // key -> Jira status name, written by the brief
 	Links      []map[string]string `json:"links,omitempty"`      // {label, url}
@@ -373,6 +375,18 @@ func remarshal(from, to any) error {
 	return nil
 }
 
+// badField says what is wrong with a merged task's area or levels, or "".
+func badField(t *Task) string {
+	levels := []string{"", "high", "medium", "low"}
+	switch {
+	case t.Area != "" && !areaRe.MatchString(t.Area):
+		return "area: want work, personal or a project folder name"
+	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
+		return "urgency, importance: want high, medium or low"
+	}
+	return ""
+}
+
 // handleUpsert merges the body's fields into the task; history, job and files are server-owned.
 func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
@@ -397,8 +411,8 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
-	if next.Area != "" && !areaRe.MatchString(next.Area) {
-		writeJSON(w, 400, map[string]string{"error": "area: want work, personal or a project folder name"})
+	if bad := badField(&next); bad != "" {
+		writeJSON(w, 400, map[string]string{"error": bad})
 		return
 	}
 	if !ok && r.URL.Query().Get("actor") == "eugene" {
