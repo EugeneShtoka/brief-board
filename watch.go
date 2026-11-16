@@ -268,12 +268,51 @@ sync the board, but take no actions and send nothing. Your final message is one 
 			b.logf("sweep", "%s: %s", status, text)
 			b.saveOrLog()
 			b.mu.Unlock()
+
+			if prompt := b.roadmapPrompt(); prompt != "" {
+				status, text = runClaude(b.claude, b.home, prompt)
+				b.mu.Lock()
+				b.logf("roadmap", "%s: %s", status, text)
+				b.saveOrLog()
+				b.mu.Unlock()
+			}
 		}
 		select {
 		case <-b.wake:
 		case <-time.After(10 * time.Minute):
 		}
 	}
+}
+
+// roadmapPrompt asks Claude to keep one task per next item of the areas' roadmap files; "" when no area has one.
+func (b *Board) roadmapPrompt() string {
+	var files strings.Builder
+	for i := range b.areas {
+		for _, f := range b.areas[i].roadmapFiles() {
+			fmt.Fprintf(&files, "- area %q: %s\n", b.areas[i].ID, f)
+		}
+	}
+	if files.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`Keep Eugene's Brief Board (%s) in step with his roadmap files. This is a scheduled run and nobody is watching.
+
+The files, by the board area their tasks belong to:
+%s
+1. GET /api/state. The tasks with source "roadmap" are yours; touch no other task.
+2. Read each file and find its next to-do items: what it puts now or next (a Now/Next section, unchecked boxes, the
+   top of an ordered list), not the whole backlog, at most five per file. Read only these files.
+3. PUT /api/tasks/roadmap-<area>-<short slug of the item> (JSON, fields merge) for each one: source "roadmap", that area,
+   a short title, group "roadmap", status "todo" and since today on create, and a summary that names the file's path
+   and quotes the item. Send area only on create. An item the file no longer lists, or now marks done: its task goes to
+   done, with a note (POST /api/tasks/<id>/notes {actor: "claude", kind: "note", text}) saying why.
+4. A roadmap task Eugene marked done whose item the file still lists as open: mark it done in the file, the way that
+   file marks done items (tick its box, move it to a done section, or remove it), change nothing else in the file,
+   and note it on the task. A file git tracks (git ls-files --error-unmatch) gets that edit committed on its own:
+   git commit -m "Roadmap: <item> done" -- <file>, never pushed. An untracked file is just edited.
+   A dropped task: leave the file alone, and don't make the task again.
+
+Your final message is one line: what changed on the board and in which files.`, b.selfURL, files.String())
 }
 
 // lastBrief is when the last brief started: a scheduled run, or the brief Claude last pushed.
