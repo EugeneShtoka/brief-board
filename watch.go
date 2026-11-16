@@ -366,15 +366,101 @@ func (b *Board) pollGitHub(keyRe *regexp.Regexp) error {
 		updates = append(updates, update{n, ghUpdate(n)})
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
+	var settle []settleCheck
 	for _, u := range updates {
 		for _, t := range b.ghTasks(u.n, keyRe) {
 			b.note(t, "github", "update", u.text)
+			if page := ghPageURL(u.n.Subject.URL); slices.Contains(taskPulls(t), page) {
+				settle = append(settle, settleCheck{t.ID, page})
+			}
 		}
 	}
 	b.st.GitHubSince = newest
 	b.ghETag = etag
-	return b.save()
+	err = b.save()
+	b.mu.Unlock()
+	b.settleMerged(settle, since)
+	return err
+}
+
+var pullRe = regexp.MustCompile(`^https://github\.com/[^/]+/[^/]+/pull/\d+`)
+
+// taskPulls are the github.com pages of the pull requests t links, once each.
+func taskPulls(t *Task) []string {
+	var pulls []string
+	for _, l := range t.Links {
+		if p := pullRe.FindString(l["url"]); p != "" && !slices.Contains(pulls, p) {
+			pulls = append(pulls, p)
+		}
+	}
+	return pulls
+}
+
+// ghPull is the part of a pull request settleMerged reads.
+type ghPull struct {
+	State    string `json:"state"` // open | closed
+	Merged   bool   `json:"merged"`
+	ClosedAt string `json:"closed_at"`
+}
+
+// settleCheck is a task a notification reached through a pull request it links: that pull request's page.
+type settleCheck struct{ id, page string }
+
+// pullsDone is whether every pull request is closed and one of them merged; all closed
+// unmerged (abandoned, or replaced by one the task doesn't link yet) leaves the task alone.
+func pullsDone(pulls []ghPull) bool {
+	merged := false
+	for _, p := range pulls {
+		if p.State != "closed" {
+			return false
+		}
+		merged = merged || p.Merged
+	}
+	return merged
+}
+
+// settleMerged moves each open task to done once pullsDone holds for the pull requests it links, when the
+// notification's own pull request closed after since: a reopened task, or one linking long-merged pull
+// requests as context, stays open through later comments on them. No Claude runs.
+func (b *Board) settleMerged(checks []settleCheck, since string) {
+	for _, c := range checks {
+		b.mu.Lock()
+		var pages []string
+		if t := b.st.Tasks[c.id]; t != nil && t.Status != "done" && t.Status != "dropped" {
+			pages = taskPulls(t)
+		}
+		b.mu.Unlock()
+		if len(pages) == 0 {
+			continue
+		}
+		pulls := make([]ghPull, 0, len(pages))
+		fresh := false
+		for _, page := range pages {
+			api := strings.Replace(strings.Replace(page, "://github.com/", "://api.github.com/repos/", 1), "/pull/", "/pulls/", 1)
+			out, err := ghAPI(api)
+			var p ghPull
+			if err == nil {
+				err = json.Unmarshal(out, &p)
+			}
+			if err != nil {
+				log.Printf("github: settle %s: %v", c.id, err)
+				break
+			}
+			pulls = append(pulls, p)
+			fresh = fresh || page == c.page && p.ClosedAt > since
+		}
+		if !fresh || len(pulls) < len(pages) || !pullsDone(pulls) {
+			continue
+		}
+		b.mu.Lock()
+		// Re-checked: Eugene may have moved it while GitHub answered.
+		if t := b.st.Tasks[c.id]; t != nil && t.Status != "done" && t.Status != "dropped" {
+			b.note(t, "github", "status", t.Status+" → done: its pull requests are merged or closed")
+			setStatus(t, "done")
+			b.saveOrLog()
+		}
+		b.mu.Unlock()
+	}
 }
 
 // ghNotifications reads every page of a notifications query.

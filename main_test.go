@@ -231,3 +231,33 @@ func TestGhStatus(t *testing.T) {
 		t.Errorf("ghStatus = %d %q %v, want 304 W/\"abc\"", status, etag, err)
 	}
 }
+
+func TestTaskPulls(t *testing.T) {
+	task := &Task{Links: []map[string]string{
+		{"url": "https://github.com/o/r/pull/7#discussion_r1"},
+		{"url": "https://github.com/o/r/pull/7/files"},
+		{"url": "https://github.com/o/r/issues/8"},
+		{"url": "https://github.com/o/s/pull/9"},
+	}}
+	if got, want := taskPulls(task), []string{"https://github.com/o/r/pull/7", "https://github.com/o/s/pull/9"}; !slices.Equal(got, want) {
+		t.Errorf("taskPulls = %v, want %v", got, want)
+	}
+}
+
+func TestPullsDone(t *testing.T) {
+	merged, closed, open := ghPull{State: "closed", Merged: true}, ghPull{State: "closed"}, ghPull{State: "open"}
+	for _, c := range []struct {
+		pulls []ghPull
+		want  bool
+	}{
+		{[]ghPull{merged}, true},
+		{[]ghPull{merged, closed}, true},
+		{[]ghPull{merged, open}, false},
+		{[]ghPull{closed}, false},
+		{nil, false},
+	} {
+		if got := pullsDone(c.pulls); got != c.want {
+			t.Errorf("pullsDone(%v) = %v, want %v", c.pulls, got, c.want)
+		}
+	}
+}
