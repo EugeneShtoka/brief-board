@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -421,6 +422,7 @@ func (b *Board) watchGitHub(keyRe *regexp.Regexp, every time.Duration) {
 		if err := b.pollGitHub(keyRe); err != nil {
 			log.Printf("github: %v", err)
 		}
+		b.settleMerged(b.shippingChecks(), "")
 	}
 }
 
@@ -524,74 +526,157 @@ type ghPull struct {
 	State    string `json:"state"` // open | closed
 	Merged   bool   `json:"merged"`
 	ClosedAt string `json:"closed_at"`
-	Head     struct {
+	MergedAt string `json:"merged_at"`
+	Base     struct {
+		Ref  string `json:"ref"`
+		Repo struct {
+			DefaultBranch string `json:"default_branch"`
+		} `json:"repo"`
+	} `json:"base"`
+	// Shipped is whether a merged pull request is on its repository's default branch (see ghShipped).
+	Shipped bool `json:"-"`
+	Head    struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
 }
 
-// settleCheck is a task a notification reached through a pull request it links: that pull request's page.
+// settleCheck is a task a notification reached through a pull request it links: that pull request's page,
+// or "" for a task re-checked because it is shipping.
 type settleCheck struct{ id, page string }
+
+// shippingChecks re-check each open task whose merged pull requests had not reached the default branch yet:
+// the release that carries them there notifies nobody.
+// shortcut: every poll re-reads each shipping task's pull requests and releases (a few gh calls per task); key off the default branch's ETag if that gets heavy.
+func (b *Board) shippingChecks() []settleCheck {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var checks []settleCheck
+	for _, t := range b.st.Tasks {
+		if t.Shipping && t.Status != "done" && t.Status != "dropped" {
+			checks = append(checks, settleCheck{t.ID, ""})
+		}
+	}
+	return checks
+}
+
+// pullsShipped is whether each merged pull request is on its default branch.
+func pullsShipped(pulls []ghPull) bool {
+	return !slices.ContainsFunc(pulls, func(p ghPull) bool { return p.Merged && !p.Shipped })
+}
+
+// ghShipped is whether merged p (at page) is on its default branch: merged into it, or carried there by a
+// release, a later merged pull request from p's base into the default branch. Releases are often
+// squash-merged, so p's merge commit is not an ancestor of the default branch to check.
+func ghShipped(page string, p *ghPull) (bool, error) {
+	def := p.Base.Repo.DefaultBranch
+	if p.Base.Ref == def {
+		return true, nil
+	}
+	api := ghAPIURL(page)
+	owner := strings.Split(page, "/")[3]
+	out, err := ghAPI(api[:strings.LastIndex(api, "/pulls/")] + "/pulls?state=closed&sort=updated&direction=desc&per_page=20" +
+		"&base=" + url.QueryEscape(def) + "&head=" + url.QueryEscape(owner+":"+p.Base.Ref))
+	var releases []ghPull
+	if err == nil {
+		err = json.Unmarshal(out, &releases)
+	}
+	if err != nil {
+		return false, fmt.Errorf("ghShipped: %w", err)
+	}
+	return released(p, releases), nil
+}
+
+// released is whether one of releases merged at or after p did.
+func released(p *ghPull, releases []ghPull) bool {
+	return slices.ContainsFunc(releases, func(r ghPull) bool { return r.MergedAt != "" && r.MergedAt >= p.MergedAt })
+}
 
 // pullsDone is whether every pull request is closed and one of them merged; all closed
 // unmerged (abandoned, or replaced by one the task doesn't link yet) leaves the task alone.
 func pullsDone(pulls []ghPull) bool {
 	merged := false
-	for _, p := range pulls {
-		if p.State != "closed" {
+	for i := range pulls {
+		if pulls[i].State != "closed" {
 			return false
 		}
-		merged = merged || p.Merged
+		merged = merged || pulls[i].Merged
 	}
 	return merged
 }
 
 // settleMerged moves each open task to done once pullsDone holds for the pull requests it links, when the
 // notification's own pull request closed after since: a reopened task, or one linking long-merged pull
-// requests as context, stays open through later comments on them. A task waiting for more than their
+// requests as context, stays open through later comments on them. Merged ones count once on their default
+// branch: until then the task is shipping, re-checked each poll. A task waiting for more than their
 // review (see endsWithPulls) only gets a note. No Claude runs.
 func (b *Board) settleMerged(checks []settleCheck, since string) {
 	for _, c := range checks {
 		b.mu.Lock()
 		var pages []string
+		shipping := false
 		if t := b.st.Tasks[c.id]; t != nil && t.Status != "done" && t.Status != "dropped" {
-			pages = taskPulls(t)
+			pages, shipping = taskPulls(t), t.Shipping
 		}
 		b.mu.Unlock()
 		if len(pages) == 0 {
 			continue
 		}
-		pulls := make([]ghPull, 0, len(pages))
-		fresh := false
-		for _, page := range pages {
-			out, err := ghAPI(ghAPIURL(page))
-			var p ghPull
-			if err == nil {
-				err = json.Unmarshal(out, &p)
-			}
-			if err != nil {
-				log.Printf("github: settle %s: %v", c.id, err)
-				break
-			}
-			pulls = append(pulls, p)
-			fresh = fresh || page == c.page && p.ClosedAt > since
+		pulls := settlePulls(c.id, pages)
+		i := slices.Index(pages, c.page)
+		fresh := shipping || i >= 0 && pulls != nil && pulls[i].ClosedAt > since
+		if fresh && pullsDone(pulls) {
+			b.settle(c.id, pulls)
 		}
-		if !fresh || len(pulls) < len(pages) || !pullsDone(pulls) {
-			continue
-		}
-		b.mu.Lock()
-		// Re-checked: Eugene may have moved it while GitHub answered.
-		if t := b.st.Tasks[c.id]; t != nil && t.Status == "waiting" && !endsWithPulls(t.WaitingFor) {
-			b.note(t, "github", "update", "Its pull requests are merged or closed; still waiting for "+t.WaitingFor)
-			b.saveOrLog()
-		} else if t != nil && t.Status != "done" && t.Status != "dropped" {
-			b.note(t, "github", "status", t.Status+" → done: its pull requests are merged or closed")
-			setStatus(t, "done")
-			b.doneNow(t)
-			b.saveOrLog()
-		}
-		b.mu.Unlock()
 	}
+}
+
+// settlePulls are the pull requests at pages, with Shipped set; nil unless every one was read.
+func settlePulls(id string, pages []string) []ghPull {
+	pulls := make([]ghPull, len(pages))
+	for i, page := range pages {
+		p := &pulls[i]
+		out, err := ghAPI(ghAPIURL(page))
+		if err == nil {
+			err = json.Unmarshal(out, p)
+		}
+		if err == nil && p.Merged {
+			p.Shipped, err = ghShipped(page, p)
+		}
+		if err != nil {
+			log.Printf("github: settle %s: %v", id, err)
+			return nil
+		}
+	}
+	return pulls
+}
+
+// settle is what done pulls make of task id, if still open: shipping while a merged one is off its default
+// branch, else a note when it waits for more than their review, else done.
+func (b *Board) settle(id string, pulls []ghPull) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	// Re-checked: Eugene may have moved it while GitHub answered.
+	t := b.st.Tasks[id]
+	switch {
+	case t == nil || t.Status == "done" || t.Status == "dropped":
+		return
+	case !pullsShipped(pulls):
+		if t.Shipping {
+			return
+		}
+		t.Shipping = true
+		p := &pulls[slices.IndexFunc(pulls, func(p ghPull) bool { return p.Merged && !p.Shipped })]
+		b.note(t, "github", "update", "Its pull requests are merged into "+p.Base.Ref+", not "+p.Base.Repo.DefaultBranch+" yet; checked again each poll")
+	case t.Status == "waiting" && !endsWithPulls(t.WaitingFor):
+		t.Shipping = false
+		b.note(t, "github", "update", "Its pull requests are merged or closed; still waiting for "+t.WaitingFor)
+	default:
+		b.note(t, "github", "status", t.Status+" → done: its pull requests are merged or closed")
+		setStatus(t, "done")
+		b.doneNow(t)
+	}
+	b.saveOrLog()
 }
 
 var reviewRe = regexp.MustCompile(`(?i)^(PR|pull request)\b`)
@@ -662,8 +747,8 @@ func (b *Board) cleanMerged(id, dir, pane string, pages []string) {
 			time.Sleep(time.Second)
 		}
 	}
-	for _, p := range merged {
-		text, err := pruneWorktree(dir, p.Head.Ref, p.Head.SHA)
+	for i := range merged {
+		text, err := pruneWorktree(dir, merged[i].Head.Ref, merged[i].Head.SHA)
 		if err != nil {
 			log.Printf("github: clean %s: %v", id, err)
 		}
