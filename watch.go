@@ -422,6 +422,9 @@ func (b *Board) watchGitHub(keyRe *regexp.Regexp, every time.Duration) {
 		if err := b.pollGitHub(keyRe); err != nil {
 			log.Printf("github: %v", err)
 		}
+		if err := b.pollOwn(); err != nil {
+			log.Printf("github: %v", err)
+		}
 		b.settleMerged(b.shippingChecks(), "")
 		b.fireTriggers()
 	}
@@ -495,6 +498,89 @@ func (b *Board) pollGitHub(keyRe *regexp.Regexp) error {
 	b.mu.Unlock()
 	b.settleMerged(settle, since)
 	return err
+}
+
+// ghEvent is the part of a GitHub event pollOwn reads.
+type ghEvent struct {
+	Type      string `json:"type"`
+	CreatedAt string `json:"created_at"`
+	Payload   struct {
+		Action      string `json:"action"`
+		PullRequest struct {
+			URL string `json:"url"`
+		} `json:"pull_request"`
+	} `json:"payload"`
+}
+
+// pollOwn settles the tasks linking a pull request the gh user merged or closed: GitHub notifies nobody of
+// their own actions, so pollGitHub never hears of those. No Claude runs.
+// shortcut: one page of events (100), and one that surfaces after a newer one was seen is skipped; dedupe by event id if that bites.
+func (b *Board) pollOwn() error {
+	b.mu.Lock()
+	since := b.st.GitHubOwnSince
+	if since == "" {
+		defer b.mu.Unlock()
+		b.st.GitHubOwnSince = time.Now().UTC().Format(time.RFC3339)
+		return b.save()
+	}
+	b.mu.Unlock()
+	if b.ghLogin == "" {
+		out, err := ghAPI("--jq", ".login", "user")
+		if err != nil {
+			return fmt.Errorf("pollOwn: %w", err)
+		}
+		b.ghLogin = strings.TrimSpace(string(out))
+	}
+	events, etag, err := ghEvents(b.ghLogin, b.ghOwn)
+	if err != nil || events == nil {
+		return err
+	}
+	newest := since
+	var settle []settleCheck
+	b.mu.Lock()
+	for _, e := range events {
+		if e.CreatedAt <= since {
+			continue
+		}
+		newest = max(newest, e.CreatedAt)
+		if e.Type != "PullRequestEvent" || e.Payload.Action != "merged" && e.Payload.Action != "closed" {
+			continue
+		}
+		page := ghPageURL(e.Payload.PullRequest.URL)
+		for _, t := range b.st.Tasks {
+			if slices.Contains(taskPulls(t), page) {
+				settle = append(settle, settleCheck{t.ID, page})
+			}
+		}
+	}
+	b.st.GitHubOwnSince = newest
+	b.ghOwn = etag
+	err = b.save()
+	b.mu.Unlock()
+	b.settleMerged(settle, since)
+	return err
+}
+
+// ghEvents is user's newest events and their ETag; nil while they match etag (a 304, free of the rate limit).
+func ghEvents(user, etag string) ([]ghEvent, string, error) {
+	query := "users/" + user + "/events?per_page=100"
+	head, err := ghAPI("-i", "-H", "If-None-Match: "+etag, query)
+	status, etag, perr := ghStatus(head)
+	if perr == nil && status == http.StatusNotModified { // gh exits 1 on a 304
+		return nil, etag, nil
+	}
+	if err = errors.Join(err, perr); err != nil {
+		return nil, "", fmt.Errorf("ghEvents: %w", err)
+	}
+	out, err := ghAPI(query)
+	events := []ghEvent{}
+	if err == nil {
+		err = json.Unmarshal(out, &events)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("ghEvents: %w", err)
+	}
+	return events, etag, nil
 }
 
 var pullRe = regexp.MustCompile(`https://github\.com/[^/\s]+/[^/\s]+/pull/\d+`)

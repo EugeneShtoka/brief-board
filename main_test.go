@@ -580,6 +580,43 @@ func TestCleanMerged(t *testing.T) {
 	}
 }
 
+func TestPollOwn(t *testing.T) {
+	// The gh user merged pull request 1 after the last poll and pull request 2 before it; GitHub notified nobody.
+	bin, dir := t.TempDir(), t.TempDir()
+	gh := `case "$*" in
+*.login\ user) echo me;;
+-i*) printf 'HTTP/1.1 200 OK\r\nEtag: "e1"\r\n\r\n';;
+users/me/events*) echo '[
+ {"type":"PullRequestEvent","created_at":"2026-11-17T16:00:00Z","payload":{"action":"merged","pull_request":{"url":"https://api.github.com/repos/o/r/pulls/1"}}},
+ {"type":"PullRequestEvent","created_at":"2026-11-17T09:00:00Z","payload":{"action":"merged","pull_request":{"url":"https://api.github.com/repos/o/r/pulls/2"}}}]';;
+*/pulls/1) echo '{"state":"closed","merged":true,"closed_at":"2026-11-17T16:00:00Z","base":{"ref":"main","repo":{"default_branch":"main"}}}';;
+*/pulls/2) echo '{"state":"closed","merged":true,"closed_at":"2026-11-17T09:00:00Z","base":{"ref":"main","repo":{"default_branch":"main"}}}';;
+*) exit 1;;
+esac`
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\nshift\n"+gh+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.GitHubOwnSince = "2026-11-17T12:00:00Z"
+	b.st.Tasks = map[string]*Task{
+		"new": {ID: "new", Status: "waiting", WaitingFor: "PR review", Links: []map[string]string{{"url": "https://github.com/o/r/pull/1"}}},
+		"old": {ID: "old", Status: "waiting", WaitingFor: "PR review", Links: []map[string]string{{"url": "https://github.com/o/r/pull/2"}}},
+	}
+	if err := b.pollOwn(); err != nil {
+		t.Fatal(err)
+	}
+	if got := b.st.Tasks["new"].Status; got != "done" {
+		t.Errorf("new: %s, want done", got)
+	}
+	if got := b.st.Tasks["old"].Status; got != "waiting" {
+		t.Errorf("old: %s, want waiting (merged before the last poll)", got)
+	}
+	if b.st.GitHubOwnSince != "2026-11-17T16:00:00Z" || b.ghOwn != `"e1"` {
+		t.Errorf("since %s, etag %s; want the newest event's and its ETag", b.st.GitHubOwnSince, b.ghOwn)
+	}
+}
+
 func TestFullNames(t *testing.T) {
 	b := &Board{}
 	b.st.Tasks = map[string]*Task{"a": {Who: "Polina Shapiro"}, "b": {Who: "Bar Worcel"}, "c": {Who: "Sagi Chizik, Sagi Levi"}}
