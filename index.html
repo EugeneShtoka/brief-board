@@ -373,6 +373,7 @@ function renderDialog(fresh) {
     <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
     <button class="btn" data-act="clarify" ${busy ? "disabled" : ""}>Clarify</button>
     ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
+    <button class="btn" data-act="close" ${busy || t.status === "done" ? "disabled" : ""}>Close</button>
     <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>`);
 }
 
@@ -486,8 +487,16 @@ $("dlg").addEventListener("click", (e) => {
   if (e.target.id === "f-pick") return $("f-files").click();
   const f = e.target.closest("[data-unfile]");
   if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
-  const b = e.target.closest("[data-act]"); if (b && !b.disabled) act(b.dataset.act, b.dataset.key);
+  const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
+  if (b.dataset.act === "close") return closeTask();
+  act(b.dataset.act, b.dataset.key);
 });
+// Close marks the task done, the same PUT as dragging it to Closed.
+async function closeTask() {
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "done" }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't close the task."; return; }
+  apply(r);
+}
 // Tags are typed or picked from the ones in use; "#Some Tag" is stored as some-tag.
 const tagsOf = () => (state.tasks.find((x) => x.id === openId) || {}).tags || [];
 const tagOf = (s) => s.trim().toLowerCase().replace(/^#+/, "").replace(/\s+/g, "-");
