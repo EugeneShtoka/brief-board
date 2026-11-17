@@ -579,3 +579,24 @@ func TestCleanMerged(t *testing.T) {
 		t.Errorf("notes = %q, want %q", notes, want)
 	}
 }
+
+func TestFullNames(t *testing.T) {
+	b := &Board{}
+	b.st.Tasks = map[string]*Task{"a": {Who: "Polina Shapiro"}, "b": {Who: "Bar Worcel"}, "c": {Who: "Sagi Chizik, Sagi Levi"}}
+	for in, want := range map[string]string{
+		"Polina":                  "Polina Shapiro",
+		"polina":                  "Polina Shapiro",
+		"Bar + Polina":            "Bar Worcel, Polina Shapiro",
+		"Bar/Polina Shapiro":      "Bar Worcel, Polina Shapiro",
+		"Bar and Polina, Bar":     "Bar Worcel, Polina Shapiro",
+		"Evgeny":                  "Evgeny",
+		"Evgeny Subotin & Evgeny": "Evgeny Subotin",
+		"Sagi":                    "Sagi",
+		"  ":                      "",
+	} {
+		task := &Task{Who: in}
+		if b.fullNames(task); task.Who != want {
+			t.Errorf("%q: %q, want %q", in, task.Who, want)
+		}
+	}
+}

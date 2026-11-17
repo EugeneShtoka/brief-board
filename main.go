@@ -491,8 +491,34 @@ func (b *Board) badField(t *Task) string {
 	return ""
 }
 
+// whoSep splits a who that names several people: "Bar + Polina", "Bar/Polina", "Bar & Polina", "Bar and Polina".
+var whoSep = regexp.MustCompile(`\s*(?:[,+&/]|\band\b)\s*`)
+
+// fullNames rewrites t's who as full names, comma-separated, each once: a lone first name becomes the one full name
+// with that first name on the board (this task included). The caller holds b.mu.
+func (b *Board) fullNames(t *Task) {
+	full := map[string][]string{} // lowercased first name: the full names that start with it
+	for _, o := range append(slices.Collect(maps.Values(b.st.Tasks)), t) {
+		for _, n := range whoSep.Split(strings.TrimSpace(o.Who), -1) {
+			if first, _, ok := strings.Cut(n, " "); ok && !slices.Contains(full[strings.ToLower(first)], n) {
+				full[strings.ToLower(first)] = append(full[strings.ToLower(first)], n)
+			}
+		}
+	}
+	var names []string
+	for _, n := range whoSep.Split(strings.TrimSpace(t.Who), -1) {
+		if f := full[strings.ToLower(n)]; len(f) == 1 {
+			n = f[0]
+		}
+		if n != "" && !slices.Contains(names, n) {
+			names = append(names, n)
+		}
+	}
+	t.Who = strings.Join(names, ", ")
+}
+
 // handleUpsert merges the body's fields into the task; history, job and files are server-owned.
-func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
+func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) { //nolint:funlen // one step per field rule, in order
 	id := r.PathValue("id")
 	var patch map[string]json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
@@ -516,6 +542,7 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defaultLevels(&next)
+	b.fullNames(&next)
 	linkPulls(&next, next.Summary)
 	if bad := b.badField(&next); bad != "" {
 		writeJSON(w, 400, map[string]string{"error": bad})
