@@ -90,10 +90,19 @@ type Task struct {
 	Thread     map[string]string   `json:"thread,omitempty"`     // where a reply goes: {room, reply_to, thread}
 	Messages   []map[string]string `json:"messages,omitempty"`   // the story's messages: {label, room, event, url}, opened at url, else in kith
 	Files      []string            `json:"files,omitempty"`      // Eugene's attachments: absolute paths under files/<id> next to the state file
+	Triggers   []Trigger           `json:"triggers,omitempty"`   // what Eugene wants done once its pull requests reach a branch, see fireTriggers
 	DoneAt     *time.Time          `json:"doneAt,omitempty"`
 	UpdatedAt  time.Time           `json:"updatedAt"`
 	History    []Entry             `json:"history"`
 	Job        *Job                `json:"job,omitempty"`
+}
+
+// Trigger is a session Eugene sets up ahead: once a pull request the task links reaches branch On,
+// a session starts on the task to do Do, once.
+type Trigger struct {
+	On    string     `json:"on"` // a branch, e.g. development or main
+	Do    string     `json:"do"`
+	Fired *time.Time `json:"fired,omitempty"`
 }
 
 type State struct {
@@ -487,6 +496,8 @@ func (b *Board) badField(t *Task) string {
 		return fmt.Sprintf("group: %q is gone, set %s", t.Group, goneGroups[t.Group])
 	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
 		return "urgency, importance: want high, medium or low"
+	case slices.ContainsFunc(t.Triggers, func(tr Trigger) bool { return strings.TrimSpace(tr.On) == "" || strings.TrimSpace(tr.Do) == "" }):
+		return "triggers: each needs on (a branch) and do"
 	}
 	return ""
 }
@@ -744,7 +755,9 @@ const actionRules = `What each action means:
 - update: a Jira update arrived (from the Jira feed, not from Eugene). Read the ticket in Jira (status, newest
   comments) and refresh this task: summary (what changed, who said what), jiraStatus, messages. If the update asks
   something of Eugene (a mention, a question, an assignment), set group "waiting_on_you" and status "todo".
-  Never send messages and never change Jira on an update.`
+  Never send messages and never change Jira on an update.
+- trigger: a pull request the task links reached the branch of a trigger Eugene set on it ahead (task.triggers).
+  Do what the trigger says, the way act does: it is Eugene's own instruction, given before the merge.`
 
 func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	view := *t
@@ -758,9 +771,12 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 		guidance = "none"
 	}
 	var sb strings.Builder
-	if req.Action == "update" {
+	switch req.Action {
+	case "update":
 		fmt.Fprintf(&sb, "A Jira update arrived for an item of Eugene's Brief Board (%s). Nobody is watching this run.\n\nTask:\n%s\n\nThe update: %s\n", b.selfURL, taskJSON, guidance)
-	} else {
+	case "trigger":
+		fmt.Fprintf(&sb, "A trigger Eugene set on an item of his Brief Board (%s) fired.\n\nTask:\n%s\n\nThe trigger: %s\n", b.selfURL, taskJSON, guidance)
+	default:
 		fmt.Fprintf(&sb, "Eugene pressed %q on an item of his Brief Board (%s).\n\nTask:\n%s\n\nEugene's guidance: %s\n", req.Action, b.selfURL, taskJSON, guidance)
 	}
 	if req.Action == "qa" {

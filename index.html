@@ -350,6 +350,11 @@ function renderDialog(fresh) {
       <label for="f-importance">Importance<select id="f-importance">${levelOpts(t.importance)}</select></label></div>
     <div style="display:grid;gap:0.25rem"><label for="f-tag">Tags</label><div class="tagrow"><span id="d-tags" style="display:contents"></span>
       <input type="text" id="f-tag" list="tag-list" maxlength="40" placeholder="Add a tag, Enter" style="width:12rem"></div><datalist id="tag-list"></datalist></div>
+    <div style="display:grid;gap:0.25rem"><label for="f-trig-do">Triggers: once a pull request this task links reaches the branch, a Claude session does this</label>
+      <div class="tagrow"><span id="d-trigs" style="display:contents"></span></div>
+      <div class="tagrow"><input type="text" id="f-trig-on" maxlength="100" placeholder="development" aria-label="Branch" style="width:9rem">
+        <input type="text" id="f-trig-do" maxlength="500" placeholder="e.g. tell Bar it's on dev" style="flex:1;min-width:10rem">
+        <button type="button" class="btn" id="f-trig-add">Add trigger</button></div></div>
     <div><h3>History</h3><ol class="tl" id="d-hist" style="margin-top:0.5rem"></ol></div>
     <div class="actions">
       <div id="d-busy" style="display:contents"></div>
@@ -373,6 +378,7 @@ function renderDialog(fresh) {
   if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
   if (document.activeElement !== $("f-importance")) $("f-importance").value = t.importance || "";
   put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
+  put($("d-trigs"), (t.triggers || []).map((x, i) => `<span class="pill tag">on ${esc(x.on)}: ${esc(x.do)}${x.fired ? ` · fired ${dm(x.fired)}` : ""}<button type="button" class="untag" data-untrig="${i}" aria-label="Remove trigger on ${esc(x.on)}">×</button></span>`).join(""));
   // Suggest every tag in use that this task doesn't have yet.
   put($("tag-list"), allTags().filter((g) => !(t.tags || []).includes(g)).map((g) => `<option value="${esc(g)}">`).join(""));
   put($("d-hist"), (t.history || []).slice().reverse().map((e) =>
@@ -495,6 +501,9 @@ $("dlg").addEventListener("click", (e) => {
   if (e.target === $("dlg") || e.target.id === "x") return $("dlg").close();
   const u = e.target.closest("[data-untag]");
   if (u) return setTags(tagsOf().filter((g) => g !== u.dataset.untag));
+  const ut = e.target.closest("[data-untrig]");
+  if (ut) return setTriggers(trigsOf().filter((_, i) => i !== +ut.dataset.untrig));
+  if (e.target.id === "f-trig-add") return addTrigger();
   if (e.target.id === "f-pick") return $("f-files").click();
   const f = e.target.closest("[data-unfile]");
   if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
@@ -521,6 +530,19 @@ $("dlg").addEventListener("keydown", (e) => {
 async function setTags(tags) {
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the tags."; return; }
+  apply(r);
+}
+// Triggers go to the server whole, fired ones as the server gave them, so they don't fire again.
+const trigsOf = () => (state.tasks.find((x) => x.id === openId) || {}).triggers || [];
+function addTrigger() {
+  const on = $("f-trig-on").value.trim(), what = $("f-trig-do").value.trim();
+  if (!on || !what) { $("f-err").hidden = false; $("f-err").textContent = "A trigger needs a branch and what to do."; return; }
+  $("f-trig-on").value = $("f-trig-do").value = "";
+  setTriggers([...trigsOf(), { on, do: what }]);
+}
+async function setTriggers(triggers) {
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ triggers }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't change the triggers."; return; }
   apply(r);
 }
 $("dlg").addEventListener("close", () => { openId = null; });
