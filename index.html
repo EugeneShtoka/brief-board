@@ -101,6 +101,7 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 /* The filter: a dropdown of checkbox groups; what's unchecked is hidden. Each row's "only" shows on hover or focus. */
 .filter { position: relative; display: inline-block; margin-top: 0.625rem; }
 #theme { margin-top: 0.625rem; margin-left: 0.25rem; }
+#search { width: 14rem; margin-top: 0.625rem; margin-left: 0.25rem; }
 .filter summary { list-style: none; }
 .filter summary::-webkit-details-marker { display: none; }
 .filter summary::after { content: " ▾"; color: var(--muted); }
@@ -139,7 +140,7 @@ dialog::backdrop { background: rgb(10 14 24 / .45); }
 .refs { display: flex; flex-wrap: wrap; gap: 0.5rem 0.875rem; font-size: 0.8125rem; }
 .actions { border-top: 1px solid var(--line); padding-top: 0.875rem; display: grid; gap: 0.625rem; }
 label { font: 500 0.75rem var(--body); color: var(--muted); display: grid; gap: 0.25rem; }
-textarea, input[type=text] { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem 0.625rem; width: 100%; }
+textarea, input[type=text], input[type=search] { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.5rem 0.625rem; width: 100%; }
 textarea { min-height: 4.5rem; resize: vertical; }
 textarea:focus, input:focus { outline: 0.125rem solid var(--accent); outline-offset: 0; border-color: transparent; }
 .btns { display: flex; flex-wrap: wrap; gap: 0.5rem; }
@@ -164,6 +165,7 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
       <p class="headline" id="headline">Tasks from the daily brief appear here once Claude writes them.</p>
       <div class="note" id="note" hidden></div>
       <details class="filter" id="filter"><summary class="btn" id="filter-sum">Show: all</summary><div class="menu" id="filter-menu"></div></details>
+      <input type="search" id="search" aria-label="Search tasks" placeholder="Search, !exclude">
       <select id="theme" aria-label="Theme"><option value="">Theme: system</option><option value="light">Light</option><option value="dark">Dark</option><option value="cobalt">Cobalt</option></select>
     </div>
     <div class="side">
@@ -255,9 +257,15 @@ const filterOpts = () => [["area", "Project", areaList()], ["status", "Status", 
   ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
   ["source", "Source", allOf("source").map((v) => [v, SOURCE[v] || v])],
   ["tag", "Tags", [...allTags().map((g) => [g, g]), ["", "No tag"]]]];
-const filtering = () => Object.values(hide).some((v) => v.length);
+// The search keeps a task whose title, story, people, tags and Jira keys hold every word and none of the !words.
+const terms = () => $("search").value.toLowerCase().split(/\s+/).filter((w) => w && w !== "!");
+const found = (t) => {
+  const s = [t.title, t.summary, t.who, t.waitingFor, ...(t.tags || []), ...(t.jira || [])].join(" ").toLowerCase();
+  return terms().every((w) => w[0] === "!" ? !s.includes(w.slice(1)) : s.includes(w));
+};
+const filtering = () => Object.values(hide).some((v) => v.length) || terms().length > 0;
 // Each filter dim is the task field of that name; a tagged task shows while any of its tags is checked.
-const visible = (t) => Object.entries(hide).every(([dim, off]) => dim === "tag"
+const visible = (t) => found(t) && Object.entries(hide).every(([dim, off]) => dim === "tag"
   ? ((t.tags || []).length ? t.tags.some((g) => !off.includes(g)) : !off.includes(""))
   : !off.includes(t[dim] || ""));
 const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
@@ -539,6 +547,7 @@ function setFilter() {
   render();
   if (!$("log").hidden) loadLog();
 }
+$("search").addEventListener("input", setFilter);
 $("filter-menu").addEventListener("change", (e) => {
   const { dim } = e.target.dataset, v = e.target.value;
   hide[dim] = e.target.checked ? hide[dim].filter((x) => x !== v) : [...hide[dim], v];
