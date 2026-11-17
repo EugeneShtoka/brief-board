@@ -423,7 +423,7 @@ func (b *Board) watchGitHub(keyRe *regexp.Regexp, every time.Duration) {
 			log.Printf("github: %v", err)
 		}
 		b.settleMerged(b.shippingChecks(), "")
-		b.fireTriggers()
+		b.fireTriggers(true)
 	}
 }
 
@@ -602,10 +602,25 @@ func onBranch(page, branch string) (bool, error) {
 	return false, nil
 }
 
-// fireTriggers starts a session for each trigger whose branch a pull request its task links has reached
-// (see onBranch). A task busy with another session keeps its trigger for a later poll; a dropped task's never fire.
-// shortcut: every pending trigger costs a few GitHub calls each poll, fine for a handful; check only on new notifications if they pile up.
-func (b *Board) fireTriggers() {
+// due says who made a trigger that needs no GitHub call due, and how: its time came, or one of the task's Jira keys
+// is in its status (as the brief and update sessions last wrote it); "" when it isn't due.
+func (tr Trigger) due(t *Task, now time.Time) (actor, why string) {
+	if tr.At != nil && !now.Before(*tr.At) {
+		return "board", "its time came, " + tr.At.Local().Format("2006-01-02 15:04")
+	}
+	for _, k := range t.Jira {
+		if tr.JiraStatus != "" && strings.EqualFold(t.JiraStatus[k], tr.JiraStatus) {
+			return "jira", k + " reached " + t.JiraStatus[k]
+		}
+	}
+	return "", ""
+}
+
+// fireTriggers starts a session for each trigger that is due (see due) and, when gh, each trigger whose branch a
+// pull request its task links has reached (see onBranch). A task busy with another session keeps its trigger for a
+// later check; a dropped task's never fire.
+// shortcut: every pending branch trigger costs a few GitHub calls each poll, fine for a handful; check only on new notifications if they pile up.
+func (b *Board) fireTriggers(gh bool) {
 	type check struct {
 		id    string
 		tr    Trigger
@@ -615,7 +630,12 @@ func (b *Board) fireTriggers() {
 	b.mu.Lock()
 	for _, t := range b.st.Tasks {
 		for _, tr := range t.Triggers {
-			if pages := taskPulls(t); tr.Fired == nil && t.Status != "dropped" && len(pages) > 0 {
+			if tr.Fired != nil || t.Status == "dropped" {
+				continue
+			}
+			if actor, why := tr.due(t, time.Now()); why != "" {
+				b.fire(t, tr, actor, why)
+			} else if pages := taskPulls(t); gh && tr.On != "" && len(pages) > 0 {
 				checks = append(checks, check{t.ID, tr, pages})
 			}
 		}
@@ -637,18 +657,25 @@ func (b *Board) fireTriggers() {
 		}
 		b.mu.Lock()
 		// Re-checked: Eugene may have changed the triggers, or a session started, while GitHub answered.
-		if t := b.st.Tasks[c.id]; t != nil && !b.busy(t) {
-			if i := slices.Index(t.Triggers, c.tr); i >= 0 {
-				now := time.Now()
-				t.Triggers[i].Fired = &now
-				text := "a pull request it links reached " + c.tr.On + "; do: " + c.tr.Do
-				b.note(t, "github", "trigger", text)
-				b.start(t, actRequest{Action: "trigger", Comment: text})
-				b.saveOrLog()
-			}
+		if t := b.st.Tasks[c.id]; t != nil {
+			b.fire(t, c.tr, "github", "a pull request it links reached "+c.tr.On)
 		}
 		b.mu.Unlock()
 	}
+}
+
+// fire starts tr's session on t, unless t no longer has tr or is busy with another session. The caller holds b.mu.
+func (b *Board) fire(t *Task, tr Trigger, actor, why string) {
+	i := slices.Index(t.Triggers, tr)
+	if i < 0 || b.busy(t) {
+		return
+	}
+	now := time.Now()
+	t.Triggers[i].Fired = &now
+	text := why + "; do: " + tr.Do
+	b.note(t, actor, "trigger", text)
+	b.start(t, actRequest{Action: "trigger", Comment: text})
+	b.saveOrLog()
 }
 
 // settleCheck is a task a notification reached through a pull request it links: that pull request's page,
@@ -1008,6 +1035,8 @@ func (b *Board) ghTasks(n *ghNotification, keyRe *regexp.Regexp) []*Task {
 			return l["url"] == page || strings.HasPrefix(l["url"], page+"/") || strings.HasPrefix(l["url"], page+"#")
 		})
 		if linked || slices.ContainsFunc(keys, func(k string) bool { return slices.Contains(t.Jira, k) }) {
+			// A pull request that reaches t by a Jira key in its title becomes t's, so its merge settles t and fires t's triggers.
+			linkPulls(t, page)
 			tasks = append(tasks, t)
 		}
 	}

@@ -247,6 +247,18 @@ func TestHandleUpsertLevels(t *testing.T) {
 			t.Errorf("group %s: %d, want 400", g, code)
 		}
 	}
+	for trig, want := range map[string]int{
+		`{"on": "main", "do": "x"}`:                 200,
+		`{"jiraStatus": "Done", "do": "x"}`:         200,
+		`{"at": "2026-11-18T09:00:00Z", "do": "x"}`: 200,
+		`{"do": "x"}`:    400,
+		`{"on": "main"}`: 400,
+		`{"on": "main", "at": "2026-11-18T09:00:00Z", "do": "x"}`: 400,
+	} {
+		if code := put(`{"triggers": [` + trig + `]}`); code != want {
+			t.Errorf("trigger %s: %d, want %d", trig, code, want)
+		}
+	}
 }
 
 func TestSpawnSessionTerminal(t *testing.T) {
@@ -357,6 +369,10 @@ func TestGhTasks(t *testing.T) {
 	slices.Sort(ids)
 	if want := []string{"jira", "pr"}; !slices.Equal(ids, want) {
 		t.Errorf("ghTasks = %v, want %v", ids, want)
+	}
+	// The key brought pull request 7 to "jira", so it is jira's now; "pr" linked it already.
+	if got := taskPulls(b.st.Tasks["jira"]); !slices.Equal(got, []string{"https://github.com/o/r/pull/7"}) || len(b.st.Tasks["pr"].Links) != 1 {
+		t.Errorf("jira's pulls = %v, pr's links = %v", got, b.st.Tasks["pr"].Links)
 	}
 }
 
@@ -625,12 +641,26 @@ esac`
 	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, claude: "claude", terminal: []string{"true"},
 		areas: []Area{{ID: "work", Dir: dir}}}
 	pr := []map[string]string{{"url": "https://github.com/o/r/pull/1"}}
+	past, future := time.Now().Add(-time.Minute), time.Now().Add(time.Hour)
 	b.st.Tasks = map[string]*Task{
 		"dev":     {ID: "dev", Area: "work", Status: "done", Links: pr, Triggers: []Trigger{{On: "development", Do: "tell Bar"}, {On: "staging", Do: "later"}}},
 		"dropped": {ID: "dropped", Area: "work", Status: "dropped", Links: pr, Triggers: []Trigger{{On: "main", Do: "no"}}},
 		"busy":    {ID: "busy", Area: "work", Links: pr, Triggers: []Trigger{{On: "main", Do: "wait"}}, Job: &Job{Status: "running"}},
+		// Neither needs GitHub: a time that came and one that hasn't, a Jira status reached and one that isn't.
+		"at":   {ID: "at", Area: "work", Triggers: []Trigger{{At: &past, Do: "ping"}, {At: &future, Do: "not yet"}}},
+		"jira": {ID: "jira", Area: "work", Jira: []string{"BE-1", "BE-2"}, JiraStatus: map[string]string{"BE-2": "QA - Staging"}, Triggers: []Trigger{{JiraStatus: "Done", Do: "no"}, {JiraStatus: "qa - staging", Do: "tell QA"}}},
 	}
-	b.fireTriggers()
+	b.fireTriggers(false)
+	if b.st.Tasks["dev"].Triggers[0].Fired != nil {
+		t.Error("a branch trigger fired without GitHub")
+	}
+	if at := b.st.Tasks["at"]; at.Triggers[0].Fired == nil || at.Triggers[1].Fired != nil || at.History[0].Actor != "board" {
+		t.Errorf("at = %+v, want only the past time fired, by the board", at)
+	}
+	if j := b.st.Tasks["jira"]; j.Triggers[0].Fired != nil || j.Triggers[1].Fired == nil || j.History[0].Text != "BE-2 reached QA - Staging; do: tell QA" {
+		t.Errorf("jira = %+v, want the QA trigger fired", j)
+	}
+	b.fireTriggers(true)
 	dev := b.st.Tasks["dev"]
 	if dev.Triggers[0].Fired == nil || dev.Triggers[1].Fired != nil {
 		t.Errorf("dev triggers = %+v, want only development fired", dev.Triggers)

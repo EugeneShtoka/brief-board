@@ -91,19 +91,21 @@ type Task struct {
 	Thread     map[string]string   `json:"thread,omitempty"`     // where a reply goes: {room, reply_to, thread}
 	Messages   []map[string]string `json:"messages,omitempty"`   // the story's messages: {label, room, event, url}, opened at url, else in kith
 	Files      []string            `json:"files,omitempty"`      // Eugene's attachments: absolute paths under files/<id> next to the state file
-	Triggers   []Trigger           `json:"triggers,omitempty"`   // what Eugene wants done once its pull requests reach a branch, see fireTriggers
+	Triggers   []Trigger           `json:"triggers,omitempty"`   // what Eugene wants done once something happens, see fireTriggers
 	DoneAt     *time.Time          `json:"doneAt,omitempty"`
 	UpdatedAt  time.Time           `json:"updatedAt"`
 	History    []Entry             `json:"history"`
 	Job        *Job                `json:"job,omitempty"`
 }
 
-// Trigger is a session Eugene sets up ahead: once a pull request the task links reaches branch On,
-// a session starts on the task to do Do, once.
+// Trigger is a session Eugene sets up ahead: once a pull request the task links reaches branch On, one of the
+// task's Jira keys reaches status JiraStatus, or time At comes (exactly one is set), a session starts on the task to do Do, once.
 type Trigger struct {
-	On    string     `json:"on"` // a branch, e.g. development or main
-	Do    string     `json:"do"`
-	Fired *time.Time `json:"fired,omitempty"`
+	On         string     `json:"on,omitempty"` // a branch, e.g. development or main
+	JiraStatus string     `json:"jiraStatus,omitempty"`
+	At         *time.Time `json:"at,omitempty"`
+	Do         string     `json:"do"`
+	Fired      *time.Time `json:"fired,omitempty"`
 }
 
 type State struct {
@@ -499,8 +501,16 @@ func (b *Board) badField(t *Task) string {
 		return fmt.Sprintf("group: %q is gone, set %s", t.Group, goneGroups[t.Group])
 	case !slices.Contains(levels, t.Urgency) || !slices.Contains(levels, t.Importance):
 		return "urgency, importance: want high, medium or low"
-	case slices.ContainsFunc(t.Triggers, func(tr Trigger) bool { return strings.TrimSpace(tr.On) == "" || strings.TrimSpace(tr.Do) == "" }):
-		return "triggers: each needs on (a branch) and do"
+	case slices.ContainsFunc(t.Triggers, func(tr Trigger) bool {
+		kinds := 0
+		for _, set := range []bool{strings.TrimSpace(tr.On) != "", strings.TrimSpace(tr.JiraStatus) != "", tr.At != nil} {
+			if set {
+				kinds++
+			}
+		}
+		return kinds != 1 || strings.TrimSpace(tr.Do) == ""
+	}):
+		return "triggers: each needs do and one of on (a branch), jiraStatus or at"
 	}
 	return ""
 }
@@ -759,8 +769,9 @@ const actionRules = `What each action means:
   comments) and refresh this task: summary (what changed, who said what), jiraStatus, messages. If the update asks
   something of Eugene (a mention, a question, an assignment), set group "waiting_on_you" and status "todo".
   Never send messages and never change Jira on an update.
-- trigger: a pull request the task links reached the branch of a trigger Eugene set on it ahead (task.triggers).
-  Do what the trigger says, the way act does: it is Eugene's own instruction, given before the merge.`
+- trigger: a trigger Eugene set on the task ahead (task.triggers) fired: a pull request the task links reached its
+  branch, one of the task's Jira keys reached its status, or its time came. Do what the trigger says, the way act does:
+  it is Eugene's own instruction, given ahead.`
 
 func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	view := *t
@@ -1088,6 +1099,7 @@ func main() {
 	go func() {
 		for ; ; time.Sleep(time.Minute) {
 			b.reapSessions()
+			b.fireTriggers(false) // time and Jira status triggers; watchGitHub's polls fire branch ones
 		}
 	}()
 
