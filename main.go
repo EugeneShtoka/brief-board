@@ -115,6 +115,8 @@ type State struct {
 	JiraSeen map[string][]string `json:"jiraSeenIn,omitempty"`
 	// GitHubSince is the newest GitHub notification's updated_at seen; empty until the first poll sets a baseline.
 	GitHubSince string `json:"githubSince,omitempty"`
+	// GitHubOwnSince is the newest of the gh user's own GitHub events seen; empty until the first poll sets a baseline.
+	GitHubOwnSince string `json:"githubOwnSince,omitempty"`
 	// Briefs is, per area id, its last brief run.
 	Briefs map[string]*Job `json:"briefs,omitempty"`
 }
@@ -136,6 +138,8 @@ type Board struct {
 	wake     chan struct{}     // nudges scheduleBrief out of its sleep
 	rerun    map[string]bool   // area ids to brief now: the board's button, or a brief that ran while kith was down
 	ghETag   string            // pollGitHub's own: the ETag of its last notifications answer
+	ghOwn    string            // pollOwn's own: the ETag of its last events answer
+	ghLogin  string            // the gh user, read once by pollOwn
 	clean    bool              // BOARD_CLEAN_MERGED
 	areas    []Area            // BOARD_AREAS
 	env      map[string]string // the service's env, before settings.json; a saved setting equal to it is dropped from the file
