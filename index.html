@@ -247,7 +247,7 @@ const allOf = (f) => [...new Set(state.tasks.map((t) => t[f] || ""))].sort();
 // what's unchecked, so a new project, person or tag shows up by default; "" is a task with no group, source, person or tag.
 let hide = { area: [], status: [], group: [], urgency: [], importance: [], who: [], waitingFor: [], source: [], tag: [] };
 try { hide = { ...hide, ...JSON.parse(localStorage.getItem("hide")) }; } catch {}
-const filterOpts = () => [["area", "Area", areaList()], ["status", "Status", STATUS],
+const filterOpts = () => [["area", "Project", areaList()], ["status", "Status", STATUS],
   ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
   ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
   ["who", "Who", allOf("who").map((v) => [v, v || "Nobody"])],
@@ -310,6 +310,8 @@ function render() {
 
   const b = state.brief || {};
   if (b.headline) put($("headline"), linkify(b.headline));
+  // The headline is the work brief's, so it shows only while work does.
+  $("headline").hidden = hide.area.includes("work");
   // Each shown area's last brief (work's is also the brief Claude last pushed), newest on top; the button briefs the shown areas.
   const shown = areaList().filter(([v]) => !hide.area.includes(v));
   const runs = shown.map(([v, l]) => {
@@ -321,7 +323,7 @@ function render() {
   $("date").textContent = oldest ? `${dm(oldest.at)} ${hm(oldest.at)}` : "None yet";
   $("brun").hidden = !runs.length;
   put($("brun"), runs.map((x) => `${esc(x.l)} ${dm(x.at)} ${hm(x.at)}${x.status === "running" ? " running…" : x.status === "failed" ? " failed" : ""}`).join("<br>"));
-  $("run-brief").textContent = hide.area.length ? `Brief ${shown.length === 1 ? shown[0][1] : shown.length + " areas"} now` : "Run brief now";
+  $("run-brief").textContent = hide.area.length ? `Brief ${shown.length === 1 ? shown[0][1] : shown.length + " projects"} now` : "Run brief now";
   $("run-brief").disabled = !shown.length;
   if (openId) renderDialog(false);
 }
@@ -334,7 +336,7 @@ function renderDialog(fresh) {
     <div class="dlg-head"><div><h2 id="dlg-title"></h2><div class="meta" id="d-meta"></div></div>
       <button class="x" id="x" aria-label="Close">×</button></div>
     <div id="d-story" style="display:contents"></div>
-    <div class="tagrow" style="gap:0.875rem"><label for="f-area">Area<select id="f-area">${areaOpts(t.area)}</select></label>
+    <div class="tagrow" style="gap:0.875rem"><label for="f-area">Project<select id="f-area">${areaOpts(t.area)}</select></label>
       <label for="f-urgency">Urgency<select id="f-urgency">${levelOpts(t.urgency)}</select></label>
       <label for="f-importance">Importance<select id="f-importance">${levelOpts(t.importance)}</select></label></div>
     <div style="display:grid;gap:0.25rem"><label for="f-tag">Tags</label><div class="tagrow"><span id="d-tags" style="display:contents"></span>
@@ -389,7 +391,7 @@ function renderNew() {
     <div class="dlg-head"><h2 id="dlg-title">New task</h2><button class="x" id="x" aria-label="Close">×</button></div>
     <form id="new-form" style="display:grid;gap:0.875rem">
       <label for="n-title">Title<input type="text" id="n-title" required maxlength="200"></label>
-      <div class="tagrow" style="gap:0.875rem"><label for="n-area">Area<select id="n-area">${areaOpts(pre)}</select></label>
+      <div class="tagrow" style="gap:0.875rem"><label for="n-area">Project<select id="n-area">${areaOpts(pre)}</select></label>
         <label for="n-urgency">Urgency<select id="n-urgency">${levelOpts("")}</select></label>
         <label for="n-importance">Importance<select id="n-importance">${levelOpts("")}</select></label></div>
       <label for="n-tags">Tags (comma-separated)<input type="text" id="n-tags" maxlength="200" placeholder="e.g. infra, q4"></label>
