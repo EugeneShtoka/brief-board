@@ -137,6 +137,11 @@ dialog::backdrop { background: rgb(10 14 24 / .45); }
 .x { all: unset; cursor: pointer; font: 1.25rem var(--mono); color: var(--muted); padding: 0 0.375rem; border-radius: 0.375rem; }
 .x:focus-visible { outline: 0.125rem solid var(--accent); }
 .story { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 72ch; }
+/* A question the task's Claude session waits on, answered here. */
+.ask { border: 1px solid var(--warn); border-radius: 0.625rem; padding: 0.75rem 0.875rem; display: grid; gap: 0.75rem; }
+.ask fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.375rem; }
+.ask legend { font: 600 0.875rem var(--body); padding: 0 0 0.25rem; }
+.ask label.opt { display: flex; gap: 0.5rem; align-items: baseline; font: 0.875rem var(--body); color: var(--ink); cursor: pointer; }
 .refs { display: flex; flex-wrap: wrap; gap: 0.5rem 0.875rem; font-size: 0.8125rem; }
 .actions { border-top: 1px solid var(--line); padding-top: 0.875rem; display: grid; gap: 0.625rem; }
 label { font: 500 0.75rem var(--body); color: var(--muted); display: grid; gap: 0.25rem; }
@@ -284,6 +289,7 @@ function pills(t) {
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
   if (t.urgency && t.urgency !== "medium") out.push(`<span class="pill ${t.urgency === "high" ? "crit" : ""}">urgency ${esc(t.urgency)}</span>`);
   if (t.importance && t.importance !== "medium") out.push(`<span class="pill ${t.importance === "high" ? "warn" : ""}">importance ${esc(t.importance)}</span>`);
+  if (t.job && t.job.question) out.push(`<span class="pill warn">Claude asks</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
@@ -352,6 +358,7 @@ function renderDialog(fresh) {
     <div class="dlg-head"><div><h2 id="dlg-title"></h2><div class="meta" id="d-meta"></div></div>
       <button class="x" id="x" aria-label="Close">×</button></div>
     <div id="d-story" style="display:contents"></div>
+    <form class="ask" id="d-ask" hidden></form>
     <div class="tagrow" style="gap:0.875rem"><label for="f-area">Project<select id="f-area">${areaOpts(t.area)}</select></label>
       <label for="f-urgency">Urgency<select id="f-urgency">${levelOpts(t.urgency)}</select></label>
       <label for="f-importance">Importance<select id="f-importance">${levelOpts(t.importance)}</select></label></div>
@@ -366,7 +373,7 @@ function renderDialog(fresh) {
       <label for="f-comment">Guidance for Claude (optional: what to do, or what to find out)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
       ${filesField("Files for Claude, attached when you press a button")}
       <div class="btns" id="d-btns"></div>
-      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its report lands in the history.</div>
+      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history.</div>
       <div class="err" id="f-err" hidden></div>
     </div>`; }
   const busy = running(t);
@@ -379,6 +386,9 @@ function renderDialog(fresh) {
   put($("d-meta"), `${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}`);
   put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Act can fill it in.</div>`}
     ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
+  const q = t.job && t.job.question;
+  $("d-ask").hidden = !q;
+  put($("d-ask"), q ? askForm(q) : "");
   if (document.activeElement !== $("f-area")) $("f-area").value = t.area;
   if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
   if (document.activeElement !== $("f-importance")) $("f-importance").value = t.importance || "";
@@ -397,6 +407,31 @@ function renderDialog(fresh) {
     <button class="btn" data-act="close" ${busy || t.status === "done" ? "disabled" : ""}>Close</button>
     <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>
     <button class="btn danger" data-act="delete" ${busy ? "disabled" : ""}>Delete</button>`);
+}
+
+// A question the task's session waits on (handleAsk): each one's options, and Eugene's own words in place of them.
+const askForm = (q) => `<h3>Claude asks</h3>${q.questions.map((x, i) => `<fieldset><legend>${esc(x.question)}</legend>${
+  x.options.map((o) => `<label class="opt"><input type="${x.multiSelect ? "checkbox" : "radio"}" name="q${i}" value="${esc(o.label)}"><span>${esc(o.label)}${o.description ? ` <span class="hint">${esc(o.description)}</span>` : ""}</span></label>`).join("")}
+  <input type="text" name="q${i}-own" placeholder="Or say it in your words" aria-label="Your own answer to: ${esc(x.question)}"></fieldset>`).join("")}
+  <div class="btns"><button class="btn primary" type="submit">Answer</button><button class="btn" type="button" id="ask-term">Answer in the terminal</button></div>`;
+// Several picks join with ", " and own words, as Claude Code's own prompt sends them; own words replace a single pick.
+function answer(e) {
+  e.preventDefault();
+  const f = $("d-ask"), answers = {};
+  for (const [i, x] of state.tasks.find((t) => t.id === openId).job.question.questions.entries()) {
+    const picked = [...f.querySelectorAll(`[name="q${i}"]:checked`)].map((c) => c.value), own = f.elements[`q${i}-own`].value.trim();
+    const a = x.multiSelect ? [...picked, own].filter(Boolean).join(", ") : own || picked[0];
+    if (!a) { $("f-err").hidden = false; $("f-err").textContent = "Answer every question."; return; }
+    answers[x.question] = a;
+  }
+  sendAnswer(answers);
+}
+// No answers hand the question back to the session's terminal.
+async function sendAnswer(answers) {
+  $("f-err").hidden = true;
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/answer`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ answers }) }).catch(() => null);
+  if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't send the answer."; return; }
+  apply(r);
 }
 
 const areaOpts = (sel) => areaList()
@@ -513,6 +548,7 @@ $("dlg").addEventListener("click", (e) => {
   if (ut) return setTriggers(trigsOf().filter((_, i) => i !== +ut.dataset.untrig));
   if (e.target.id === "f-trig-add") return addTrigger();
   if (e.target.id === "f-pick") return $("f-files").click();
+  if (e.target.id === "ask-term") return sendAnswer({});
   const f = e.target.closest("[data-unfile]");
   if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
   const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
@@ -592,7 +628,7 @@ $("dlg").addEventListener("change", async (e) => {
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = `Couldn't change the ${field}.`; return; }
   apply(r);
 });
-$("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); if (e.target.id === "settings-form") saveSettings(e); });
+$("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); if (e.target.id === "d-ask") answer(e); if (e.target.id === "settings-form") saveSettings(e); });
 $("run-brief").addEventListener("click", async () => {
   $("run-brief").disabled = true;
   const areas = areaList().map(([v]) => v).filter((v) => !hide.area.includes(v));
