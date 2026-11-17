@@ -350,11 +350,9 @@ function renderDialog(fresh) {
       <label for="f-importance">Importance<select id="f-importance">${levelOpts(t.importance)}</select></label></div>
     <div style="display:grid;gap:0.25rem"><label for="f-tag">Tags</label><div class="tagrow"><span id="d-tags" style="display:contents"></span>
       <input type="text" id="f-tag" list="tag-list" maxlength="40" placeholder="Add a tag, Enter" style="width:12rem"></div><datalist id="tag-list"></datalist></div>
-    <div style="display:grid;gap:0.25rem"><label for="f-trig-do">Triggers: once a pull request this task links reaches the branch, a Claude session does this</label>
+    <div style="display:grid;gap:0.25rem"><label for="f-trig-do">Triggers: once this happens, a Claude session does this</label>
       <div class="tagrow"><span id="d-trigs" style="display:contents"></span></div>
-      <div class="tagrow"><input type="text" id="f-trig-on" maxlength="100" placeholder="development" aria-label="Branch" style="width:9rem">
-        <input type="text" id="f-trig-do" maxlength="500" placeholder="e.g. tell Bar it's on dev" style="flex:1;min-width:10rem">
-        <button type="button" class="btn" id="f-trig-add">Add trigger</button></div></div>
+      ${trigField('<button type="button" class="btn" id="f-trig-add">Add trigger</button>')}</div>
     <div><h3>History</h3><ol class="tl" id="d-hist" style="margin-top:0.5rem"></ol></div>
     <div class="actions">
       <div id="d-busy" style="display:contents"></div>
@@ -378,7 +376,7 @@ function renderDialog(fresh) {
   if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
   if (document.activeElement !== $("f-importance")) $("f-importance").value = t.importance || "";
   put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
-  put($("d-trigs"), (t.triggers || []).map((x, i) => `<span class="pill tag">on ${esc(x.on)}: ${esc(x.do)}${x.fired ? ` · fired ${dm(x.fired)}` : ""}<button type="button" class="untag" data-untrig="${i}" aria-label="Remove trigger on ${esc(x.on)}">×</button></span>`).join(""));
+  put($("d-trigs"), (t.triggers || []).map((x, i) => `<span class="pill tag">${esc(trigWhen(x))}: ${esc(x.do)}${x.fired ? ` · fired ${dm(x.fired)}` : ""}<button type="button" class="untag" data-untrig="${i}" aria-label="Remove trigger ${esc(trigWhen(x))}">×</button></span>`).join(""));
   // Suggest every tag in use that this task doesn't have yet.
   put($("tag-list"), allTags().filter((g) => !(t.tags || []).includes(g)).map((g) => `<option value="${esc(g)}">`).join(""));
   put($("d-hist"), (t.history || []).slice().reverse().map((e) =>
@@ -412,6 +410,7 @@ function renderNew() {
         <label for="n-importance">Importance<select id="n-importance">${levelOpts("")}</select></label></div>
       <label for="n-tags">Tags (comma-separated)<input type="text" id="n-tags" maxlength="200" placeholder="e.g. infra, q4"></label>
       <label for="n-summary">The story (what, for whom, by when; Claude reads this when you press Act)<textarea id="n-summary"></textarea></label>
+      <div style="display:grid;gap:0.25rem"><label for="f-trig-do">Trigger (optional): once this happens, a Claude session does this</label>${trigField("")}</div>
       ${filesField("Files Claude reads too")}
       <div class="btns"><button class="btn primary" type="submit">Add</button></div>
       <div class="err" id="f-err" hidden></div>
@@ -423,6 +422,9 @@ async function addTask(e) {
   const id = "m-" + (title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "task") + "-" + Date.now().toString(36);
   const body = { title, area: $("n-area").value, summary: $("n-summary").value.trim(), status: "todo", since: today, source: "eugene",
     urgency: $("n-urgency").value, importance: $("n-importance").value, tags: [...new Set($("n-tags").value.split(",").map(tagOf).filter(Boolean))] };
+  const tr = newTrig();
+  if (typeof tr === "string") { $("f-err").hidden = false; $("f-err").textContent = tr; return; }
+  if (tr) body.triggers = [tr];
   const r = await fetch(`api/tasks/${id}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't add the task."; return; }
   const failed = await attach(id);
@@ -534,11 +536,28 @@ async function setTags(tags) {
 }
 // Triggers go to the server whole, fired ones as the server gave them, so they don't fire again.
 const trigsOf = () => (state.tasks.find((x) => x.id === openId) || {}).triggers || [];
+// The trigger inputs, in the dialog and the new-task form: what fires it (a branch, a Jira status or a time) and what to do.
+const TRIG = { on: ["a linked PR reaches branch", "text", "development"], jiraStatus: ["a Jira key reaches status", "text", "QA - Staging"], at: ["the time comes", "datetime-local", ""] };
+const trigField = (add) => `<div class="tagrow"><select id="f-trig-kind" aria-label="Fires when">${Object.entries(TRIG).map(([k, [l]]) => `<option value="${k}">${l}</option>`).join("")}</select>
+  <input type="text" id="f-trig-on" maxlength="100" placeholder="development" aria-label="Branch" style="width:11rem">
+  <input type="text" id="f-trig-do" maxlength="500" placeholder="e.g. tell Bar it's on dev" style="flex:1;min-width:10rem">${add}</div>`;
+const trigWhen = (x) => x.at ? `at ${dm(x.at)} ${hm(x.at)}` : x.jiraStatus ? `on Jira ${x.jiraStatus}` : `on ${x.on}`;
+function trigKind() {
+  const [l, type, ph] = TRIG[$("f-trig-kind").value], v = $("f-trig-on");
+  v.type = type; v.placeholder = ph; v.value = ""; v.setAttribute("aria-label", l);
+}
+// newTrig is the trigger the inputs describe, null when they are empty, or what is missing.
+function newTrig() {
+  const kind = $("f-trig-kind").value, v = $("f-trig-on").value.trim(), what = $("f-trig-do").value.trim();
+  if (!v && !what) return null;
+  if (!v || !what) return "A trigger needs when it fires and what to do.";
+  return { [kind]: kind === "at" ? new Date(v).toISOString() : v, do: what };
+}
 function addTrigger() {
-  const on = $("f-trig-on").value.trim(), what = $("f-trig-do").value.trim();
-  if (!on || !what) { $("f-err").hidden = false; $("f-err").textContent = "A trigger needs a branch and what to do."; return; }
+  const tr = newTrig() || "A trigger needs when it fires and what to do.";
+  if (typeof tr === "string") { $("f-err").hidden = false; $("f-err").textContent = tr; return; }
   $("f-trig-on").value = $("f-trig-do").value = "";
-  setTriggers([...trigsOf(), { on, do: what }]);
+  setTriggers([...trigsOf(), tr]);
 }
 async function setTriggers(triggers) {
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ triggers }) }).catch(() => null);
@@ -550,6 +569,7 @@ $("dlg").addEventListener("close", () => { openId = null; });
 $("dlg").addEventListener("change", async (e) => {
   if (e.target.id === "f-files") { pend.push(...e.target.files); e.target.value = ""; return showFiles(); }
   if (e.target.id === "theme") return setTheme(e.target.value);
+  if (e.target.id === "f-trig-kind") return trigKind();
   const field = { "f-area": "area", "f-urgency": "urgency", "f-importance": "importance" }[e.target.id];
   if (!field || !openId) return;
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [field]: e.target.value }) }).catch(() => null);
