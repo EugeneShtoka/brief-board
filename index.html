@@ -253,7 +253,7 @@ const filterOpts = () => [["area", "Project", areaList()], ["status", "Status", 
   ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
   ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
   ["source", "Source", allOf("source").map((v) => [v, SOURCE[v] || v])],
-  ["tag", "Tags", [...allTags().map((g) => [g, "#" + g]), ["", "No tag"]]]];
+  ["tag", "Tags", [...allTags().map((g) => [g, g]), ["", "No tag"]]]];
 const filtering = () => Object.values(hide).some((v) => v.length);
 // Each filter dim is the task field of that name; a tagged task shows while any of its tags is checked.
 const visible = (t) => Object.entries(hide).every(([dim, off]) => dim === "tag"
@@ -264,7 +264,7 @@ const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)
 function pills(t) {
   const [gl, gc] = GROUP[t.group] || [t.group || "", ""], out = [];
   if (t.area && t.area !== "work") out.push(`<span class="pill">${esc(areaName(t.area))}</span>`);
-  for (const g of t.tags || []) out.push(`<span class="pill tag">#${esc(g)}</span>`);
+  for (const g of t.tags || []) out.push(`<span class="pill tag">${esc(g)}</span>`);
   if (gl) out.push(`<span class="pill ${gc}">${esc(gl)}</span>`);
   if (t.urgency && t.urgency !== "medium") out.push(`<span class="pill ${t.urgency === "high" ? "crit" : ""}">urgency ${esc(t.urgency)}</span>`);
   if (t.importance && t.importance !== "medium") out.push(`<span class="pill ${t.importance === "high" ? "warn" : ""}">importance ${esc(t.importance)}</span>`);
@@ -363,7 +363,7 @@ function renderDialog(fresh) {
   if (document.activeElement !== $("f-area")) $("f-area").value = t.area;
   if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
   if (document.activeElement !== $("f-importance")) $("f-importance").value = t.importance || "";
-  put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">#${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
+  put($("d-tags"), (t.tags || []).map((g) => `<span class="pill tag">${esc(g)}<button type="button" class="untag" data-untag="${esc(g)}" aria-label="Remove tag ${esc(g)}">×</button></span>`).join(""));
   // Suggest every tag in use that this task doesn't have yet.
   put($("tag-list"), allTags().filter((g) => !(t.tags || []).includes(g)).map((g) => `<option value="${esc(g)}">`).join(""));
   put($("d-hist"), (t.history || []).slice().reverse().map((e) =>
