@@ -244,17 +244,21 @@ function laneOf(t) {
 const areaList = () => (cfg().areas || []).map((a) => [a.id, a.name]);
 const areaName = (id) => (areaList().find(([v]) => v === id) || [id, id])[1];
 const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sort();
+// The people a task is with: the board stores who as full names, comma-separated.
+const people = (t) => (t.who || "").split(",").map((n) => n.trim()).filter(Boolean);
+const allPeople = () => [...new Set(state.tasks.flatMap(people))].sort();
 // Every value of a task field in use, sorted; "" is a task without one.
 const allOf = (f) => [...new Set(state.tasks.map((t) => t[f] || ""))].sort();
 // The filter narrows the lanes, the progress summary and History by each task field below and tag. It keeps
-// what's unchecked, so a new project, source or tag shows up by default; "" is a task with no group, source or tag.
-// Only categories are filters: who and waitingFor are free text per task, so they stay on the cards.
-let hide = { area: [], status: [], group: [], urgency: [], importance: [], source: [], tag: [] };
-// A saved dim the filter no longer has (who, waitingFor) is dropped, or it would still hide tasks.
+// what's unchecked, so a new project, source, person or tag shows up by default; "" is a task with no group, source,
+// person or tag. "Waiting for" lists each person in who; the task's waitingFor sentence is free text and stays on the card.
+let hide = { area: [], status: [], group: [], urgency: [], importance: [], who: [], source: [], tag: [] };
+// A saved dim the filter no longer has (waitingFor) is dropped, or it would still hide tasks.
 try { for (const [dim, off] of Object.entries(JSON.parse(localStorage.getItem("hide")))) if (dim in hide) hide[dim] = off; } catch {}
 const filterOpts = () => [["area", "Project", areaList()], ["status", "Status", STATUS],
   ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
   ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
+  ["who", "Waiting for", [...allPeople().map((n) => [n, n]), ["", "No one"]]],
   ["source", "Source", allOf("source").map((v) => [v, SOURCE[v] || v])],
   ["tag", "Tags", [...allTags().map((g) => [g, g]), ["", "No tag"]]]];
 // The search keeps a task whose title, story, people, tags and Jira keys hold every word and none of the !words.
@@ -264,10 +268,12 @@ const found = (t) => {
   return terms().every((w) => w[0] === "!" ? !s.includes(w.slice(1)) : s.includes(w));
 };
 const filtering = () => Object.values(hide).some((v) => v.length) || terms().length > 0;
-// Each filter dim is the task field of that name; a tagged task shows while any of its tags is checked.
-const visible = (t) => found(t) && Object.entries(hide).every(([dim, off]) => dim === "tag"
-  ? ((t.tags || []).length ? t.tags.some((g) => !off.includes(g)) : !off.includes(""))
-  : !off.includes(t[dim] || ""));
+// Each filter dim is the task field of that name; a task with several tags or people shows while any of them is checked.
+const valsOf = (t, dim) => dim === "tag" ? t.tags || [] : dim === "who" ? people(t) : [t[dim] || ""];
+const visible = (t) => found(t) && Object.entries(hide).every(([dim, off]) => {
+  const v = valsOf(t, dim);
+  return v.length ? v.some((x) => !off.includes(x)) : !off.includes("");
+});
 const carried = (t) => t.since ? Math.round((new Date(today) - new Date(t.since)) / 864e5) : 0;
 
 function pills(t) {
