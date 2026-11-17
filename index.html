@@ -244,14 +244,14 @@ const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sor
 // Every value of a task field in use, sorted; "" is a task without one.
 const allOf = (f) => [...new Set(state.tasks.map((t) => t[f] || ""))].sort();
 // The filter narrows the lanes, the progress summary and History by each task field below and tag. It keeps
-// what's unchecked, so a new project, person or tag shows up by default; "" is a task with no group, source, person or tag.
-let hide = { area: [], status: [], group: [], urgency: [], importance: [], who: [], waitingFor: [], source: [], tag: [] };
-try { hide = { ...hide, ...JSON.parse(localStorage.getItem("hide")) }; } catch {}
+// what's unchecked, so a new project, source or tag shows up by default; "" is a task with no group, source or tag.
+// Only categories are filters: who and waitingFor are free text per task, so they stay on the cards.
+let hide = { area: [], status: [], group: [], urgency: [], importance: [], source: [], tag: [] };
+// A saved dim the filter no longer has (who, waitingFor) is dropped, or it would still hide tasks.
+try { for (const [dim, off] of Object.entries(JSON.parse(localStorage.getItem("hide")))) if (dim in hide) hide[dim] = off; } catch {}
 const filterOpts = () => [["area", "Project", areaList()], ["status", "Status", STATUS],
   ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
   ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
-  ["who", "Who", allOf("who").map((v) => [v, v || "Nobody"])],
-  ["waitingFor", "Waiting for", allOf("waitingFor").map((v) => [v, v || "Nothing owed"])],
   ["source", "Source", allOf("source").map((v) => [v, SOURCE[v] || v])],
   ["tag", "Tags", [...allTags().map((g) => [g, "#" + g]), ["", "No tag"]]]];
 const filtering = () => Object.values(hide).some((v) => v.length);
