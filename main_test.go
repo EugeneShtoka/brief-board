@@ -326,6 +326,38 @@ func TestHandleAttach(t *testing.T) {
 	}
 }
 
+func TestHandleDelete(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.Tasks = map[string]*Task{"t1": {ID: "t1"}, "busy": {ID: "busy", Job: &Job{Action: "act", Status: "running"}}}
+	files := filepath.Join(dir, "files", "t1")
+	if err := os.MkdirAll(files, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /api/tasks/{id}", b.handleDelete)
+	del := func(id string) int {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), "DELETE", "/api/tasks/"+id, nil))
+		return rec.Code
+	}
+	if code := del("t1"); code != 200 {
+		t.Fatalf("delete: %d", code)
+	}
+	if _, ok := b.st.Tasks["t1"]; ok {
+		t.Error("t1 is still on the board")
+	}
+	if _, err := os.Stat(files); !os.IsNotExist(err) {
+		t.Errorf("files/t1 still there: %v", err)
+	}
+	if code := del("t1"); code != 404 {
+		t.Errorf("deleting again: %d, want 404", code)
+	}
+	if code := del("busy"); code != 409 || b.st.Tasks["busy"] == nil {
+		t.Errorf("a task Claude works on: %d, want 409 and kept", code)
+	}
+}
+
 func TestReapSessions(t *testing.T) {
 	// The mux lists pane 7 only.
 	bin := t.TempDir()
