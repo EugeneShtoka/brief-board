@@ -600,3 +600,48 @@ func TestFullNames(t *testing.T) {
 		}
 	}
 }
+
+func TestFireTriggers(t *testing.T) {
+	// Pull request 1 merged into development; release 9 into main came after it and carries its merge commit, release 8 came before.
+	bin, dir := t.TempDir(), t.TempDir()
+	gh := `case "$1" in
+*/pulls/1) echo '{"number":1,"merged":true,"merged_at":"2026-11-16T18:00:00Z","merge_commit_sha":"abc","base":{"ref":"development"}}';;
+*/pulls\?*base=main) echo '[{"number":9,"merged_at":"2026-11-16T19:00:00Z"},{"number":8,"merged_at":"2026-11-16T17:00:00Z"}]';;
+*/pulls\?*) echo '[]';;
+*/pulls/9/commits*) echo '[{"sha":"abc"}]';;
+*/pulls/8/commits*) echo '[{"sha":"old"}]';;
+*) exit 1;;
+esac`
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\nshift\n"+gh+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for branch, want := range map[string]bool{"development": true, "main": true, "staging": false} {
+		if got, err := onBranch("https://github.com/o/r/pull/1", branch); got != want || err != nil {
+			t.Errorf("onBranch(%s) = %v, %v; want %v", branch, got, err, want)
+		}
+	}
+
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, claude: "claude", terminal: []string{"true"},
+		areas: []Area{{ID: "work", Dir: dir}}}
+	pr := []map[string]string{{"url": "https://github.com/o/r/pull/1"}}
+	b.st.Tasks = map[string]*Task{
+		"dev":     {ID: "dev", Area: "work", Status: "done", Links: pr, Triggers: []Trigger{{On: "development", Do: "tell Bar"}, {On: "staging", Do: "later"}}},
+		"dropped": {ID: "dropped", Area: "work", Status: "dropped", Links: pr, Triggers: []Trigger{{On: "main", Do: "no"}}},
+		"busy":    {ID: "busy", Area: "work", Links: pr, Triggers: []Trigger{{On: "main", Do: "wait"}}, Job: &Job{Status: "running"}},
+	}
+	b.fireTriggers()
+	dev := b.st.Tasks["dev"]
+	if dev.Triggers[0].Fired == nil || dev.Triggers[1].Fired != nil {
+		t.Errorf("dev triggers = %+v, want only development fired", dev.Triggers)
+	}
+	if dev.Job == nil || dev.Job.Action != "trigger" || dev.Job.Status != "running" {
+		t.Errorf("dev job = %+v, want a running trigger session", dev.Job)
+	}
+	if e := dev.History[0]; e.Kind != "trigger" || e.Text != "a pull request it links reached development; do: tell Bar" {
+		t.Errorf("dev note = %+v", e)
+	}
+	if b.st.Tasks["dropped"].Triggers[0].Fired != nil || b.st.Tasks["busy"].Triggers[0].Fired != nil {
+		t.Error("a dropped or busy task's trigger fired")
+	}
+}

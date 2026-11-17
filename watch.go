@@ -423,6 +423,7 @@ func (b *Board) watchGitHub(keyRe *regexp.Regexp, every time.Duration) {
 			log.Printf("github: %v", err)
 		}
 		b.settleMerged(b.shippingChecks(), "")
+		b.fireTriggers()
 	}
 }
 
@@ -539,6 +540,115 @@ type ghPull struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
+}
+
+// ghMerge is the part of a pull request onBranch reads.
+type ghMerge struct {
+	Number         int    `json:"number"`
+	Merged         bool   `json:"merged"`
+	MergedAt       string `json:"merged_at"`
+	MergeCommitSHA string `json:"merge_commit_sha"`
+	Base           struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
+}
+
+// ghGet reads gh api's JSON answer for path into v.
+func ghGet(path string, v any) error {
+	out, err := ghAPI(path)
+	if err == nil {
+		err = json.Unmarshal(out, v)
+	}
+	if err != nil {
+		return fmt.Errorf("ghGet: %w", err)
+	}
+	return nil
+}
+
+// onBranch is whether the pull request at page has reached branch: merged into it, or its merge commit
+// carried there by a pull request merged into branch after it. That one may be squash-merged (the be repo's
+// development -> main releases are), so it is its commit list that is read, not branch's history.
+func onBranch(page, branch string) (bool, error) {
+	var p ghMerge
+	if err := ghGet(ghAPIURL(page), &p); err != nil {
+		return false, err
+	}
+	if !p.Merged || p.Base.Ref == branch {
+		return p.Merged, nil
+	}
+	api := ghAPIURL(page)
+	repo := api[:strings.LastIndex(api, "/pulls/")]
+	// shortcut: the 30 pull requests into branch updated last, and each one's first 100 commits; page further if releases outgrow that.
+	var into []ghMerge
+	if err := ghGet(repo+"/pulls?state=closed&sort=updated&direction=desc&base="+url.QueryEscape(branch), &into); err != nil {
+		return false, err
+	}
+	for _, r := range into {
+		if r.MergedAt == "" || r.MergedAt < p.MergedAt {
+			continue
+		}
+		var commits []struct {
+			SHA string `json:"sha"`
+		}
+		if err := ghGet(fmt.Sprintf("%s/pulls/%d/commits?per_page=100", repo, r.Number), &commits); err != nil {
+			return false, err
+		}
+		for _, c := range commits {
+			if c.SHA == p.MergeCommitSHA {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// fireTriggers starts a session for each trigger whose branch a pull request its task links has reached
+// (see onBranch). A task busy with another session keeps its trigger for a later poll; a dropped task's never fire.
+// shortcut: every pending trigger costs a few GitHub calls each poll, fine for a handful; check only on new notifications if they pile up.
+func (b *Board) fireTriggers() {
+	type check struct {
+		id    string
+		tr    Trigger
+		pages []string
+	}
+	var checks []check
+	b.mu.Lock()
+	for _, t := range b.st.Tasks {
+		for _, tr := range t.Triggers {
+			if pages := taskPulls(t); tr.Fired == nil && t.Status != "dropped" && len(pages) > 0 {
+				checks = append(checks, check{t.ID, tr, pages})
+			}
+		}
+	}
+	b.mu.Unlock()
+	for _, c := range checks {
+		reached := false
+		for _, page := range c.pages {
+			ok, err := onBranch(page, c.tr.On)
+			if err != nil {
+				log.Printf("github: trigger %s: %v", c.id, err)
+			}
+			if reached = ok; ok {
+				break
+			}
+		}
+		if !reached {
+			continue
+		}
+		b.mu.Lock()
+		// Re-checked: Eugene may have changed the triggers, or a session started, while GitHub answered.
+		if t := b.st.Tasks[c.id]; t != nil && !b.busy(t) {
+			if i := slices.Index(t.Triggers, c.tr); i >= 0 {
+				now := time.Now()
+				t.Triggers[i].Fired = &now
+				text := "a pull request it links reached " + c.tr.On + "; do: " + c.tr.Do
+				b.note(t, "github", "trigger", text)
+				b.start(t, actRequest{Action: "trigger", Comment: text})
+				b.saveOrLog()
+			}
+		}
+		b.mu.Unlock()
+	}
 }
 
 // settleCheck is a task a notification reached through a pull request it links: that pull request's page,
