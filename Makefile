@@ -84,10 +84,17 @@ fix:
 	go fmt ./...
 	$(GOLANGCI) run --fix ./...
 
+# Advisories npm audit may report without failing the gate. GHSA-fc5q-39xc-vjpf: picomatch
+# ReDoS, no patched release yet, and markdownlint only globs our own paths. Drop it once one ships.
+NPM_AUDIT_IGNORE := GHSA-fc5q-39xc-vjpf
+
 # Go modules, and the one npm tree the gates run (markdownlint-cli2's lock).
 vuln:
 	$(GOVULN) ./...
-	cd tools/markdownlint && npm audit --audit-level=low --omit=dev
+	@cd tools/markdownlint && found=$$(npm audit --omit=dev --json | jq -r --arg ignore '$(NPM_AUDIT_IGNORE)' \
+		'[.vulnerabilities[].via[] | objects | select(.url | split("/")[-1] | IN($$ignore | split(" ")[]) | not)] \
+		| unique | .[] | "\(.severity) \(.name): \(.url)"') || exit 1; \
+		if [ -n "$$found" ]; then echo "npm audit:"; echo "$$found"; exit 1; fi; echo "npm audit: nothing unignored"
 
 # Scan history (only when this dir is its own repo root) and the working tree.
 secrets:
