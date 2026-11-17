@@ -645,3 +645,45 @@ esac`
 		t.Error("a dropped or busy task's trigger fired")
 	}
 }
+
+func TestSaveSettings(t *testing.T) {
+	dir := t.TempDir()
+	for _, k := range settingKeys { // not the live service's env
+		t.Setenv(k, "")
+	}
+	areas := `[{"id": "work", "dir": "` + dir + `"}]`
+	t.Setenv("BOARD_AREAS", areas)
+	b := &Board{path: filepath.Join(dir, "state.json"), triage: make(chan struct{}, 1), restart: make(chan struct{}, 1),
+		env: map[string]string{"BOARD_AREAS": areas, "BOARD_PR_URL": "https://env/pull/"}}
+	save := func(body string) int {
+		rec := httptest.NewRecorder()
+		b.handleSaveSettings(rec, httptest.NewRequestWithContext(t.Context(), "PUT", "/api/settings", strings.NewReader(body)))
+		return rec.Code
+	}
+	for _, body := range []string{`{"BOARD_JIRA_POLL": "soon"}`, `{"BOARD_ADDR": ":1"}`, `{"BOARD_AREAS": "[]"}`,
+		`{"BOARD_AREAS": "[{\"id\": \"work\", \"dir\": \"/nonexistent\"}]"}`, `{"BOARD_ISSUE_KEY": "("}`, `{"BOARD_SESSION_IN": "pane"}`} {
+		if code := save(body); code != 400 {
+			t.Errorf("%s: %d, want 400", body, code)
+		}
+	}
+	b.st.Briefs = map[string]*Job{"work": {Status: "running"}}
+	if code := save(`{"BOARD_GITHUB_POLL": "5m"}`); code != 409 {
+		t.Errorf("while a brief runs: %d, want 409", code)
+	}
+	if _, err := os.Stat(settingsPath(b.path)); !os.IsNotExist(err) || len(b.restart) != 0 {
+		t.Fatalf("a refused save wrote settings.json (%v) or restarted (%d)", err, len(b.restart))
+	}
+	b.st.Briefs = nil
+	// Only what differs from the env is kept; the PR link set back to the env's drops its override.
+	if code := save(`{"BOARD_GITHUB_POLL": " 5m ", "BOARD_PR_URL": "https://env/pull/"}`); code != 202 || len(b.restart) != 1 {
+		t.Fatalf("save: %d, restart %d; want 202 and a restart", code, len(b.restart))
+	}
+	data, err := os.ReadFile(settingsPath(b.path))
+	var got map[string]string
+	if err != nil || json.Unmarshal(data, &got) != nil || !maps.Equal(got, map[string]string{"BOARD_GITHUB_POLL": "5m"}) {
+		t.Fatalf("settings.json %s (%v); want only the GitHub poll", data, err)
+	}
+	if before := applySettings(settingsPath(b.path)); before["BOARD_GITHUB_POLL"] != "" || os.Getenv("BOARD_GITHUB_POLL") != "5m" {
+		t.Errorf("BOARD_GITHUB_POLL %q, before %q; want 5m over the env's empty", os.Getenv("BOARD_GITHUB_POLL"), before["BOARD_GITHUB_POLL"])
+	}
+}

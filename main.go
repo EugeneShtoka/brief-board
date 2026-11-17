@@ -13,6 +13,7 @@
 // BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page),
 // BOARD_CLEAN_MERGED (1: a task moving to done with a merged pull request closes its session and removes the
 // pull request's worktree, see cleanMerged).
+// The page's settings (settingKeys) are saved in settings.json next to the state file and win over the env, see applySettings.
 // Every history entry is also appended to log/<monday>.jsonl next to the state file, one file per week.
 package main
 
@@ -131,12 +132,14 @@ type Board struct {
 	terminal []string // BOARD_TERMINAL; empty is the wezterm mux
 	window   bool     // wezterm: a session gets its own window, not a tab
 	selfURL  string
-	triage   chan struct{}   // one Jira triage at a time
-	wake     chan struct{}   // nudges scheduleBrief out of its sleep
-	rerun    map[string]bool // area ids to brief now: the board's button, or a brief that ran while kith was down
-	ghETag   string          // pollGitHub's own: the ETag of its last notifications answer
-	clean    bool            // BOARD_CLEAN_MERGED
-	areas    []Area          // BOARD_AREAS
+	triage   chan struct{}     // one Jira triage at a time
+	wake     chan struct{}     // nudges scheduleBrief out of its sleep
+	rerun    map[string]bool   // area ids to brief now: the board's button, or a brief that ran while kith was down
+	ghETag   string            // pollGitHub's own: the ETag of its last notifications answer
+	clean    bool              // BOARD_CLEAN_MERGED
+	areas    []Area            // BOARD_AREAS
+	env      map[string]string // the service's env, before settings.json; a saved setting equal to it is dropped from the file
+	restart  chan struct{}     // a saved setting: main restarts the board to apply it
 }
 
 // areaRe keeps an area id a plain lowercase name.
@@ -1039,14 +1042,18 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
 	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
+	mux.HandleFunc("GET /api/settings", b.handleSettings)
+	mux.HandleFunc("PUT /api/settings", b.handleSaveSettings)
 	return mux
 }
 
 func main() {
 	home, _ := os.UserHomeDir()
 	addr := env("BOARD_ADDR", ":8787")
+	path := env("BOARD_STATE", filepath.Join(home, ".local", "state", "brief-board", "state.json"))
+	base := applySettings(settingsPath(path))
 	b := &Board{
-		path:     env("BOARD_STATE", filepath.Join(home, ".local", "state", "brief-board", "state.json")),
+		path:     path,
 		home:     home,
 		claude:   env("BOARD_CLAUDE", "claude"),
 		terminal: strings.Fields(os.Getenv("BOARD_TERMINAL")),
@@ -1055,6 +1062,8 @@ func main() {
 		selfURL:  env("BOARD_URL", "http://localhost"+addr),
 		triage:   make(chan struct{}, 1),
 		wake:     make(chan struct{}, 1),
+		env:      base,
+		restart:  make(chan struct{}, 1),
 	}
 	areas, err := b.parseAreas(os.Getenv("BOARD_AREAS"))
 	if err != nil {
@@ -1100,9 +1109,170 @@ func main() {
 		}
 	}
 
+	b.serve(addr)
+}
+
+// serve answers until a saved setting asks for a restart; then the board runs itself again, the same process, with the
+// service's env and the new settings.json.
+func (b *Board) serve(addr string) {
 	log.Printf("brief-board on %s, state %s, claude runs in %s", addr, b.path, b.workdir)
 	srv := &http.Server{Addr: addr, Handler: b.routes(), ReadHeaderTimeout: 10 * time.Second}
-	log.Fatal(srv.ListenAndServe())
+	stopped := make(chan struct{})
+	go func() {
+		<-b.restart
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil { // lets the save's answer go out first
+			log.Print(err)
+		}
+		close(stopped)
+	}()
+	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal(err)
+	}
+	<-stopped
+	b.mu.Lock() // no state write cut in half
+	exe, err := os.Executable()
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Print("settings saved, restarting")
+	envList := make([]string, 0, len(b.env))
+	for k, v := range b.env {
+		envList = append(envList, k+"="+v)
+	}
+	log.Fatal(syscall.Exec(exe, os.Args, envList)) //nolint:gosec // the board's own binary and argv
+}
+
+// settingKeys are the settings the page edits. BOARD_ADDR and BOARD_STATE it only shows: one moves the page, the other is
+// where settings.json lives.
+var settingKeys = []string{"BOARD_AREAS", "BOARD_BRIEF_EVERY", "BOARD_JIRA_POLL", "BOARD_GITHUB_POLL", "BOARD_ISSUE_KEY",
+	"BOARD_KITH_MCP", "BOARD_CLAUDE", "BOARD_TERMINAL", "BOARD_SESSION_IN", "BOARD_CLEAN_MERGED", "BOARD_ISSUE_URL",
+	"BOARD_PR_URL", "BOARD_URL"}
+
+func settingsPath(state string) string { return filepath.Join(filepath.Dir(state), "settings.json") }
+
+// applySettings sets the env from settings.json, {"BOARD_...": value}, before anything reads it, and returns the env from
+// before. No file is no settings; a broken one is logged and left out rather than fatal, so the page comes up to fix it.
+func applySettings(path string) (before map[string]string) {
+	before = map[string]string{}
+	for _, kv := range os.Environ() {
+		k, v, _ := strings.Cut(kv, "=")
+		before[k] = v
+	}
+	var set map[string]string
+	data, err := os.ReadFile(path) //nolint:gosec // settings.json next to the board's own state file
+	if err == nil {
+		err = json.Unmarshal(data, &set)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("applySettings: %s: %v", path, err)
+	}
+	for k, v := range set {
+		if slices.Contains(settingKeys, k) {
+			if err := os.Setenv(k, v); err != nil {
+				log.Printf("applySettings: %v", err)
+			}
+		}
+	}
+	return before
+}
+
+// handleSettings answers every setting as the board runs with it, and as the service's env has it.
+func (b *Board) handleSettings(w http.ResponseWriter, r *http.Request) {
+	now, env := map[string]string{"BOARD_STATE": b.path}, map[string]string{"BOARD_STATE": b.env["BOARD_STATE"]}
+	for _, k := range append(slices.Clone(settingKeys), "BOARD_ADDR") {
+		now[k], env[k] = os.Getenv(k), b.env[k]
+	}
+	writeJSON(w, 200, map[string]any{"settings": now, "env": env})
+}
+
+// handleSaveSettings saves the settings sent over the current ones, keeping in settings.json only those that differ from
+// the env, then restarts the board. A value the board would refuse at start is refused here, or the restart would loop on
+// it; so is a save while Claude runs headless, which the restart would cut off.
+func (b *Board) handleSaveSettings(w http.ResponseWriter, r *http.Request) {
+	var body map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	set := map[string]string{}
+	for _, k := range settingKeys {
+		set[k] = os.Getenv(k)
+	}
+	for k, v := range body {
+		if !slices.Contains(settingKeys, k) {
+			writeJSON(w, 400, map[string]string{"error": "no setting " + k})
+			return
+		}
+		set[k] = strings.TrimSpace(v)
+	}
+	if err := b.checkSettings(set); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.headless() {
+		writeJSON(w, 409, map[string]string{"error": "Claude is running a brief, a triage or a task; save once it ends"})
+		return
+	}
+	maps.DeleteFunc(set, func(k, v string) bool { return v == b.env[k] })
+	data, err := json.MarshalIndent(set, "", "  ")
+	if err == nil {
+		tmp := settingsPath(b.path) + ".tmp"
+		if err = os.WriteFile(tmp, data, 0o600); err == nil {
+			err = os.Rename(tmp, settingsPath(b.path))
+		}
+	}
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": fmt.Sprintf("handleSaveSettings: %v", err)})
+		return
+	}
+	writeJSON(w, 202, map[string]bool{"restarting": true})
+	select {
+	case b.restart <- struct{}{}:
+	default:
+	}
+}
+
+// checkSettings refuses what main would stop on, or read as off without a word: a bad duration, key pattern or area list.
+func (b *Board) checkSettings(set map[string]string) error {
+	for _, k := range []string{"BOARD_BRIEF_EVERY", "BOARD_JIRA_POLL", "BOARD_GITHUB_POLL"} {
+		if _, err := time.ParseDuration(set[k]); set[k] != "" && err != nil {
+			return fmt.Errorf("%s: %w", k, err)
+		}
+	}
+	if _, err := regexp.Compile(set["BOARD_ISSUE_KEY"]); err != nil {
+		return fmt.Errorf("BOARD_ISSUE_KEY: %w", err)
+	}
+	if s := set["BOARD_SESSION_IN"]; s != "" && s != "tab" && s != "window" {
+		return fmt.Errorf("BOARD_SESSION_IN: %q, want tab or window", s)
+	}
+	areas, err := b.parseAreas(set["BOARD_AREAS"])
+	if err != nil {
+		return err
+	}
+	_, err = (&Board{areas: areas}).dirFor(&Task{Area: "work"})
+	return err
+}
+
+// headless says whether Claude runs without a session: a brief, a triage or a task's run. The caller holds b.mu.
+func (b *Board) headless() bool {
+	if len(b.triage) > 0 {
+		return true
+	}
+	for _, j := range b.st.Briefs {
+		if j.Status == "running" {
+			return true
+		}
+	}
+	for _, t := range b.st.Tasks {
+		if t.Job != nil && t.Job.Status == "running" && t.Job.Session == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // seedLog creates the week files on their first start, from the history state.json already holds.
