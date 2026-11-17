@@ -243,24 +243,25 @@ function laneOf(t) {
 // Areas come from the server (BOARD_AREAS); work holds anything unmarked.
 const areaList = () => (cfg().areas || []).map((a) => [a.id, a.name]);
 const areaName = (id) => (areaList().find(([v]) => v === id) || [id, id])[1];
-const allTags = () => [...new Set(state.tasks.flatMap((t) => t.tags || []))].sort();
+const allTags = (ts = state.tasks) => [...new Set(ts.flatMap((t) => t.tags || []))].sort();
 // The people a task is with: the board stores who as full names, comma-separated.
 const people = (t) => (t.who || "").split(",").map((n) => n.trim()).filter(Boolean);
-const allPeople = () => [...new Set(state.tasks.flatMap(people))].sort();
+const allPeople = (ts) => [...new Set(ts.flatMap(people))].sort();
 // Every value of a task field in use, sorted; "" is a task without one.
-const allOf = (f) => [...new Set(state.tasks.map((t) => t[f] || ""))].sort();
+const allOf = (ts, f) => [...new Set(ts.map((t) => t[f] || ""))].sort();
 // The filter narrows the lanes, the progress summary and History by each task field below and tag. It keeps
 // what's unchecked, so a new project, source, person or tag shows up by default; "" is a task with no group, source,
 // person or tag. "Waiting for" lists each person in who; the task's waitingFor sentence is free text and stays on the card.
 let hide = { area: [], status: [], group: [], urgency: [], importance: [], who: [], source: [], tag: [] };
 // A saved dim the filter no longer has (waitingFor) is dropped, or it would still hide tasks.
 try { for (const [dim, off] of Object.entries(JSON.parse(localStorage.getItem("hide")))) if (dim in hide) hide[dim] = off; } catch {}
-const filterOpts = () => [["area", "Project", areaList()], ["status", "Status", STATUS],
+// Waiting for, Source and Tags list only what the tasks of the shown projects have; the fixed dims list every value.
+const filterOpts = (ts = state.tasks.filter((t) => !hide.area.includes(t.area))) => [["area", "Project", areaList()], ["status", "Status", STATUS],
   ["group", "Group", [...Object.entries(GROUP).map(([k, [l]]) => [k, l]), ["", "No group"]]],
   ["urgency", "Urgency", LEVEL], ["importance", "Importance", LEVEL],
-  ["who", "Waiting for", [...allPeople().map((n) => [n, n]), ["", "No one"]]],
-  ["source", "Source", allOf("source").map((v) => [v, SOURCE[v] || v])],
-  ["tag", "Tags", [...allTags().map((g) => [g, g]), ["", "No tag"]]]];
+  ["who", "Waiting for", [...allPeople(ts).map((n) => [n, n]), ["", "No one"]]],
+  ["source", "Source", allOf(ts, "source").map((v) => [v, SOURCE[v] || v])],
+  ["tag", "Tags", [...allTags(ts).map((g) => [g, g]), ["", "No tag"]]]];
 // The search keeps a task whose title, story, people, tags and Jira keys hold every word and none of the !words.
 const terms = () => $("search").value.toLowerCase().split(/\s+/).filter((w) => w && w !== "!");
 const found = (t) => {
@@ -294,8 +295,8 @@ function pills(t) {
 
 function render() {
   const opts = filterOpts();
-  // A hidden value that no longer exists (a removed project, a tag nobody has) is forgotten.
-  for (const [dim, , vals] of opts) hide[dim] = hide[dim].filter((v) => vals.some(([x]) => x === v));
+  // A hidden value that no longer exists (a removed project, a tag nobody has) is forgotten; one only another project has is kept.
+  for (const [dim, , vals] of filterOpts(state.tasks)) hide[dim] = hide[dim].filter((v) => vals.some(([x]) => x === v));
   const by = { todo: [], doing: [], waiting: [], closed: [] };
   for (const t of state.tasks.filter(visible)) { const l = laneOf(t); if (l) by[l].push(t); }
   // The checkboxes are set after the markup, so a click doesn't rebuild the menu and lose focus.
