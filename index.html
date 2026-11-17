@@ -373,10 +373,11 @@ function renderDialog(fresh) {
       <label for="f-comment">Guidance for Claude (optional: what to do, or what to find out)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
       ${filesField("Files for Claude, attached when you press a button")}
       <div class="btns" id="d-btns"></div>
-      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history.</div>
+      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history. Send to the session types the guidance into it; Close, Drop and Delete stop it.</div>
       <div class="err" id="f-err" hidden></div>
     </div>`; }
-  const busy = running(t);
+  // A wezterm session stays open after its report, for Eugene to steer; the board learns it ended only when told.
+  const busy = running(t), live = t.job && t.job.pane && (busy || t.job.status === "ok");
   const js = t.jiraStatus || {}, late = preQa(t);
   const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
     ...(t.messages || []).map(messageLink),
@@ -404,9 +405,10 @@ function renderDialog(fresh) {
     ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
     <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
     ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
-    <button class="btn" data-act="close" ${busy || t.status === "done" ? "disabled" : ""}>Close</button>
-    <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>
-    <button class="btn danger" data-act="delete" ${busy ? "disabled" : ""}>Delete</button>`);
+    ${live ? `<button class="btn" data-act="say">Send to the session</button>` : ""}
+    <button class="btn" data-act="close" ${t.status === "done" ? "disabled" : ""}>Close</button>
+    <button class="btn danger" data-act="drop" ${t.status === "dropped" ? "disabled" : ""}>Drop</button>
+    <button class="btn danger" data-act="delete">Delete</button>`);
 }
 
 // A question the task's session waits on (handleAsk): each one's options, and Eugene's own words in place of them.
@@ -505,6 +507,15 @@ async function apply(r) {
   render(); return t;
 }
 
+async function say() {
+  const text = $("f-comment").value.trim(), err = $("f-err");
+  if (!text) { err.hidden = false; err.textContent = "Write what to send in the guidance."; return; }
+  const r = await fetch(`api/tasks/${encodeURIComponent(openId)}/say`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text }) }).catch(() => null);
+  if (!r || !r.ok) { err.hidden = false; err.textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't send it."; return; }
+  err.hidden = true; $("f-comment").value = "";
+  apply(r);
+}
+
 async function act(action, key) {
   const comment = $("f-comment").value.trim(), err = $("f-err");
   err.hidden = true;
@@ -554,6 +565,7 @@ $("dlg").addEventListener("click", (e) => {
   const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
   if (b.dataset.act === "close") return closeTask();
   if (b.dataset.act === "delete") return deleteTask();
+  if (b.dataset.act === "say") return say();
   act(b.dataset.act, b.dataset.key);
 });
 // Close marks the task done, the same PUT as dragging it to Closed.

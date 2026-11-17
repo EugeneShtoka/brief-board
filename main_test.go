@@ -362,6 +362,56 @@ func TestHandleAskAnswer(t *testing.T) {
 	}
 }
 
+func TestSessionSayAndStop(t *testing.T) {
+	dir := t.TempDir()
+	// A fake wezterm: panes 7 and 9 are t1's and t3's sessions, pane 8 a pane that took t2's old id; every other call is logged.
+	fake := "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[{\"pane_id\":7,\"title\":\"✳ t1-act\"},{\"pane_id\":8,\"title\":\"zsh\"},{\"pane_id\":9,\"title\":\"✳ t3-act\"}]'; else echo \"$@\" >> " + dir + "/calls; fi\n"
+	if err := os.WriteFile(filepath.Join(dir, "wezterm"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{
+		"t1": {ID: "t1", Area: "work", Status: "doing", Job: &Job{Action: "act", Status: "running", Session: "t1-act", Pane: "7"}},
+		"t2": {ID: "t2", Area: "work", Status: "doing", Job: &Job{Action: "act", Status: "ok", Session: "t2-act", Pane: "8"}},
+		"t3": {ID: "t3", Area: "work", Status: "doing", Job: &Job{Action: "act", Status: "running", Session: "t3-act", Pane: "9"}},
+	}
+	mux := b.routes()
+	do := func(method, path, body string) int {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body)))
+		return rec.Code
+	}
+	calls := func() string { out, _ := os.ReadFile(filepath.Join(dir, "calls")); return string(out) }
+
+	if code := do(http.MethodPost, "/api/tasks/t1/say", `{"text":"-also check the tests"}`); code != 200 {
+		t.Fatalf("say: %d", code)
+	}
+	if want := "cli send-text --pane-id 7 -- -also check the tests\ncli send-text --pane-id 7 --no-paste \r\n"; calls() != want {
+		t.Errorf("say typed %q, want %q", calls(), want)
+	}
+	if code := do(http.MethodPost, "/api/tasks/t2/say", `{"text":"x"}`); code != 409 {
+		t.Errorf("say into a pane that is no longer the session's: %d, want 409", code)
+	}
+
+	do(http.MethodPut, "/api/tasks/t1", `{"status":"done"}`)
+	if strings.Contains(calls(), "kill-pane") {
+		t.Error("a session closing its own task was stopped")
+	}
+	do(http.MethodPut, "/api/tasks/t1", `{"status":"doing"}`)
+	do(http.MethodPut, "/api/tasks/t1?actor=eugene", `{"status":"done"}`)
+	if !strings.HasSuffix(calls(), "cli kill-pane --pane-id 7\n") || b.st.Tasks["t1"].Job.Status != "stopped" {
+		t.Errorf("closed on the board: calls %q, job %s; want pane 7 killed and the job stopped", calls(), b.st.Tasks["t1"].Job.Status)
+	}
+	do(http.MethodPost, "/api/tasks/t2/act", `{"action":"drop"}`)
+	if strings.Contains(calls(), "--pane-id 8") {
+		t.Error("dropping t2 killed pane 8, which is no longer its session")
+	}
+	if code := do(http.MethodDelete, "/api/tasks/t3", ""); code != 200 || !strings.HasSuffix(calls(), "cli kill-pane --pane-id 9\n") {
+		t.Errorf("delete while Claude works: %d, calls %q; want 200 and pane 9 killed", code, calls())
+	}
+}
+
 func TestHandleAttach(t *testing.T) {
 	dir := t.TempDir()
 	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
