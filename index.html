@@ -8,7 +8,7 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <script>try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch {}</script>
 <style>
-/* Layout: header (headline, filter + progress), then two tabs: Tickets (new task, four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions. */
+/* Layout: header (headline, filter, settings + progress), then two tabs: Tickets (new task, four status lanes) and History (one Monday–Sunday week at a time, from the week files). A task opens in a dialog with its story, history and actions; ⚙ opens the settings in it. */
 :root {
   --bg: #f3f5f8; --surface: #ffffff; --ink: #172033; --muted: #5b6577; --line: #dde2ea;
   --accent: #2f5bd3; --accent-soft: #e6ecfb;
@@ -18,7 +18,7 @@
   --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
   color-scheme: light;
 }
-/* Themes: light (above), dark and cobalt are picked in the header (data-theme on <html>); with none picked, dark follows the system. */
+/* Themes: light (above), dark and cobalt are picked in Settings (data-theme on <html>); with none picked, dark follows the system. */
 @media (prefers-color-scheme: dark) { :root:not([data-theme]) {
   --bg: #0f1420; --surface: #171e2d; --ink: #e5e9f1; --muted: #98a2b5; --line: #273145;
   --accent: #7d9cf0; --accent-soft: #1f2a46;
@@ -100,8 +100,8 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 .tagrow { display: flex; flex-wrap: wrap; gap: 0.375rem; align-items: center; }
 /* The filter: a dropdown of checkbox groups; what's unchecked is hidden. Each row's "only" shows on hover or focus. */
 .filter { position: relative; display: inline-block; margin-top: 0.625rem; }
-#theme { margin-top: 0.625rem; margin-left: 0.25rem; }
 #search { width: 14rem; margin-top: 0.625rem; margin-left: 0.25rem; }
+#settings { margin-top: 0.625rem; margin-left: 0.25rem; }
 .filter summary { list-style: none; }
 .filter summary::-webkit-details-marker { display: none; }
 .filter summary::after { content: " ▾"; color: var(--muted); }
@@ -166,7 +166,7 @@ select { font: 0.875rem var(--body); color: var(--ink); background: var(--bg); b
       <div class="note" id="note" hidden></div>
       <details class="filter" id="filter"><summary class="btn" id="filter-sum">Show: all</summary><div class="menu" id="filter-menu"></div></details>
       <input type="search" id="search" aria-label="Search tasks" placeholder="Search, !exclude">
-      <select id="theme" aria-label="Theme"><option value="">Theme: system</option><option value="light">Light</option><option value="dark">Dark</option><option value="cobalt">Cobalt</option></select>
+      <button class="btn" id="settings" aria-label="Settings" title="Settings">⚙</button>
     </div>
     <div class="side">
       <div class="progress" aria-label="Last brief">
@@ -549,13 +549,14 @@ $("dlg").addEventListener("close", () => { openId = null; });
 // Moving a task to another area also moves where its next session runs.
 $("dlg").addEventListener("change", async (e) => {
   if (e.target.id === "f-files") { pend.push(...e.target.files); e.target.value = ""; return showFiles(); }
+  if (e.target.id === "theme") return setTheme(e.target.value);
   const field = { "f-area": "area", "f-urgency": "urgency", "f-importance": "importance" }[e.target.id];
   if (!field || !openId) return;
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [field]: e.target.value }) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = `Couldn't change the ${field}.`; return; }
   apply(r);
 });
-$("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); });
+$("dlg").addEventListener("submit", (e) => { if (e.target.id === "new-form") addTask(e); if (e.target.id === "settings-form") saveSettings(e); });
 $("run-brief").addEventListener("click", async () => {
   $("run-brief").disabled = true;
   const areas = areaList().map(([v]) => v).filter((v) => !hide.area.includes(v));
@@ -586,12 +587,56 @@ $("filter-menu").addEventListener("click", (e) => {
 document.addEventListener("click", (e) => { if (!$("filter").contains(e.target)) $("filter").open = false; });
 $("filter").addEventListener("keydown", (e) => { if (e.key === "Escape" && $("filter").open) { $("filter").open = false; $("filter-sum").focus(); } });
 // The theme is kept per browser; "" follows the system's light or dark.
-$("theme").value = document.documentElement.dataset.theme || "";
-$("theme").addEventListener("change", (e) => {
-  const t = e.target.value;
+function setTheme(t) {
   if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
   try { if (t) localStorage.setItem("theme", t); else localStorage.removeItem("theme"); } catch {}
-});
+}
+// Settings by category: [key, label, hint, kind]. The board's are its BOARD_* settings, saved over the service's env
+// (saving restarts the board); kind is text (default), json, check, ro (shown only) or a list of choices; "" is the first.
+const SETTINGS = [
+  ["Projects", [["BOARD_AREAS", "Projects", "A JSON list of {id, name, dir, roadmap, jiraRoom, briefEvery}; work is required.", "json"]]],
+  ["Briefs", [["BOARD_BRIEF_EVERY", "Brief every", "How often a project without its own briefEvery is briefed, e.g. 6h; empty is only by the button."]]],
+  ["Watchers", [["BOARD_JIRA_POLL", "Jira feed poll", "Empty is 2m."], ["BOARD_GITHUB_POLL", "GitHub notifications poll", "Empty is off, e.g. 5m."],
+    ["BOARD_ISSUE_KEY", "Issue key pattern", "A regular expression; empty is \\b[A-Z][A-Z0-9]+-\\d+\\b."], ["BOARD_KITH_MCP", "kith MCP command", "Empty is kith-mcp."]]],
+  ["Sessions", [["BOARD_CLAUDE", "Claude command", "Empty is claude."], ["BOARD_TERMINAL", "Terminal", "Empty is the wezterm mux, else a command the session is appended to, e.g. kitty."],
+    ["BOARD_SESSION_IN", "A wezterm session opens in", "", [["", "A new tab"], ["window", "Its own window"]]],
+    ["BOARD_CLEAN_MERGED", "Clean up merged work", "A task done with a merged pull request closes its session and removes its worktree.", "check"]]],
+  ["Links", [["BOARD_ISSUE_URL", "Issue link base", "An issue key is appended, e.g. https://you.atlassian.net/browse/."], ["BOARD_PR_URL", "Pull request link base", "A #number is appended."]]],
+  ["Server", [["BOARD_URL", "Board URL", "How Claude reaches the board; empty is http://localhost and the address."],
+    ["BOARD_ADDR", "Address", "Set in the service's env only.", "ro"], ["BOARD_STATE", "State file", "Set in the service's env only; settings.json sits next to it.", "ro"]]],
+];
+async function renderSettings() {
+  openId = null;
+  const r = await fetch("api/settings").catch(() => null);
+  const { settings: now = {}, env = {} } = r && r.ok ? await r.json() : {};
+  const field = ([k, label, hint, kind]) => {
+    const v = now[k] || "", id = "s-" + k, on = kind !== "ro" && v !== (env[k] || "");
+    const input = kind === "json" ? `<textarea id="${id}" data-key="${k}" spellcheck="false" style="font-family:var(--mono);min-height:12rem">${esc(v)}</textarea>`
+      : kind === "check" ? `<input type="checkbox" id="${id}" data-key="${k}" ${v === "1" ? "checked" : ""}>`
+      : Array.isArray(kind) ? `<select id="${id}" data-key="${k}">${kind.map(([o, l]) => `<option value="${o}" ${o === v || !o && v === "tab" ? "selected" : ""}>${l}</option>`).join("")}</select>`
+      : `<input type="text" id="${id}" ${kind === "ro" ? "readonly" : `data-key="${k}"`} value="${esc(v)}">`;
+    return `<label for="${id}">${esc(label)} <code>${k}</code>${input}<span class="hint">${esc(hint)}${on ? ` Set here; the env file has ${env[k] ? `<code>${esc(env[k])}</code>` : "none"}.` : ""}</span></label>`;
+  };
+  $("dlg-body").innerHTML = `
+    <div class="dlg-head"><h2 id="dlg-title">Settings</h2><button class="x" id="x" aria-label="Close">×</button></div>
+    <h3>Appearance</h3>
+    <label for="theme">Theme (this browser)<select id="theme">${[["", "System"], ["light", "Light"], ["dark", "Dark"], ["cobalt", "Cobalt"]]
+      .map(([v, l]) => `<option value="${v}" ${v === (document.documentElement.dataset.theme || "") ? "selected" : ""}>${l}</option>`).join("")}</select></label>
+    ${r && r.ok ? `<form id="settings-form" style="display:grid;gap:0.875rem">
+      ${SETTINGS.map(([cat, fields]) => `<h3>${cat}</h3>${fields.map(field).join("")}`).join("")}
+      <div class="btns"><button class="btn primary" type="submit">Save and restart the board</button></div>
+      <div class="err" id="s-err" hidden></div><div class="hint" id="s-ok" hidden></div>
+    </form>` : `<div class="err">Couldn't read the board's settings.</div>`}`;
+}
+async function saveSettings(e) {
+  e.preventDefault();
+  const body = Object.fromEntries([...$("settings-form").querySelectorAll("[data-key]")].map((el) => [el.dataset.key, el.type === "checkbox" ? (el.checked ? "1" : "") : el.value]));
+  const r = await fetch("api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
+  $("s-err").hidden = r && r.ok; $("s-ok").hidden = !(r && r.ok);
+  if (r && r.ok) $("s-ok").textContent = "Saved. The board is restarting; the page picks it up in a few seconds.";
+  else $("s-err").textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't save the settings.";
+}
+$("settings").addEventListener("click", async () => { await renderSettings(); $("dlg").showModal(); });
 // The open tab lives in the URL hash, so a reload or a bookmark keeps it.
 function showTab() {
   const hist = location.hash === "#history";
