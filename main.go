@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"cmp"
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -66,8 +67,9 @@ type Job struct {
 	Status    string     `json:"status"` // running | ok | failed | stopped
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
-	Session   string     `json:"session,omitempty"` // button jobs: the Claude session's name, for remote control
-	Pane      string     `json:"pane,omitempty"`    // button jobs: its wezterm pane id
+	Session   string     `json:"session,omitempty"`  // button jobs: the Claude session's name, for remote control
+	Pane      string     `json:"pane,omitempty"`     // button jobs: its wezterm pane id
+	ClaudeID  string     `json:"claudeId,omitempty"` // Claude Code's session id, which the task's next session resumes
 	// Question is the AskUserQuestion input the session waits on Eugene to answer on the board, see handleAsk.
 	Question json.RawMessage `json:"question,omitempty"`
 }
@@ -853,7 +855,8 @@ func saveUpload(fh *multipart.FileHeader, path string) error {
 type actRequest struct {
 	Action  string `json:"action"` // reply | act | qa | drop; update comes from the Jira watcher
 	Comment string `json:"comment"`
-	Key     string `json:"key"` // qa only: the Jira key to move
+	Key     string `json:"key"`   // qa only: the Jira key to move
+	Fresh   bool   `json:"fresh"` // a new Claude session, not the task's last one resumed or continued
 }
 
 func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
@@ -880,8 +883,11 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if b.busy(t) {
-			writeJSON(w, 409, map[string]string{"error": "Claude is already working on this task"})
-			return
+			if code, err := b.addGuidance(t, req); err != nil {
+				writeJSON(w, code, map[string]string{"error": err.Error()})
+				return
+			}
+			break
 		}
 		text := req.Comment
 		if req.Action == "qa" {
@@ -974,20 +980,40 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	return sb.String(), nil
 }
 
-// start runs Claude on t; callers hold mu. A Jira update runs headless; a button press gets its own
+// start runs Claude on t; callers hold mu. A Jira update runs headless; a button press gets an
 // interactive session in the wezterm mux server, which outlives a board restart and can be attached to.
+// The task keeps one Claude conversation: a press goes into its open session, or resumes it once closed, unless req.Fresh.
 func (b *Board) start(t *Task, req actRequest) {
+	if req.Fresh {
+		b.stopSession(t)
+	}
+	prev := t.Job
 	t.Job = &Job{Action: req.Action, Status: "running", StartedAt: time.Now()}
+	if prev != nil && !req.Fresh {
+		t.Job.ClaudeID = prev.ClaudeID
+	}
 	prompt, err := b.prompt(t, req)
 	if err == nil && req.Action == "update" {
 		go b.run(t.ID, req.Action, prompt)
 		return
 	}
-	if err == nil {
+	verb := "Started"
+	switch {
+	case err != nil:
+	case !req.Fresh && sessionPane(prev):
+		verb, t.Job.Session, t.Job.Pane = "Continued", prev.Session, prev.Pane
+		err = typeInto(t.Job.Pane, prompt)
+	default:
+		resume := t.Job.ClaudeID != ""
+		if resume {
+			verb = "Resumed"
+		} else {
+			t.Job.ClaudeID = newSessionID()
+		}
 		t.Job.Session = t.ID + "-" + req.Action
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, prompt)
+			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, t.Job.ClaudeID, resume, prompt)
 		}
 	}
 	if err != nil {
@@ -1000,12 +1026,21 @@ func (b *Board) start(t *Task, req actRequest) {
 	if t.Job.Pane != "" {
 		where = "wezterm pane " + t.Job.Pane
 	}
-	b.note(t, "claude", "session", fmt.Sprintf("Started session %q in %s: attach there, or on claude.ai/code (remote control).", t.Job.Session, where))
+	b.note(t, "claude", "session", fmt.Sprintf("%s session %q in %s: attach there, or on claude.ai/code (remote control).", verb, t.Job.Session, where))
 }
 
-// spawnSession opens an interactive Claude Code session and returns its wezterm pane id ("" in another terminal).
+// newSessionID is a random UUID (v4), the form claude's --session-id takes.
+func newSessionID() string {
+	u := make([]byte, 16)
+	_, _ = rand.Read(u) // crypto/rand.Read never fails
+	u[6], u[8] = u[6]&0x0f|0x40, u[8]&0x3f|0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[:4], u[4:6], u[6:8], u[8:10], u[10:])
+}
+
+// spawnSession opens an interactive Claude Code session with Claude session id claudeID, resuming it when resume,
+// and returns its wezterm pane id ("" in another terminal).
 // In wezterm the pane closes when Claude exits, so a live pane means a live session.
-func (b *Board) spawnSession(dir, id, name, prompt string) (string, error) {
+func (b *Board) spawnSession(dir, id, name, claudeID string, resume bool, prompt string) (string, error) {
 	// Its questions wait on the board (handleAsk) for up to a day; the task id is path-escaped, so it can't break the quotes.
 	ask := fmt.Sprintf("curl -s -X POST '%s/api/tasks/%s/ask' -H 'Content-Type: application/json' --data-binary @-", b.selfURL, url.PathEscape(id))
 	settings, err := json.Marshal(map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
@@ -1015,8 +1050,12 @@ func (b *Board) spawnSession(dir, id, name, prompt string) (string, error) {
 	}
 	// zsh -lic gives the session the user's login env; the service's own PATH is bare.
 	// claude and the prompt reach zsh as "$0" and "$@", never as shell text.
+	idFlag := "--session-id"
+	if resume {
+		idFlag = "--resume"
+	}
 	session := []string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name,
-		"--settings", string(settings), prompt}
+		idFlag, claudeID, "--settings", string(settings), prompt}
 	if len(b.terminal) > 0 {
 		// shortcut: no pane to watch, so a session that dies without reporting keeps its task busy,
 		// and a terminal that stays our child dies with a board restart; track its process if another terminal gets real use.
@@ -1113,40 +1152,30 @@ func (b *Board) stopSession(t *Task) {
 	b.note(t, "claude", "session", fmt.Sprintf("Stopped session %q.", j.Session))
 }
 
-// handleSay pastes Eugene's {"text"} into the task's live session and submits it; Claude Code queues it while busy.
-func (b *Board) handleSay(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Text string `json:"text"`
+// addGuidance types Eugene's guidance into t's session while Claude works on it: Act then adds to the round,
+// not starts one; other actions wait. It returns the HTTP status for its error. Callers hold mu.
+func (b *Board) addGuidance(t *Task, req actRequest) (int, error) {
+	text := req.Comment
+	if req.Action != "act" || !sessionPane(t.Job) {
+		return 409, errors.New("busy: Claude is already working on this task")
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
-		writeJSON(w, 400, map[string]string{"error": "need {text}"})
-		return
+	if strings.TrimSpace(text) == "" {
+		return 400, errors.New("write the guidance to add to Claude's session")
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	t, ok := b.st.Tasks[r.PathValue("id")]
-	if !ok {
-		writeJSON(w, 404, map[string]string{"error": "no such task"})
-		return
+	if err := typeInto(t.Job.Pane, text); err != nil {
+		return 500, err
 	}
-	if !sessionPane(t.Job) {
-		writeJSON(w, 409, map[string]string{"error": "this task has no live session in wezterm"})
-		return
-	}
-	_, err := wezterm([]string{"cli", "send-text", "--pane-id", t.Job.Pane, "--", req.Text})
+	b.note(t, "eugene", "message", text)
+	return 200, nil
+}
+
+// typeInto pastes text into a session's pane and submits it; Claude Code queues it while busy.
+func typeInto(pane, text string) error {
+	_, err := wezterm([]string{"cli", "send-text", "--pane-id", pane, "--", text})
 	if err == nil {
-		_, err = wezterm([]string{"cli", "send-text", "--pane-id", t.Job.Pane, "--no-paste", "\r"})
+		_, err = wezterm([]string{"cli", "send-text", "--pane-id", pane, "--no-paste", "\r"})
 	}
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
-	}
-	b.note(t, "eugene", "message", req.Text)
-	if err := b.save(); err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
-		return
-	}
-	writeJSON(w, 200, t)
+	return err
 }
 
 // busy reports whether t has a job still running; a session whose pane is gone ended without reporting,
@@ -1306,7 +1335,6 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
 	mux.HandleFunc("POST /api/tasks/{id}/ask", b.handleAsk)
 	mux.HandleFunc("POST /api/tasks/{id}/answer", b.handleAnswer)
-	mux.HandleFunc("POST /api/tasks/{id}/say", b.handleSay)
 	mux.HandleFunc("GET /api/settings", b.handleSettings)
 	mux.HandleFunc("PUT /api/settings", b.handleSaveSettings)
 	return mux

@@ -266,7 +266,7 @@ func TestSpawnSessionTerminal(t *testing.T) {
 	dir := t.TempDir()
 	// The terminal gets the session as its argv, run in the task's folder.
 	b := &Board{claude: "claude", selfURL: "http://board", terminal: []string{"sh", "-c", `printf '%s\n' "$PWD" "$@" > args.tmp && mv args.tmp args`, "sh"}}
-	pane, err := b.spawnSession(dir, "t'1", "s1", "do it")
+	pane, err := b.spawnSession(dir, "t'1", "s1", "id1", false, "do it")
 	if err != nil || pane != "" {
 		t.Fatalf("spawnSession = %q, %v; want no pane, no error", pane, err)
 	}
@@ -279,7 +279,7 @@ func TestSpawnSessionTerminal(t *testing.T) {
 	}
 	// Its questions go to the board: the hook posts them to the task, its id escaped out of the shell quotes.
 	settings := `{"hooks":{"PreToolUse":[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/ask' -H 'Content-Type: application/json' --data-binary @-","timeout":86400,"type":"command"}],"matcher":"AskUserQuestion"}]}}`
-	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--settings\n" + settings + "\ndo it\n"
+	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--session-id\nid1\n--settings\n" + settings + "\ndo it\n"
 	if string(out) != want {
 		t.Errorf("terminal got\n%s\nwant\n%s", out, want)
 	}
@@ -384,14 +384,11 @@ func TestSessionSayAndStop(t *testing.T) {
 	}
 	calls := func() string { out, _ := os.ReadFile(filepath.Join(dir, "calls")); return string(out) }
 
-	if code := do(http.MethodPost, "/api/tasks/t1/say", `{"text":"-also check the tests"}`); code != 200 {
-		t.Fatalf("say: %d", code)
+	if code := do(http.MethodPost, "/api/tasks/t1/act", `{"action":"act","comment":"-also check the tests"}`); code != 200 {
+		t.Fatalf("act while Claude works: %d", code)
 	}
 	if want := "cli send-text --pane-id 7 -- -also check the tests\ncli send-text --pane-id 7 --no-paste \r\n"; calls() != want {
-		t.Errorf("say typed %q, want %q", calls(), want)
-	}
-	if code := do(http.MethodPost, "/api/tasks/t2/say", `{"text":"x"}`); code != 409 {
-		t.Errorf("say into a pane that is no longer the session's: %d, want 409", code)
+		t.Errorf("act while Claude works typed %q, want %q", calls(), want)
 	}
 
 	do(http.MethodPut, "/api/tasks/t1", `{"status":"done"}`)
@@ -409,6 +406,61 @@ func TestSessionSayAndStop(t *testing.T) {
 	}
 	if code := do(http.MethodDelete, "/api/tasks/t3", ""); code != 200 || !strings.HasSuffix(calls(), "cli kill-pane --pane-id 9\n") {
 		t.Errorf("delete while Claude works: %d, calls %q; want 200 and pane 9 killed", code, calls())
+	}
+}
+
+func TestActKeepsOneSession(t *testing.T) {
+	dir := t.TempDir()
+	// A fake wezterm: panes 7 and 9 are a's and d's open sessions, pane 8 a pane that took e's old id; spawn opens pane 42.
+	fake := "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[{\"pane_id\":7,\"title\":\"✳ a-act\"},{\"pane_id\":8,\"title\":\"zsh\"},{\"pane_id\":9,\"title\":\"✳ d-act\"}]'; exit; fi\n" +
+		"echo \"$@\" >> " + dir + "/calls\nif [ \"$2\" = spawn ]; then echo 42; fi\n"
+	if err := os.WriteFile(filepath.Join(dir, "wezterm"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, claude: "claude", areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{
+		"a": {ID: "a", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", ClaudeID: "id-a"}},
+		"b": {ID: "b", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "b-act", ClaudeID: "id-b"}},
+		"c": {ID: "c", Area: "work"},
+		"d": {ID: "d", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "d-act", Pane: "9", ClaudeID: "id-d"}},
+		"e": {ID: "e", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "e-act", Pane: "8"}},
+	}
+	mux := b.routes()
+	act := func(id, body string) (int, string) {
+		_ = os.Remove(filepath.Join(dir, "calls"))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/tasks/"+id+"/act", strings.NewReader(body)))
+		out, _ := os.ReadFile(filepath.Join(dir, "calls"))
+		return rec.Code, string(out)
+	}
+
+	// Its session is open: the new round is typed into it.
+	if code, calls := act("a", `{"action":"act"}`); code != 200 || !strings.HasPrefix(calls, "cli send-text --pane-id 7 -- Eugene pressed") || strings.Contains(calls, "spawn") {
+		t.Errorf("a: %d, calls %q; want the prompt typed into pane 7", code, calls)
+	}
+	if j := b.st.Tasks["a"].Job; j.Status != "running" || j.Pane != "7" || j.ClaudeID != "id-a" {
+		t.Errorf("a's job = %+v, want running in pane 7 on id-a", j)
+	}
+	// Its session closed: it is resumed.
+	if code, calls := act("b", `{"action":"act"}`); code != 200 || !strings.Contains(calls, " --resume id-b ") {
+		t.Errorf("b: %d, calls %q; want a spawn resuming id-b", code, calls)
+	}
+	if j := b.st.Tasks["b"].Job; j.Pane != "42" || j.ClaudeID != "id-b" {
+		t.Errorf("b's job = %+v, want pane 42 on id-b", j)
+	}
+	// No session yet: a new one, with an id of its own.
+	if code, calls := act("c", `{"action":"act"}`); code != 200 || !strings.Contains(calls, " --session-id "+b.st.Tasks["c"].Job.ClaudeID+" ") || len(b.st.Tasks["c"].Job.ClaudeID) != 36 {
+		t.Errorf("c: %d, calls %q, id %q; want a spawn with a new session id", code, calls, b.st.Tasks["c"].Job.ClaudeID)
+	}
+	// Fresh: the open session is stopped and a new one started.
+	code, calls := act("d", `{"action":"act","fresh":true}`)
+	if id := b.st.Tasks["d"].Job.ClaudeID; code != 200 || !strings.HasPrefix(calls, "cli kill-pane --pane-id 9\n") || id == "id-d" || !strings.Contains(calls, " --session-id "+id+" ") {
+		t.Errorf("d: %d, calls %q; want pane 9 killed and a new session", code, calls)
+	}
+	// Claude works, but pane 8 is no longer its session: nothing to add to.
+	if code, calls := act("e", `{"action":"act","comment":"x"}`); code != 409 || calls != "" {
+		t.Errorf("e: %d, calls %q; want 409 and nothing typed", code, calls)
 	}
 }
 
