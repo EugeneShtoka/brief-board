@@ -2,15 +2,16 @@
 // (wezterm mux, remote control) on a task when a button is pressed (reply, act, qa). Drop is handled here.
 //
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
-// BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery"}, the board's areas and
+// BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery", "issueUrl", "prUrl"}, the board's areas and
 // the folders their sessions run in; work's is also where the brief runs; roadmap: the files the roadmap run reads, see
 // defaultRoadmap; jiraRoom: the kith room the area's Jira bot posts in, see watchJira; briefEvery: how often the area is
-// briefed, a Go duration, default BOARD_BRIEF_EVERY, unset or 0 only by the board's button, see scheduleBrief),
+// briefed, a Go duration, default BOARD_BRIEF_EVERY, unset or 0 only by the board's button, see scheduleBrief;
+// issueUrl / prUrl: the area's link bases, default BOARD_ISSUE_URL / BOARD_PR_URL),
 // BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
 // BOARD_SESSION_IN (tab | window: a wezterm session's new tab in the window last used, or its own window),
-// BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page),
+// BOARD_ISSUE_URL / BOARD_PR_URL (link bases for issue keys and #PR numbers in the page, for areas without their own),
 // BOARD_CLEAN_MERGED (1: a task moving to done with a merged pull request closes its session and removes the
 // pull request's worktree, see cleanMerged).
 // The page's settings (settingKeys) are saved in settings.json next to the state file and win over the env, see applySettings.
@@ -166,6 +167,8 @@ type Area struct {
 	Roadmap    []string      `json:"roadmap"`
 	JiraRoom   string        `json:"jiraRoom,omitempty"`
 	BriefEvery string        `json:"briefEvery,omitempty"`
+	IssueURL   string        `json:"issueUrl,omitempty"`
+	PRURL      string        `json:"prUrl,omitempty"`
 	every      time.Duration // BriefEvery, parsed; 0 is never on schedule
 }
 
@@ -207,6 +210,7 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		}
 		seen[a.ID] = true
 		a.Name = cmp.Or(a.Name, a.ID)
+		a.IssueURL, a.PRURL = cmp.Or(a.IssueURL, os.Getenv("BOARD_ISSUE_URL")), cmp.Or(a.PRURL, os.Getenv("BOARD_PR_URL"))
 		if a.Roadmap == nil {
 			a.Roadmap = defaultRoadmap
 		}
@@ -1352,18 +1356,18 @@ func main() {
 
 	// BOARD_ISSUE_KEY: the key pattern in the Jira feeds (each area's jiraRoom) and GitHub notifications.
 	keyRe := regexp.MustCompile(env("BOARD_ISSUE_KEY", `\b[A-Z][A-Z0-9]+-\d+\b`))
-	for _, a := range b.areas {
-		if a.JiraRoom != "" {
+	for i := range b.areas {
+		if a := &b.areas[i]; a.JiraRoom != "" {
 			every := cmp.Or(envDuration("BOARD_JIRA_POLL"), 2*time.Minute)
-			go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), &a, keyRe, every)
+			go b.watchJira(env("BOARD_KITH_MCP", "kith-mcp"), a, keyRe, every)
 			log.Printf("watching %q for %s's Jira updates every %s", a.JiraRoom, a.ID, every)
 		}
 	}
 	// BOARD_GITHUB_POLL: how often to read GitHub notifications (via gh) onto the tasks they are about; unset is off.
 	go b.watchGitHub(keyRe, envDuration("BOARD_GITHUB_POLL"))
 	go b.scheduleBrief()
-	for _, a := range b.areas {
-		if a.every > 0 && b.briefs(&a) {
+	for i := range b.areas {
+		if a := &b.areas[i]; a.every > 0 && b.briefs(a) {
 			log.Printf("briefing %s every %s", a.ID, a.every)
 		}
 	}

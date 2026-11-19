@@ -139,6 +139,9 @@ dialog::backdrop { background: rgb(10 14 24 / .45); }
 .story { white-space: pre-wrap; overflow-wrap: anywhere; max-width: 72ch; }
 /* A question the task's Claude session waits on, answered here. */
 .ask { border: 1px solid var(--warn); border-radius: 0.625rem; padding: 0.75rem 0.875rem; display: grid; gap: 0.75rem; }
+fieldset.proj { border: 1px solid var(--line); border-radius: 0.625rem; margin: 0; padding: 0.75rem 0.875rem; display: grid; gap: 0.625rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+fieldset.proj .btns { grid-column: 1 / -1; }
+fieldset.proj legend { font: 600 0.875rem var(--body); padding: 0 0.25rem; }
 .ask fieldset { border: 0; margin: 0; padding: 0; display: grid; gap: 0.375rem; }
 .ask legend { font: 600 0.875rem var(--body); padding: 0 0 0.25rem; }
 .ask label.opt { display: flex; gap: 0.5rem; align-items: baseline; font: 0.875rem var(--body); color: var(--ink); cursor: pointer; }
@@ -224,15 +227,17 @@ const kithLink = (label, room, event) => `<a href="${esc(kithURI(room, event))}"
 const messageLink = (m) => /^https:\/\//.test(m.url || "") ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.label || "message")} ↗</a>` : kithLink(m.label || "message", m.room, m.event);
 const preQa = (t) => t.status === "done" ? (t.jira || []).filter((k) => PRE_QA.has((t.jiraStatus || {})[k])) : [];
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-// Issue and PR link bases come from the server (BOARD_ISSUE_URL, BOARD_PR_URL); no link when unset.
+// Issue and PR link bases come from the server: the area's issueUrl and prUrl, else BOARD_ISSUE_URL and BOARD_PR_URL; no link when unset.
 const cfg = () => state.config || {};
-const refs = (s) => esc(s)
-  .replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (m) => cfg().issue ? `<a href="${cfg().issue}${m}" target="_blank" rel="noopener"><code class="ref">${m}</code></a>` : `<code class="ref">${m}</code>`)
-  .replace(/(^|[\s(*])#(\d{3,5})\b/g, (m, pre, n) => cfg().pr ? `${pre}<a href="${cfg().pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
+const bases = (area) => { const a = (cfg().areas || []).find((x) => x.id === area) || {}; return { issue: esc(a.issueUrl ?? cfg().issue ?? ""), pr: esc(a.prUrl ?? cfg().pr ?? "") }; };
+const refs = (s, { issue, pr }) => esc(s)
+  .replace(/\b([A-Z][A-Z0-9]+-\d+)\b/g, (m) => issue ? `<a href="${issue}${m}" target="_blank" rel="noopener"><code class="ref">${m}</code></a>` : `<code class="ref">${m}</code>`)
+  .replace(/(^|[\s(*])#(\d{3,5})\b/g, (m, pre, n) => pr ? `${pre}<a href="${pr}${n}" target="_blank" rel="noopener"><code class="ref">#${n}</code></a>` : m)
   .replace(/(^|\s)(https?:\/\/[^\s<]*[^\s<.,:!?)])/g,'$1<a href="$2" target="_blank" rel="noopener">$2</a>');
 // The markdown the brief writes: `code` and [text](url) are cut out before refs links keys and URLs, **bold** last.
-const linkify = (s) => String(s ?? "").split(/(`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/)
-  .map((p, i) => i % 2 === 0 ? refs(p) : p[0] === "`" ? `<code>${esc(p.slice(1, -1))}</code>`
+// Keys and #numbers link with the bases of the area the text belongs to.
+const linkify = (s, area) => String(s ?? "").split(/(`[^`\n]+`|\[[^\]\n]+\]\(https?:\/\/[^\s)]+\))/)
+  .map((p, i) => i % 2 === 0 ? refs(p, bases(area)) : p[0] === "`" ? `<code>${esc(p.slice(1, -1))}</code>`
     : p.replace(/^\[(.+)\]\((.+)\)$/, (m, t, u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(t)}</a>`))
   .join("").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
 let state = { brief: {}, tasks: [] }, pend = [], openId = null, today = ymd(new Date()), poll;
@@ -331,7 +336,7 @@ function render() {
   $("n-history").textContent = [...state.tasks.filter(visible).flatMap((t) => t.history || []), ...(filtering() ? [] : state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
 
   const b = state.brief || {};
-  if (b.headline) put($("headline"), linkify(b.headline));
+  if (b.headline) put($("headline"), linkify(b.headline, "work"));
   // The headline is the work brief's, so it shows only while work does.
   $("headline").hidden = hide.area.includes("work");
   // Each shown area's last brief (work's is also the brief Claude last pushed), newest on top; the button briefs the shown areas.
@@ -379,13 +384,13 @@ function renderDialog(fresh) {
   // A wezterm session stays open after its report, for Eugene to steer; the board learns it ended only when told.
   const busy = running(t), live = t.job && t.job.pane && (busy || t.job.status === "ok");
   const js = t.jiraStatus || {}, late = preQa(t);
-  const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
+  const refs = [...(t.jira || []).map((k) => `<span><a href="${bases(t.area).issue}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),
     ...(t.messages || []).map(messageLink),
     ...(t.thread && t.thread.room ? [kithLink(t.thread.reply_to ? "reply goes here" : "reply room", t.thread.room, t.thread.reply_to)] : []),
     ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
   put($("dlg-title"), esc(t.title));
   put($("d-meta"), `${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}`);
-  put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Act can fill it in.</div>`}
+  put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary, t.area)}</div>` : `<div class="hint">No story recorded yet. Act can fill it in.</div>`}
     ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
   const q = t.job && t.job.question;
   $("d-ask").hidden = !q;
@@ -398,7 +403,7 @@ function renderDialog(fresh) {
   // Suggest every tag in use that this task doesn't have yet.
   put($("tag-list"), allTags().filter((g) => !(t.tags || []).includes(g)).map((g) => `<option value="${esc(g)}">`).join(""));
   put($("d-hist"), (t.history || []).slice().reverse().map((e) =>
-    `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : dm(e.at) + " " + hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text)}</span></span></li>`).join("")
+    `<li><time title="${esc(e.at)}">${ymd(new Date(e.at)) === today ? hm(e.at) : dm(e.at) + " " + hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span><br><span class="txt">${linkify(e.text, t.area)}</span></span></li>`).join("")
     || `<li><time>—</time><span class="hint">Nothing yet.</span></li>`);
   put($("d-busy"), busy ? `<div class="pill run" style="justify-self:start">Claude is working on “${esc(t.job.action)}” since ${hm(t.job.startedAt)}</div>` : "");
   put($("d-btns"), `
@@ -560,6 +565,9 @@ $("dlg").addEventListener("click", (e) => {
   if (e.target.id === "f-trig-add") return addTrigger();
   if (e.target.id === "f-pick") return $("f-files").click();
   if (e.target.id === "ask-term") return sendAnswer({});
+  if (e.target.id === "s-add") return editProjects((ps) => ps.push({}));
+  const rp = e.target.closest("[data-unproj]");
+  if (rp) return removeProject(+rp.dataset.unproj);
   const f = e.target.closest("[data-unfile]");
   if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
   const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
@@ -676,27 +684,68 @@ function setTheme(t) {
   try { if (t) localStorage.setItem("theme", t); else localStorage.removeItem("theme"); } catch {}
 }
 // Settings by category: [key, label, hint, kind]. The board's are its BOARD_* settings, saved over the service's env
-// (saving restarts the board); kind is text (default), json, check, ro (shown only) or a list of choices; "" is the first.
+// (saving restarts the board); kind is text (default), projects, check, ro (shown only) or a list of choices; "" is the first.
+// The board-wide values below the projects are the defaults a project without its own takes.
 const SETTINGS = [
-  ["Projects", [["BOARD_AREAS", "Projects", "A JSON list of {id, name, dir, roadmap, jiraRoom, briefEvery}; work is required.", "json"]]],
-  ["Briefs", [["BOARD_BRIEF_EVERY", "Brief every", "How often a project without its own briefEvery is briefed, e.g. 6h; empty is only by the button."]]],
+  ["Projects", [["BOARD_AREAS", "Projects", "Work is required: the brief runs in it.", "projects"]]],
+  ["Briefs", [["BOARD_BRIEF_EVERY", "Brief every", "How often a project without its own is briefed, e.g. 6h; empty is only by the button."]]],
   ["Watchers", [["BOARD_JIRA_POLL", "Jira feed poll", "Empty is 2m."], ["BOARD_GITHUB_POLL", "GitHub notifications poll", "Empty is off, e.g. 5m."],
     ["BOARD_ISSUE_KEY", "Issue key pattern", "A regular expression; empty is \\b[A-Z][A-Z0-9]+-\\d+\\b."], ["BOARD_KITH_MCP", "kith MCP command", "Empty is kith-mcp."]]],
   ["Sessions", [["BOARD_CLAUDE", "Claude command", "Empty is claude."], ["BOARD_TERMINAL", "Terminal", "Empty is the wezterm mux, else a command the session is appended to, e.g. kitty."],
     ["BOARD_SESSION_IN", "A wezterm session opens in", "", [["", "A new tab"], ["window", "Its own window"]]],
     ["BOARD_CLEAN_MERGED", "Clean up merged work", "A task done with a merged pull request closes its session and removes its worktree.", "check"]]],
-  ["Links", [["BOARD_ISSUE_URL", "Issue link base", "An issue key is appended, e.g. https://you.atlassian.net/browse/."], ["BOARD_PR_URL", "Pull request link base", "A #number is appended."]]],
+  ["Links", [["BOARD_ISSUE_URL", "Issue link base", "For projects without their own; an issue key is appended, e.g. https://you.atlassian.net/browse/."],
+    ["BOARD_PR_URL", "Pull request link base", "For projects without their own; a #number is appended."]]],
   ["Server", [["BOARD_URL", "Board URL", "How Claude reaches the board; empty is http://localhost and the address."],
     ["BOARD_ADDR", "Address", "Set in the service's env only.", "ro"], ["BOARD_STATE", "State file", "Set in the service's env only; settings.json sits next to it.", "ro"]]],
 ];
+// A project's fields, BOARD_AREAS keys: [key, label, hint]. Roadmap is a list, edited comma-separated.
+const PROJECT = [["id", "Id", "Stored on its tasks: lowercase, unique, e.g. kith."], ["name", "Name", "Shown on the board; empty is the id."],
+  ["dir", "Folder", "Where its sessions run, e.g. ~/dev/kith."],
+  ["roadmap", "Roadmap files", "Globs in the folder, comma-separated; empty is roadmap.md, TODO.md and the like; none reads no files."],
+  ["jiraRoom", "Jira feed room", "The kith room its Jira bot posts in; empty watches none."],
+  ["briefEvery", "Brief every", "e.g. 6h; empty is the board's below; 0 is only by the button."],
+  ["issueUrl", "Issue link base", "Empty is the board's below."], ["prUrl", "Pull request link base", "Empty is the board's below."]];
+let projects = [], projectsRaw = "", projectsLoaded = "";
+const projectHTML = (p, i) => `<fieldset class="proj" data-proj="${i}"><legend>${esc(p.name || p.id || "New project")}</legend>
+  ${PROJECT.map(([k, label, hint]) => { const v = k === "roadmap" ? (Array.isArray(p[k]) ? p[k].join(", ") || "none" : "") : p[k] || "";
+    return `<label for="p${i}-${k}">${label}<input type="text" id="p${i}-${k}" data-pk="${k}" value="${esc(v)}" spellcheck="false"><span class="hint">${hint}</span></label>`; }).join("")}
+  ${p.id === "work" ? "" : `<div class="btns"><button type="button" class="btn danger" data-unproj="${i}">Remove ${esc(p.name || p.id || "project")}</button></div>`}</fieldset>`;
+// The fields over the projects as loaded, so keys the form doesn't edit are kept; an empty field leaves its key out.
+const readProjects = () => [...document.querySelectorAll("[data-proj]")].map((f) => {
+  const p = { ...projects[+f.dataset.proj] };
+  for (const el of f.querySelectorAll("[data-pk]")) {
+    const k = el.dataset.pk, v = el.value.trim();
+    if (!v) delete p[k];
+    else p[k] = k !== "roadmap" ? v : v === "none" ? [] : v.split(",").map((g) => g.trim()).filter(Boolean);
+  }
+  return p;
+});
+function editProjects(change) {
+  projects = readProjects(); change(projects);
+  $("s-projects").innerHTML = projects.map(projectHTML).join("");
+}
+// A project with open tasks asks first: they keep it as theirs but can't open a session until moved.
+function removeProject(i) {
+  const p = readProjects()[i], open = state.tasks.filter((t) => t.area === p.id && !closed(t)).length;
+  if (open && !confirm(`${p.name || p.id} has ${open} open task${open > 1 ? "s" : ""}. Remove it anyway?`)) return;
+  editProjects((ps) => ps.splice(i, 1));
+}
 async function renderSettings() {
   openId = null;
   const r = await fetch("api/settings").catch(() => null);
   const { settings: now = {}, env = {} } = r && r.ok ? await r.json() : {};
   const field = ([k, label, hint, kind]) => {
     const v = now[k] || "", id = "s-" + k, on = kind !== "ro" && v !== (env[k] || "");
-    const input = kind === "json" ? `<textarea id="${id}" data-key="${k}" spellcheck="false" style="font-family:var(--mono);min-height:12rem">${esc(v)}</textarea>`
-      : kind === "check" ? `<input type="checkbox" id="${id}" data-key="${k}" ${v === "1" ? "checked" : ""}>`
+    if (kind === "projects") {
+      projectsRaw = v;
+      try { projects = JSON.parse(v); } catch { projects = []; }
+      projectsLoaded = JSON.stringify(projects);
+      return `<div id="s-projects" style="display:grid;gap:0.875rem">${projects.map(projectHTML).join("")}</div>
+        <div class="btns"><button type="button" class="btn" id="s-add">Add project</button></div>
+        <span class="hint">${esc(hint)}${on ? " Set here; the env file has others." : ""}</span>`;
+    }
+    const input = kind === "check" ? `<input type="checkbox" id="${id}" data-key="${k}" ${v === "1" ? "checked" : ""}>`
       : Array.isArray(kind) ? `<select id="${id}" data-key="${k}">${kind.map(([o, l]) => `<option value="${o}" ${o === v || !o && v === "tab" ? "selected" : ""}>${l}</option>`).join("")}</select>`
       : `<input type="text" id="${id}" ${kind === "ro" ? "readonly" : `data-key="${k}"`} value="${esc(v)}">`;
     return `<label for="${id}">${esc(label)} <code>${k}</code>${input}<span class="hint">${esc(hint)}${on ? ` Set here; the env file has ${env[k] ? `<code>${esc(env[k])}</code>` : "none"}.` : ""}</span></label>`;
@@ -715,6 +764,9 @@ async function renderSettings() {
 async function saveSettings(e) {
   e.preventDefault();
   const body = Object.fromEntries([...$("settings-form").querySelectorAll("[data-key]")].map((el) => [el.dataset.key, el.type === "checkbox" ? (el.checked ? "1" : "") : el.value]));
+  // Unchanged projects go back as loaded, so a save of other settings doesn't pin the env's list in settings.json.
+  const ps = JSON.stringify(readProjects());
+  body.BOARD_AREAS = ps === projectsLoaded ? projectsRaw : ps;
   const r = await fetch("api/settings", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
   $("s-err").hidden = r && r.ok; $("s-ok").hidden = !(r && r.ok);
   if (r && r.ok) $("s-ok").textContent = "Saved. The board is restarting; the page picks it up in a few seconds.";
@@ -750,7 +802,7 @@ async function loadLog() {
   $("activity").innerHTML = entries.sort((a, b) => b.at.localeCompare(a.at)).map((e) => {
     const d = ymd(new Date(e.at)), head = d === day ? "" : `<li class="day">${d === today ? "Today" : new Date(e.at).toLocaleDateString("en-GB", { weekday: "long" })} ${dm(d)}</li>`;
     day = d;
-    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}${e.area && e.area !== "work" ? ` <span class="pill">${esc(areaName(e.area))}</span>` : ""}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text)}</span></span></li>`;
+    return head + `<li><time title="${esc(e.at)}">${hm(e.at)}</time><span><span class="who">${esc(e.actor)} · ${esc(e.kind)}</span> — ${esc(e.title || "board")}${e.area && e.area !== "work" ? ` <span class="pill">${esc(areaName(e.area))}</span>` : ""}<br><span class="txt">${linkify(e.text.length > 280 ? e.text.slice(0, 280) + "…" : e.text, e.area)}</span></span></li>`;
   }).join("") || `<li><time>—</time><span class="hint">Nothing this week.</span></li>`;
 }
 $("wk-prev").addEventListener("click", () => { week = addDays(week, -7); loadLog(); });

@@ -76,13 +76,18 @@ func TestAreas(t *testing.T) {
 	work, kith := t.TempDir(), t.TempDir()
 	b := &Board{home: "/home"}
 	t.Setenv("BOARD_BRIEF_EVERY", "6h") // an area without briefEvery's
-	areas, err := b.parseAreas(`[{"id": "work", "name": "Work", "dir": "` + work + `"}, {"id": "kith", "name": "Kith", "dir": "` + kith + `", "briefEvery": "1h"},
+	t.Setenv("BOARD_PR_URL", "https://env/pull/")
+	t.Setenv("BOARD_ISSUE_URL", "")
+	areas, err := b.parseAreas(`[{"id": "work", "name": "Work", "dir": "` + work + `"}, {"id": "kith", "name": "Kith", "dir": "` + kith + `", "briefEvery": "1h",
+		"issueUrl": "https://kith/issues/", "prUrl": "https://kith/pull/"},
 		{"id": "nixos", "dir": "~/dev/nixos"}, {"id": "personal", "name": "Personal", "dir": "~", "briefEvery": "0"}]`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, defaultRoadmap, "", "", 6 * time.Hour}, {"kith", "Kith", kith, defaultRoadmap, "", "1h", time.Hour},
-		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, "", "", 6 * time.Hour}, {"personal", "Personal", "/home", defaultRoadmap, "", "0", 0}}
+	want := []Area{{"work", "Work", work, defaultRoadmap, "", "", "", "https://env/pull/", 6 * time.Hour},
+		{"kith", "Kith", kith, defaultRoadmap, "", "1h", "https://kith/issues/", "https://kith/pull/", time.Hour},
+		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, "", "", "", "https://env/pull/", 6 * time.Hour},
+		{"personal", "Personal", "/home", defaultRoadmap, "", "0", "", "https://env/pull/", 0}}
 	if !reflect.DeepEqual(areas, want) {
 		t.Errorf("parseAreas = %v, want %v", areas, want)
 	}
