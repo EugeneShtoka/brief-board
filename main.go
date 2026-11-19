@@ -1,5 +1,5 @@
 // brief-board serves the daily brief as a task board and opens an interactive Claude Code session
-// (wezterm mux, remote control) on a task when a button is pressed (reply, clarify, act). Drop is handled here.
+// (wezterm mux, remote control) on a task when a button is pressed (reply, act, qa). Drop is handled here.
 //
 // Env: BOARD_ADDR (:8787), BOARD_STATE (~/.local/state/brief-board/state.json),
 // BOARD_AREAS (required: a JSON list of {"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery"}, the board's areas and
@@ -702,7 +702,7 @@ func saveUpload(fh *multipart.FileHeader, path string) error {
 }
 
 type actRequest struct {
-	Action  string `json:"action"` // reply | clarify | act | qa | drop; update comes from the Jira watcher
+	Action  string `json:"action"` // reply | act | qa | drop; update comes from the Jira watcher
 	Comment string `json:"comment"`
 	Key     string `json:"key"` // qa only: the Jira key to move
 }
@@ -724,7 +724,7 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 	case "drop":
 		setStatus(t, "dropped")
 		b.note(t, "eugene", "drop", strings.TrimSpace("Dropped. "+req.Comment))
-	case "reply", "clarify", "act", "qa":
+	case "reply", "act", "qa":
 		if req.Action == "qa" && !slices.Contains(t.Jira, req.Key) {
 			writeJSON(w, 400, map[string]string{"error": "qa needs one of this task's Jira keys"})
 			return
@@ -743,7 +743,7 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 		b.note(t, "eugene", req.Action, text)
 		b.start(t, req)
 	default:
-		writeJSON(w, 400, map[string]string{"error": "action must be reply, clarify, act or drop"})
+		writeJSON(w, 400, map[string]string{"error": "action must be reply, act, qa or drop"})
 		return
 	}
 	if err := b.save(); err != nil {
@@ -753,34 +753,39 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, t)
 }
 
-const actionRules = `What each action means:
-- reply: write the reply to the person in the task and SEND it now, in the room and thread where they raised it
-  (task.thread names the room, reply_to and thread when known; otherwise find the message with kith-mcp).
-  Write in that room's language and in Eugene's voice. Send once: never retry inside the room's cooldown,
-  and report exactly what kith answered, "sent" or "drafted". A Jira question gets a Jira comment instead.
-  An email (task.thread.email is its Gmail thread id) gets a Gmail draft reply in that thread, never a sent one.
-- clarify: get the missing information Eugene's guidance names. If only a person can answer it, ask them
-  in the thread where the item came from and send it. Otherwise investigate (Jira, chat, code, public API) and answer it yourself.
-- act: do the task itself, as far as it can be done safely now. Follow the CLAUDE.md, skills and memory of the
-  folder you run in, which the task's area picks (in the be repo: branch from development, pre-PR checklist, PR
-  review post). Never merge, push to main, deploy or touch prod data. A task with source "roadmap" came from the
-  roadmap file its summary names: once the work is done, mark its item done there, the way that file marks done items,
-  in the work's own commit when git tracks the file, or just edited when it doesn't.
-- qa: the task is done but its Jira ticket is still before QA. Transition that one key to "QA - Staging"
-  (read its transitions first). A sub-task that has no QA state goes straight to Done. Change nothing else, then
-  record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.
-- update: a Jira update arrived (from the Jira feed, not from Eugene). Read the ticket in Jira (status, newest
-  comments) and refresh this task: summary (what changed, who said what), jiraStatus, messages. If the update asks
-  something of Eugene (a mention, a question, an assignment), set group "waiting_on_you" and status "todo".
-  Never send messages and never change Jira on an update.
-- trigger: a trigger Eugene set on the task ahead (task.triggers) fired: a pull request the task links reached its
-  branch, one of the task's Jira keys reached its status, or its time came. Do what the trigger says, the way act does:
-  it is Eugene's own instruction, given ahead.`
+// actRule is what act asks; a trigger's own instruction is done the same way.
+const actRule = `Do the task itself, and what Eugene's guidance asks, as far as it can be done safely now. If that is getting
+missing information, investigate (Jira, chat, code, public API) and answer it yourself; if only a person can answer it,
+ask them in the thread where the item came from and send it. Follow the CLAUDE.md, skills and memory of the folder you
+run in, which the task's area picks (in the be repo: branch from development, pre-PR checklist, PR review post).
+Never merge, push to main, deploy or touch prod data. A task with source "roadmap" came from the roadmap file its
+summary names: once the work is done, mark its item done there, the way that file marks done items, in the work's
+own commit when git tracks the file, or just edited when it doesn't.`
+
+// actionRules says what each action means; a session is sent only its own.
+var actionRules = map[string]string{
+	"reply": `Write the reply to the person in the task and SEND it now, in the room and thread where they raised it
+(task.thread names the room, reply_to and thread when known; otherwise find the message with kith-mcp).
+Write in that room's language and in Eugene's voice. Send once: never retry inside the room's cooldown,
+and report exactly what kith answered, "sent" or "drafted". A Jira question gets a Jira comment instead.
+An email (task.thread.email is its Gmail thread id) gets a Gmail draft reply in that thread, never a sent one.`,
+	"act": actRule,
+	"qa": `The task is done but its Jira ticket is still before QA. Transition that one key to "QA - Staging"
+(read its transitions first). A sub-task that has no QA state goes straight to Done. Change nothing else, then
+record the new status: PUT {"jiraStatus": {"<KEY>": "<status now>"}}.`,
+	"update": `The update came from the Jira feed, not from Eugene. Read the ticket in Jira (status, newest
+comments) and refresh this task: summary (what changed, who said what), jiraStatus, messages. If the update asks
+something of Eugene (a mention, a question, an assignment), set group "waiting_on_you" and status "todo".
+Never send messages and never change Jira on an update.`,
+	"trigger": `The trigger (one of task.triggers) fired: a pull request the task links reached its branch, one of the
+task's Jira keys reached its status, or its time came. Do what the trigger says: it is Eugene's own instruction,
+given ahead. ` + actRule,
+}
 
 func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	view := *t
 	view.Job = nil
-	taskJSON, err := json.MarshalIndent(view, "", "  ")
+	taskJSON, err := json.Marshal(view)
 	if err != nil {
 		return "", fmt.Errorf("prompt: %w", err)
 	}
@@ -803,10 +808,10 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 	if len(t.Files) > 0 {
 		sb.WriteString("Eugene attached files to this task (task.files): read them, they are part of it.\n")
 	}
-	fmt.Fprintf(&sb, "\n%s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
+	fmt.Fprintf(&sb, "\nWhat to do: %s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\",\"waitingFor\":\"PR review\"}'   # todo|doing|waiting|done|dropped; waitingFor: what who owes\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n",
-		actionRules, b.selfURL, t.ID)
+		actionRules[req.Action], b.selfURL, t.ID)
 	if req.Action == "update" {
 		sb.WriteString("Your final message goes into the task's history as is: 2-4 plain lines saying what you did, what was sent or drafted, and links.\n")
 	} else {

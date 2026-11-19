@@ -754,3 +754,24 @@ func TestSaveSettings(t *testing.T) {
 		t.Errorf("BOARD_GITHUB_POLL %q, before %q; want 5m over the env's empty", os.Getenv("BOARD_GITHUB_POLL"), before["BOARD_GITHUB_POLL"])
 	}
 }
+
+func TestPromptSendsOnlyItsRule(t *testing.T) {
+	b := &Board{selfURL: "http://board"}
+	for action, rule := range actionRules {
+		p, err := b.prompt(&Task{ID: "x", Title: "T"}, actRequest{Action: action})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(p, "What to do: "+rule) || !strings.Contains(p, `{"id":"x","title":"T"`) {
+			t.Errorf("prompt(%s) misses its rule or the compact task:\n%s", action, p)
+		}
+		for other, r := range actionRules {
+			if other != action && !strings.Contains(rule, r) && strings.Contains(p, r) {
+				t.Errorf("prompt(%s) carries the %s rule", action, other)
+			}
+		}
+	}
+	if !strings.Contains(actionRules["trigger"], actRule) {
+		t.Error("a trigger's session lacks act's rules")
+	}
+}
