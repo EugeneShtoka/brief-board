@@ -241,8 +241,10 @@ const put = (el, html) => { if (el._html !== html) { el._html = html; el.innerHT
 
 const closed = (t) => t.status === "done" || t.status === "dropped";
 const running = (t) => t.job && t.job.status === "running";
+const closedToday = (t) => t.doneAt && ymd(new Date(t.doneAt)) === today;
+// Closed shows today's closed tasks, and while searching every closed task that matches, so an old one can be found.
 function laneOf(t) {
-  if (closed(t)) return t.doneAt && ymd(new Date(t.doneAt)) === today ? "closed" : null;
+  if (closed(t)) return closedToday(t) || terms().length ? "closed" : null;
   return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
 }
 // Areas come from the server (BOARD_AREAS); work holds anything unmarked.
@@ -293,7 +295,7 @@ function pills(t) {
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
-  if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + hm(t.doneAt) : ""}</span>`);
+  if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + (closedToday(t) ? "" : dm(t.doneAt) + " ") + hm(t.doneAt) : ""}</span>`);
   else if (carried(t) > 0) out.push(`<span class="pill ${carried(t) >= 3 ? "crit" : ""}">carried ${carried(t)}d</span>`);
   if (t.who || t.waitingFor) out.push(`<span>${esc([t.who, t.waitingFor].filter(Boolean).join(": "))}</span>`);
   return out.join("");
@@ -315,19 +317,20 @@ function render() {
   }).filter(Boolean).join(" · ") || "all"));
   for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
     : (a.urgency === "high" ? 0 : 1) - (b.urgency === "high" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
-  put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
+  const searching = terms().length > 0;
+  put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${k === "closed" && searching ? "Closed" : label} <span class="count">${by[k].length}</span></h2>${
     // A div, not a <button>: Firefox won't drag buttons.
     by[k].map((t) => `<div class="card ${t.urgency === "high" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" role="button" tabindex="0" draggable="true" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></div>`).join("")
-    || `<div class="empty">${k === "closed" ? "Nothing closed yet today." : "Empty."}</div>`}</section>`).join(""));
+    || `<div class="empty">${k === "closed" ? searching ? "No closed task matches." : "Nothing closed yet today." : "Empty."}</div>`}</section>`).join(""));
 
-  const total = by.todo.length + by.doing.length + by.waiting.length + by.closed.length;
-  put($("pnum"), `${by.closed.length} / ${total} <small>closed today</small>`);
-  $("pbar").style.width = total ? `${(100 * by.closed.length) / total}%` : "0";
+  const done = by.closed.filter(closedToday).length, total = by.todo.length + by.doing.length + by.waiting.length + done;
+  put($("pnum"), `${done} / ${total} <small>closed today</small>`);
+  $("pbar").style.width = total ? `${(100 * done) / total}%` : "0";
   const days = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return ymd(d); });
   const counts = days.map((d) => state.tasks.filter(visible).filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
   put($("week"), days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join(""));
 
-  $("n-tickets").textContent = total - by.closed.length;
+  $("n-tickets").textContent = total - done;
   $("n-history").textContent = [...state.tasks.filter(visible).flatMap((t) => t.history || []), ...(filtering() ? [] : state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
 
   const b = state.brief || {};
