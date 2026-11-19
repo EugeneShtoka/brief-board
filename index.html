@@ -154,6 +154,13 @@ textarea:focus, input:focus { outline: 0.125rem solid var(--accent); outline-off
 .btn:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); }
 .btn.danger { color: var(--crit); }
+/* Close, Drop and Delete: one split button, the likeliest up front and the other two in its menu, which opens upward from the dialog's foot. */
+.split { position: relative; display: inline-flex; }
+.split > .btn { border-radius: 0.5rem 0 0 0.5rem; }
+.split summary { list-style: none; border-left: 0; border-radius: 0 0.5rem 0.5rem 0; padding-inline: 0.5rem; }
+.split summary::-webkit-details-marker { display: none; }
+.split .menu { position: absolute; z-index: 10; bottom: calc(100% + 0.25rem); left: 0; display: grid; gap: 0.25rem; padding: 0.25rem; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; box-shadow: 0 0.5rem 1.5rem rgb(10 14 24 / .2); }
+.split details:not([open]) .menu { display: none; }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 .hint { font-size: 0.75rem; color: var(--muted); }
 .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; justify-content: space-between; }
@@ -406,9 +413,15 @@ function renderDialog(fresh) {
     <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
     ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
     ${live ? `<button class="btn" data-act="say">Send to the session</button>` : ""}
-    <button class="btn" data-act="close" ${t.status === "done" ? "disabled" : ""}>Close</button>
-    <button class="btn danger" data-act="drop" ${t.status === "dropped" ? "disabled" : ""}>Drop</button>
-    <button class="btn danger" data-act="delete">Delete</button>`);
+    ${endButton(t)}`);
+}
+// Close for a task still open, Delete for one already closed; the other two are a click away in the menu.
+function endButton(t) {
+  const ends = { close: ["Close", t.status === "done"], drop: ["Drop", t.status === "dropped"], delete: ["Delete", false] };
+  const first = closed(t) ? "delete" : "close";
+  const btn = (k) => `<button class="btn ${k === "close" ? "" : "danger"}" data-act="${k}" ${ends[k][1] ? "disabled" : ""}>${ends[k][0]}</button>`;
+  return `<span class="split">${btn(first)}<details><summary class="btn" aria-label="More ways to end the task">▾</summary><div class="menu">${
+    Object.keys(ends).filter((k) => k !== first).map(btn).join("")}</div></details></span>`;
 }
 
 // A question the task's session waits on (handleAsk): each one's options, and Eugene's own words in place of them.
@@ -563,6 +576,7 @@ $("dlg").addEventListener("click", (e) => {
   const f = e.target.closest("[data-unfile]");
   if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
   const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
+  b.closest("details")?.removeAttribute("open");
   if (b.dataset.act === "close") return closeTask();
   if (b.dataset.act === "delete") return deleteTask();
   if (b.dataset.act === "say") return say();
@@ -667,8 +681,8 @@ $("filter-menu").addEventListener("click", (e) => {
   hide[dim] = b.dataset.to === "all" ? [] : filterOpts().find(([d]) => d === dim)[2].map(([v]) => v).filter((v) => v !== b.dataset.v);
   setFilter();
 });
-// The dropdown closes on a click outside it and on Escape.
-document.addEventListener("click", (e) => { if (!$("filter").contains(e.target)) $("filter").open = false; });
+// A dropdown (the filter, a task's Close/Drop/Delete menu) closes on a click outside it; the filter also on Escape.
+document.addEventListener("click", (e) => { for (const d of document.querySelectorAll("details[open]")) if (!d.contains(e.target)) d.open = false; });
 $("filter").addEventListener("keydown", (e) => { if (e.key === "Escape" && $("filter").open) { $("filter").open = false; $("filter-sum").focus(); } });
 // The theme is kept per browser; "" follows the system's light or dark.
 function setTheme(t) {
