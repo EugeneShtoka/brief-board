@@ -30,6 +30,7 @@ import (
 	"maps"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,11 +63,13 @@ type LogEntry struct {
 
 type Job struct {
 	Action    string     `json:"action"`
-	Status    string     `json:"status"` // running | ok | failed
+	Status    string     `json:"status"` // running | ok | failed | stopped
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
 	Session   string     `json:"session,omitempty"` // button jobs: the Claude session's name, for remote control
 	Pane      string     `json:"pane,omitempty"`    // button jobs: its wezterm pane id
+	// Question is the AskUserQuestion input the session waits on Eugene to answer on the board, see handleAsk.
+	Question json.RawMessage `json:"question,omitempty"`
 }
 
 type Task struct {
@@ -146,6 +149,8 @@ type Board struct {
 	areas    []Area            // BOARD_AREAS
 	env      map[string]string // the service's env, before settings.json; a saved setting equal to it is dropped from the file
 	restart  chan struct{}     // a saved setting: main restarts the board to apply it
+
+	asks map[string]chan []byte // task id -> its session's waiting question, which takes the hook's reply
 }
 
 // areaRe keeps an area id a plain lowercase name.
@@ -255,6 +260,9 @@ func (b *Board) load() error {
 	// A task's area is required; ones from before that are work. The gone groups load as what replaced them.
 	for _, t := range b.st.Tasks {
 		t.Area = cmp.Or(t.Area, "work")
+		if t.Job != nil {
+			t.Job.Question = nil // its hook's request ended with the last run, and the session asks in its terminal
+		}
 		switch t.Group {
 		case "urgent":
 			t.Urgency = cmp.Or(t.Urgency, "high")
@@ -591,6 +599,10 @@ func (b *Board) handleUpsert(w http.ResponseWriter, r *http.Request) { //nolint:
 		if next.Status == "done" {
 			b.doneNow(&next)
 		}
+		// Closed on the board; a session closing its own task stays open for Eugene.
+		if (next.Status == "done" || next.Status == "dropped") && r.URL.Query().Get("actor") == "eugene" {
+			b.stopSession(&next)
+		}
 	}
 	next.UpdatedAt = time.Now()
 	b.st.Tasks[id] = &next
@@ -638,7 +650,8 @@ func (b *Board) handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "no such task"})
 		return
 	}
-	// A running session would write the task back on its next update.
+	b.stopSession(t)
+	// A session the board can't stop (no pane) would write the task back on its next update.
 	if b.busy(t) {
 		writeJSON(w, 409, map[string]string{"error": "Claude is working on this task"})
 		return
@@ -656,6 +669,112 @@ func (b *Board) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"deleted": id})
+}
+
+// handleAsk is a session's AskUserQuestion hook (see spawnSession): the question shows on the task, and the request
+// holds until Eugene answers there (handleAnswer), its reply answering the tool. An empty reply hands the question to
+// the session's own prompt in its terminal, as does the hook's request failing: a timeout, a board restart.
+func (b *Board) handleAsk(w http.ResponseWriter, r *http.Request) {
+	var hook struct {
+		ToolInput json.RawMessage `json:"tool_input"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil || len(hook.ToolInput) == 0 {
+		writeJSON(w, 400, map[string]string{"error": "need a PreToolUse hook's input"})
+		return
+	}
+	id, ch := r.PathValue("id"), make(chan []byte, 1)
+	b.mu.Lock()
+	t, ok := b.st.Tasks[id]
+	if !ok || t.Job == nil || b.asks[id] != nil {
+		b.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if b.asks == nil {
+		b.asks = map[string]chan []byte{}
+	}
+	b.asks[id], t.Job.Question = ch, hook.ToolInput
+	b.saveOrLog()
+	b.mu.Unlock()
+	defer func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.asks[id] != ch {
+			return // answered, and handleAnswer cleared it
+		}
+		delete(b.asks, id)
+		if t, ok := b.st.Tasks[id]; ok && t.Job != nil {
+			t.Job.Question = nil
+		}
+		b.saveOrLog()
+	}()
+	select {
+	case out := <-ch:
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write(out); err != nil {
+			log.Printf("ask: %v", err)
+		}
+	case <-r.Context().Done():
+	}
+}
+
+// handleAnswer answers the question a task's session waits on: {"answers": {question: answer}}, an answer being an
+// option's label, several joined by ", " as Claude Code's own prompt does, or Eugene's own words. No answers hand the
+// question back to the session's terminal.
+func (b *Board) handleAnswer(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Answers map[string]string `json:"answers"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id := r.PathValue("id")
+	t, ok := b.st.Tasks[id]
+	ch := b.asks[id]
+	if !ok || ch == nil || t.Job == nil {
+		writeJSON(w, 409, map[string]string{"error": "no question is waiting on this task"})
+		return
+	}
+	var out []byte
+	text := "Answer it in the session's terminal."
+	if len(req.Answers) > 0 {
+		var input map[string]any
+		var asked struct {
+			Questions []struct {
+				Question string `json:"question"`
+			} `json:"questions"`
+		}
+		if err := json.Unmarshal(t.Job.Question, &input); err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.Unmarshal(t.Job.Question, &asked) // it parsed as input just above
+		input["answers"] = req.Answers
+		var err error
+		out, err = json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{
+			"hookEventName": "PreToolUse", "permissionDecision": "allow", "updatedInput": input}})
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		lines := make([]string, 0, len(asked.Questions))
+		for _, q := range asked.Questions {
+			lines = append(lines, q.Question+" → "+req.Answers[q.Question])
+		}
+		text = strings.Join(lines, "\n")
+	}
+	ch <- out
+	delete(b.asks, id)
+	t.Job.Question = nil
+	b.note(t, "eugene", "answer", text)
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, t)
 }
 
 const maxAttach = 32 << 20
@@ -753,6 +872,7 @@ func (b *Board) handleAct(w http.ResponseWriter, r *http.Request) {
 	switch req.Action {
 	case "drop":
 		setStatus(t, "dropped")
+		b.stopSession(t)
 		b.note(t, "eugene", "drop", strings.TrimSpace("Dropped. "+req.Comment))
 	case "reply", "act", "qa":
 		if req.Action == "qa" && !slices.Contains(t.Jira, req.Key) {
@@ -867,7 +987,7 @@ func (b *Board) start(t *Task, req actRequest) {
 		t.Job.Session = t.ID + "-" + req.Action
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			t.Job.Pane, err = b.spawnSession(dir, t.Job.Session, prompt)
+			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, prompt)
 		}
 	}
 	if err != nil {
@@ -885,16 +1005,24 @@ func (b *Board) start(t *Task, req actRequest) {
 
 // spawnSession opens an interactive Claude Code session and returns its wezterm pane id ("" in another terminal).
 // In wezterm the pane closes when Claude exits, so a live pane means a live session.
-func (b *Board) spawnSession(dir, name, prompt string) (string, error) {
+func (b *Board) spawnSession(dir, id, name, prompt string) (string, error) {
+	// Its questions wait on the board (handleAsk) for up to a day; the task id is path-escaped, so it can't break the quotes.
+	ask := fmt.Sprintf("curl -s -X POST '%s/api/tasks/%s/ask' -H 'Content-Type: application/json' --data-binary @-", b.selfURL, url.PathEscape(id))
+	settings, err := json.Marshal(map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
+		"matcher": "AskUserQuestion", "hooks": []any{map[string]any{"type": "command", "command": ask, "timeout": 86400}}}}}})
+	if err != nil {
+		return "", fmt.Errorf("spawn: %w", err)
+	}
 	// zsh -lic gives the session the user's login env; the service's own PATH is bare.
 	// claude and the prompt reach zsh as "$0" and "$@", never as shell text.
-	session := []string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name, prompt}
+	session := []string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name,
+		"--settings", string(settings), prompt}
 	if len(b.terminal) > 0 {
 		// shortcut: no pane to watch, so a session that dies without reporting keeps its task busy,
 		// and a terminal that stays our child dies with a board restart; track its process if another terminal gets real use.
 		cmd := exec.CommandContext(context.Background(), b.terminal[0], slices.Concat(b.terminal[1:], session)...) //nolint:gosec // BOARD_TERMINAL is the service's own setting
 		cmd.Dir = dir
-		if err := cmd.Start(); err != nil {
+		if err = cmd.Start(); err != nil {
 			return "", fmt.Errorf("spawn: %w", err)
 		}
 		go func() { _ = cmd.Wait() }() // reap it; its exit says nothing about the session
@@ -926,23 +1054,99 @@ func wezterm(args []string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// paneAlive reports whether the wezterm mux still has pane; if the mux can't be asked, it assumes yes.
-func paneAlive(pane string) bool {
+// panes lists the wezterm mux's panes: id -> title.
+func panes() (map[string]string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "wezterm", "cli", "list", "--format", "json").Output()
-	var panes []struct {
-		PaneID int `json:"pane_id"`
+	if err != nil {
+		return nil, fmt.Errorf("panes: %w", err)
 	}
-	if err != nil || json.Unmarshal(out, &panes) != nil {
+	var list []struct {
+		PaneID int    `json:"pane_id"`
+		Title  string `json:"title"`
+	}
+	if err := json.Unmarshal(out, &list); err != nil {
+		return nil, fmt.Errorf("panes: %w", err)
+	}
+	all := make(map[string]string, len(list))
+	for _, p := range list {
+		all[fmt.Sprint(p.PaneID)] = p.Title
+	}
+	return all, nil
+}
+
+// paneAlive reports whether the wezterm mux still has pane; if the mux can't be asked, it assumes yes.
+func paneAlive(pane string) bool {
+	all, err := panes()
+	if err != nil {
 		return true
 	}
-	for _, p := range panes {
-		if fmt.Sprint(p.PaneID) == pane {
-			return true
-		}
+	_, ok := all[pane]
+	return ok
+}
+
+// sessionPane reports whether j's session is alive in its pane, which wezterm titles with the session's name:
+// pane ids start over with the mux, so a bare id could be someone else's pane by now.
+func sessionPane(j *Job) bool {
+	if j == nil || j.Pane == "" {
+		return false
 	}
-	return false
+	all, err := panes()
+	return err == nil && strings.Contains(all[j.Pane], j.Session)
+}
+
+// stopSession kills t's session pane, ending Claude in it, once Eugene closes, drops or deletes the task. Callers hold mu.
+func (b *Board) stopSession(t *Task) {
+	j := t.Job
+	if !sessionPane(j) {
+		return
+	}
+	if _, err := wezterm([]string{"cli", "kill-pane", "--pane-id", j.Pane}); err != nil {
+		b.note(t, "claude", "session", fmt.Sprintf("Could not stop session %q: %v", j.Session, err))
+		return
+	}
+	if j.Status == "running" {
+		now := time.Now()
+		j.Status, j.EndedAt = "stopped", &now
+	}
+	b.note(t, "claude", "session", fmt.Sprintf("Stopped session %q.", j.Session))
+}
+
+// handleSay pastes Eugene's {"text"} into the task's live session and submits it; Claude Code queues it while busy.
+func (b *Board) handleSay(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
+		writeJSON(w, 400, map[string]string{"error": "need {text}"})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.st.Tasks[r.PathValue("id")]
+	if !ok {
+		writeJSON(w, 404, map[string]string{"error": "no such task"})
+		return
+	}
+	if !sessionPane(t.Job) {
+		writeJSON(w, 409, map[string]string{"error": "this task has no live session in wezterm"})
+		return
+	}
+	_, err := wezterm([]string{"cli", "send-text", "--pane-id", t.Job.Pane, "--", req.Text})
+	if err == nil {
+		_, err = wezterm([]string{"cli", "send-text", "--pane-id", t.Job.Pane, "--no-paste", "\r"})
+	}
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	b.note(t, "eugene", "message", req.Text)
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, t)
 }
 
 // busy reports whether t has a job still running; a session whose pane is gone ended without reporting,
@@ -1093,6 +1297,9 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
 	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
+	mux.HandleFunc("POST /api/tasks/{id}/ask", b.handleAsk)
+	mux.HandleFunc("POST /api/tasks/{id}/answer", b.handleAnswer)
+	mux.HandleFunc("POST /api/tasks/{id}/say", b.handleSay)
 	mux.HandleFunc("GET /api/settings", b.handleSettings)
 	mux.HandleFunc("PUT /api/settings", b.handleSaveSettings)
 	return mux

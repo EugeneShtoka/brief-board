@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"maps"
 	"mime/multipart"
 	"net/http"
@@ -264,8 +265,8 @@ func TestHandleUpsertLevels(t *testing.T) {
 func TestSpawnSessionTerminal(t *testing.T) {
 	dir := t.TempDir()
 	// The terminal gets the session as its argv, run in the task's folder.
-	b := &Board{claude: "claude", terminal: []string{"sh", "-c", `printf '%s\n' "$PWD" "$@" > args.tmp && mv args.tmp args`, "sh"}}
-	pane, err := b.spawnSession(dir, "s1", "do it")
+	b := &Board{claude: "claude", selfURL: "http://board", terminal: []string{"sh", "-c", `printf '%s\n' "$PWD" "$@" > args.tmp && mv args.tmp args`, "sh"}}
+	pane, err := b.spawnSession(dir, "t'1", "s1", "do it")
 	if err != nil || pane != "" {
 		t.Fatalf("spawnSession = %q, %v; want no pane, no error", pane, err)
 	}
@@ -276,9 +277,138 @@ func TestSpawnSessionTerminal(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\ndo it\n"
+	// Its questions go to the board: the hook posts them to the task, its id escaped out of the shell quotes.
+	settings := `{"hooks":{"PreToolUse":[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/ask' -H 'Content-Type: application/json' --data-binary @-","timeout":86400,"type":"command"}],"matcher":"AskUserQuestion"}]}}`
+	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--settings\n" + settings + "\ndo it\n"
 	if string(out) != want {
 		t.Errorf("terminal got\n%s\nwant\n%s", out, want)
+	}
+}
+
+func TestHandleAskAnswer(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.Tasks = map[string]*Task{"t1": {ID: "t1", Job: &Job{Action: "act", Status: "running"}}, "t2": {ID: "t2"}}
+	srv := httptest.NewServer(b.routes())
+	defer srv.Close()
+	input := `{"questions":[{"question":"Color?","options":[{"label":"Red"},{"label":"Blue"}]},{"question":"Sizes?","multiSelect":true,"options":[{"label":"S"},{"label":"L"}]}]}`
+	post := func(path, body string) (int, string) {
+		req, _ := http.NewRequestWithContext(t.Context(), http.MethodPost, srv.URL+path, strings.NewReader(body))
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Body.Close()
+		out, _ := io.ReadAll(r.Body)
+		return r.StatusCode, string(out)
+	}
+	// ask holds the hook's request until the board answers it, and returns what the hook printed.
+	ask := func(id string) chan string {
+		got := make(chan string, 1)
+		go func() {
+			_, out := post("/api/tasks/"+id+"/ask", `{"hook_event_name":"PreToolUse","tool_input":`+input+`}`)
+			got <- out
+		}()
+		for range 200 {
+			b.mu.Lock()
+			waiting := b.asks[id] != nil
+			b.mu.Unlock()
+			if waiting {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return got
+	}
+
+	if code, _ := post("/api/tasks/t1/answer", `{"answers":{"Color?":"Red"}}`); code != 409 {
+		t.Errorf("an answer with no question waiting: %d, want 409", code)
+	}
+	if code, out := post("/api/tasks/t2/ask", `{"tool_input":`+input+`}`); code != 204 || out != "" {
+		t.Errorf("a question on a task with no session: %d %q, want 204 and nothing, so the terminal asks", code, out)
+	}
+
+	got := ask("t1")
+	if string(b.st.Tasks["t1"].Job.Question) != input {
+		t.Fatalf("question on the task = %s, want %s", b.st.Tasks["t1"].Job.Question, input)
+	}
+	if code, _ := post("/api/tasks/t1/answer", `{"answers":{"Color?":"Blue","Sizes?":"S, L"}}`); code != 200 {
+		t.Fatalf("answer: %d", code)
+	}
+	var hook struct {
+		Out struct {
+			Decision string `json:"permissionDecision"`
+			Input    struct {
+				Questions []any             `json:"questions"`
+				Answers   map[string]string `json:"answers"`
+			} `json:"updatedInput"`
+		} `json:"hookSpecificOutput"`
+	}
+	if err := json.Unmarshal([]byte(<-got), &hook); err != nil || hook.Out.Decision != "allow" || len(hook.Out.Input.Questions) != 2 ||
+		hook.Out.Input.Answers["Color?"] != "Blue" || hook.Out.Input.Answers["Sizes?"] != "S, L" {
+		t.Errorf("hook output = %+v, %v; want allow with the questions and both answers", hook, err)
+	}
+	tk := b.st.Tasks["t1"]
+	if h := tk.History[len(tk.History)-1]; tk.Job.Question != nil || h.Text != "Color? → Blue\nSizes? → S, L" {
+		t.Errorf("after the answer: question %s, history %q", tk.Job.Question, h.Text)
+	}
+
+	got = ask("t1")
+	if code, _ := post("/api/tasks/t1/answer", `{}`); code != 200 {
+		t.Fatalf("hand back: %d", code)
+	}
+	if out := <-got; out != "" {
+		t.Errorf("handed back to the terminal, the hook printed %q, want nothing", out)
+	}
+}
+
+func TestSessionSayAndStop(t *testing.T) {
+	dir := t.TempDir()
+	// A fake wezterm: panes 7 and 9 are t1's and t3's sessions, pane 8 a pane that took t2's old id; every other call is logged.
+	fake := "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[{\"pane_id\":7,\"title\":\"✳ t1-act\"},{\"pane_id\":8,\"title\":\"zsh\"},{\"pane_id\":9,\"title\":\"✳ t3-act\"}]'; else echo \"$@\" >> " + dir + "/calls; fi\n"
+	if err := os.WriteFile(filepath.Join(dir, "wezterm"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{
+		"t1": {ID: "t1", Area: "work", Status: "doing", Job: &Job{Action: "act", Status: "running", Session: "t1-act", Pane: "7"}},
+		"t2": {ID: "t2", Area: "work", Status: "doing", Job: &Job{Action: "act", Status: "ok", Session: "t2-act", Pane: "8"}},
+		"t3": {ID: "t3", Area: "work", Status: "doing", Job: &Job{Action: "act", Status: "running", Session: "t3-act", Pane: "9"}},
+	}
+	mux := b.routes()
+	do := func(method, path, body string) int {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), method, path, strings.NewReader(body)))
+		return rec.Code
+	}
+	calls := func() string { out, _ := os.ReadFile(filepath.Join(dir, "calls")); return string(out) }
+
+	if code := do(http.MethodPost, "/api/tasks/t1/say", `{"text":"-also check the tests"}`); code != 200 {
+		t.Fatalf("say: %d", code)
+	}
+	if want := "cli send-text --pane-id 7 -- -also check the tests\ncli send-text --pane-id 7 --no-paste \r\n"; calls() != want {
+		t.Errorf("say typed %q, want %q", calls(), want)
+	}
+	if code := do(http.MethodPost, "/api/tasks/t2/say", `{"text":"x"}`); code != 409 {
+		t.Errorf("say into a pane that is no longer the session's: %d, want 409", code)
+	}
+
+	do(http.MethodPut, "/api/tasks/t1", `{"status":"done"}`)
+	if strings.Contains(calls(), "kill-pane") {
+		t.Error("a session closing its own task was stopped")
+	}
+	do(http.MethodPut, "/api/tasks/t1", `{"status":"doing"}`)
+	do(http.MethodPut, "/api/tasks/t1?actor=eugene", `{"status":"done"}`)
+	if !strings.HasSuffix(calls(), "cli kill-pane --pane-id 7\n") || b.st.Tasks["t1"].Job.Status != "stopped" {
+		t.Errorf("closed on the board: calls %q, job %s; want pane 7 killed and the job stopped", calls(), b.st.Tasks["t1"].Job.Status)
+	}
+	do(http.MethodPost, "/api/tasks/t2/act", `{"action":"drop"}`)
+	if strings.Contains(calls(), "--pane-id 8") {
+		t.Error("dropping t2 killed pane 8, which is no longer its session")
+	}
+	if code := do(http.MethodDelete, "/api/tasks/t3", ""); code != 200 || !strings.HasSuffix(calls(), "cli kill-pane --pane-id 9\n") {
+		t.Errorf("delete while Claude works: %d, calls %q; want 200 and pane 9 killed", code, calls())
 	}
 }
 
