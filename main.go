@@ -628,6 +628,36 @@ func (b *Board) handleNote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, t)
 }
 
+// handleDelete removes the task and its attached files for good; the week's log keeps a line saying so.
+func (b *Board) handleDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t, ok := b.st.Tasks[id]
+	if !ok {
+		writeJSON(w, 404, map[string]string{"error": "no such task"})
+		return
+	}
+	// A running session would write the task back on its next update.
+	if b.busy(t) {
+		writeJSON(w, 409, map[string]string{"error": "Claude is working on this task"})
+		return
+	}
+	if filepath.IsLocal(id) {
+		if err := os.RemoveAll(filepath.Join(filepath.Dir(b.path), "files", id)); err != nil { //nolint:gosec // filepath.IsLocal(id) above
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	b.note(t, "eugene", "delete", "Deleted from the board.")
+	delete(b.st.Tasks, id)
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]string{"deleted": id})
+}
+
 const maxAttach = 32 << 20
 
 // handleAttach stores the multipart "file" fields in files/<id>/ next to the state file and lists
@@ -1059,6 +1089,7 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("PUT /api/brief", b.handleBrief)
 	mux.HandleFunc("POST /api/brief/run", b.handleBriefRun)
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
+	mux.HandleFunc("DELETE /api/tasks/{id}", b.handleDelete)
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
 	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
