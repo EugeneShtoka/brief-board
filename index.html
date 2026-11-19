@@ -356,10 +356,10 @@ function renderDialog(fresh) {
     <div><h3>History</h3><ol class="tl" id="d-hist" style="margin-top:0.5rem"></ol></div>
     <div class="actions">
       <div id="d-busy" style="display:contents"></div>
-      <label for="f-comment">Guidance for Claude (optional; for Clarify, what to clarify)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
+      <label for="f-comment">Guidance for Claude (optional: what to do, or what to find out)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
       ${filesField("Files for Claude, attached when you press a button")}
       <div class="btns" id="d-btns"></div>
-      <div class="hint">Reply sends right away. Act and Clarify open a Claude session on this task (wezterm, or claude.ai/code); its report lands in the history.</div>
+      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its report lands in the history.</div>
       <div class="err" id="f-err" hidden></div>
     </div>`; }
   const busy = running(t);
@@ -370,7 +370,7 @@ function renderDialog(fresh) {
     ...(t.links || []).map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label || l.url)} ↗</a>`)];
   put($("dlg-title"), esc(t.title));
   put($("d-meta"), `${pills(t)}${t.since ? `<span>since ${dm(t.since)}</span>` : ""}`);
-  put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Clarify can fill it in.</div>`}
+  put($("d-story"), `${t.summary ? `<div class="story">${linkify(t.summary)}</div>` : `<div class="hint">No story recorded yet. Act can fill it in.</div>`}
     ${refs.length ? `<div class="refs">${refs.join("")}</div>` : ""}`);
   if (document.activeElement !== $("f-area")) $("f-area").value = t.area;
   if (document.activeElement !== $("f-urgency")) $("f-urgency").value = t.urgency || "";
@@ -386,7 +386,6 @@ function renderDialog(fresh) {
   put($("d-btns"), `
     ${t.who ? `<button class="btn primary" data-act="reply" ${busy ? "disabled" : ""}>Reply to ${esc(t.who)}</button>` : ""}
     <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
-    <button class="btn" data-act="clarify" ${busy ? "disabled" : ""}>Clarify</button>
     ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
     <button class="btn" data-act="close" ${busy || t.status === "done" ? "disabled" : ""}>Close</button>
     <button class="btn danger" data-act="drop" ${busy || t.status === "dropped" ? "disabled" : ""}>Drop</button>`);
@@ -465,7 +464,6 @@ async function apply(r) {
 
 async function act(action, key) {
   const comment = $("f-comment").value.trim(), err = $("f-err");
-  if (action === "clarify" && !comment) { err.hidden = false; err.textContent = "Say what to clarify."; return; }
   err.hidden = true;
   const failed = await attach(openId);
   if (failed) { err.hidden = false; err.textContent = failed; return; }
