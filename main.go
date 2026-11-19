@@ -1165,13 +1165,20 @@ func (b *Board) busy(t *Task) bool {
 }
 
 // reapSessions fails every session job whose pane is gone, so the board corrects itself without waiting
-// for a button press on that task.
+// for a button press on that task, and forgets the pane of an ended job whose session has closed since.
 func (b *Board) reapSessions() {
+	all, err := panes()
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	reaped := false
 	for _, t := range b.st.Tasks {
-		if t.Job != nil && t.Job.Status == "running" && t.Job.Pane != "" && !b.busy(t) {
+		j := t.Job
+		if j != nil && j.Status == "running" && j.Pane != "" && !b.busy(t) {
+			reaped = true
+		}
+		// A session stays open after its report; once its pane is gone the task has no session to send to.
+		if err == nil && j != nil && j.Status != "running" && j.Pane != "" && !strings.Contains(all[j.Pane], j.Session) {
+			j.Pane = ""
 			reaped = true
 		}
 	}

@@ -291,6 +291,7 @@ function pills(t) {
   if (t.importance && t.importance !== "medium") out.push(`<span class="pill ${t.importance === "high" ? "warn" : ""}">importance ${esc(t.importance)}</span>`);
   if (t.job && t.job.question) out.push(`<span class="pill warn">Claude asks</span>`);
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
+  else if (t.job && t.job.pane) out.push(`<span class="pill">session open</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
   if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + hm(t.doneAt) : ""}</span>`);
@@ -376,7 +377,7 @@ function renderDialog(fresh) {
       <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history. Send to the session types the guidance into it; Close, Drop and Delete stop it.</div>
       <div class="err" id="f-err" hidden></div>
     </div>`; }
-  // A wezterm session stays open after its report, for Eugene to steer; the board learns it ended only when told.
+  // A wezterm session stays open after its report, for Eugene to steer; the board drops its pane within a minute of it closing.
   const busy = running(t), live = t.job && t.job.pane && (busy || t.job.status === "ok");
   const js = t.jiraStatus || {}, late = preQa(t);
   const refs = [...(t.jira || []).map((k) => `<span><a href="${esc(cfg().issue || "")}${esc(k)}" target="_blank" rel="noopener"><code class="ref">${esc(k)}</code></a> <span class="pill ${late.includes(k) ? "warn" : js[k] === "Done" ? "ok" : ""}">${esc(js[k] || "status unknown")}</span></span>`),

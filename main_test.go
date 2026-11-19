@@ -489,9 +489,10 @@ func TestHandleDelete(t *testing.T) {
 }
 
 func TestReapSessions(t *testing.T) {
-	// The mux lists pane 7 only.
+	// The mux lists panes 7, 8 and 9; 9 took an old session's id.
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "wezterm"), []byte("#!/bin/sh\necho '[{\"pane_id\":7}]'\n"), 0o700); err != nil {
+	list := `[{"pane_id":7,"title":"✳ s1"},{"pane_id":8,"title":"✳ s3"},{"pane_id":9,"title":"zsh"}]`
+	if err := os.WriteFile(filepath.Join(bin, "wezterm"), []byte("#!/bin/sh\necho '"+list+"'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -500,8 +501,16 @@ func TestReapSessions(t *testing.T) {
 	b.st.Tasks = map[string]*Task{
 		"live": {ID: "live", Job: &Job{Action: "act", Status: "running", Session: "s1", Pane: "7"}},
 		"dead": {ID: "dead", Job: &Job{Action: "act", Status: "running", Session: "s2", Pane: "17"}},
+		"open": {ID: "open", Job: &Job{Action: "act", Status: "ok", Session: "s3", Pane: "8"}},
+		"shut": {ID: "shut", Job: &Job{Action: "act", Status: "ok", Session: "s4", Pane: "18"}},
+		"took": {ID: "took", Job: &Job{Action: "act", Status: "ok", Session: "s5", Pane: "9"}},
 	}
 	b.reapSessions()
+	for id, want := range map[string]string{"open": "8", "shut": "", "took": "", "dead": ""} {
+		if got := b.st.Tasks[id].Job.Pane; got != want {
+			t.Errorf("%s's pane = %q, want %q", id, got, want)
+		}
+	}
 	if got := b.st.Tasks["live"].Job.Status; got != "running" {
 		t.Errorf("live pane's job = %q, want running", got)
 	}
