@@ -671,6 +671,136 @@ func (b *Board) handleDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"deleted": id})
 }
 
+// handleCombine folds two tasks into one, {"with": id}: the older stays and takes the newer's history, story,
+// references and files (see combine); the newer is removed, its session stopped as handleDelete does.
+func (b *Board) handleCombine(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		With string `json:"with"`
+	}
+	id := r.PathValue("id")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.With == "" || req.With == id {
+		writeJSON(w, 400, map[string]string{"error": "need {with}: another task's id"})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	keep, ok1 := b.st.Tasks[id]
+	gone, ok2 := b.st.Tasks[req.With]
+	if !ok1 || !ok2 {
+		writeJSON(w, 404, map[string]string{"error": "no such task"})
+		return
+	}
+	if older(gone, keep) {
+		keep, gone = gone, keep
+	}
+	b.stopSession(gone)
+	// A session the board can't stop (no pane) would write the newer task back on its next update.
+	if b.busy(gone) {
+		writeJSON(w, 409, map[string]string{"error": fmt.Sprintf("Claude is working on “%s”", gone.Title)})
+		return
+	}
+	if err := b.combine(keep, gone); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	delete(b.st.Tasks, gone.ID)
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, keep)
+}
+
+// older reports whether a started before c: by their since dates when both have one and they differ, else by
+// their first history entries.
+func older(a, c *Task) bool {
+	if a.Since != "" && c.Since != "" && a.Since != c.Since {
+		return a.Since < c.Since
+	}
+	first := func(t *Task) time.Time {
+		if len(t.History) > 0 {
+			return t.History[0].At
+		}
+		return t.UpdatedAt
+	}
+	return first(a).Before(first(c))
+}
+
+// combine moves gone's history, story, references and files into keep; keep's own fields win where both have
+// one. A file whose move fails stays gone's, so nothing is lost. Callers hold mu.
+func (b *Board) combine(keep, gone *Task) error {
+	if err := b.moveFiles(keep, gone); err != nil {
+		return err
+	}
+	keep.History = append(keep.History, gone.History...)
+	slices.SortStableFunc(keep.History, func(x, y Entry) int { return x.At.Compare(y.At) })
+	if gone.Summary != "" {
+		keep.Summary = strings.TrimSpace(keep.Summary + "\n\n**" + gone.Title + "**: " + gone.Summary)
+	}
+	same := func(x, y string) bool { return x == y }
+	keep.Tags = union(keep.Tags, gone.Tags, same)
+	keep.Jira = union(keep.Jira, gone.Jira, same)
+	keep.Links = union(keep.Links, gone.Links, maps.Equal)
+	keep.Messages = union(keep.Messages, gone.Messages, maps.Equal)
+	keep.Triggers = append(keep.Triggers, gone.Triggers...)
+	for k, v := range gone.JiraStatus {
+		if _, ok := keep.JiraStatus[k]; !ok {
+			if keep.JiraStatus == nil {
+				keep.JiraStatus = map[string]string{}
+			}
+			keep.JiraStatus[k] = v
+		}
+	}
+	who := union(whoSep.Split(keep.Who, -1), whoSep.Split(gone.Who, -1), same)
+	keep.Who = strings.Join(slices.DeleteFunc(who, func(n string) bool { return n == "" }), ", ")
+	keep.WaitingFor = cmp.Or(keep.WaitingFor, gone.WaitingFor)
+	keep.Since = cmp.Or(keep.Since, gone.Since)
+	if keep.Thread == nil {
+		keep.Thread = gone.Thread
+	}
+	keep.Shipping = keep.Shipping || gone.Shipping
+	b.note(keep, "eugene", "combine", fmt.Sprintf("Combined with “%s” (%s), which is removed.", gone.Title, gone.ID))
+	return nil
+}
+
+// moveFiles moves gone's attached files to keep's folder, one at a time. Callers hold mu.
+func (b *Board) moveFiles(keep, gone *Task) error {
+	files := filepath.Join(filepath.Dir(b.path), "files")
+	if len(gone.Files) > 0 && !filepath.IsLocal(keep.ID) {
+		return fmt.Errorf("moveFiles: task id %q can't hold files", keep.ID)
+	}
+	for len(gone.Files) > 0 {
+		f := gone.Files[0]
+		to := filepath.Join(files, keep.ID, filepath.Base(f))
+		if slices.Contains(keep.Files, to) {
+			to = filepath.Join(files, keep.ID, gone.ID+"-"+filepath.Base(f))
+		}
+		if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
+			return fmt.Errorf("moveFiles: %w", err)
+		}
+		if err := os.Rename(f, to); err != nil {
+			return fmt.Errorf("moveFiles: %w", err)
+		}
+		keep.Files, gone.Files = append(keep.Files, to), gone.Files[1:]
+	}
+	if filepath.IsLocal(gone.ID) {
+		if err := os.RemoveAll(filepath.Join(files, gone.ID)); err != nil {
+			return fmt.Errorf("moveFiles: %w", err)
+		}
+	}
+	return nil
+}
+
+// union is a with each of c's items it lacks appended.
+func union[T any](a, c []T, eq func(x, y T) bool) []T {
+	for _, x := range c {
+		if !slices.ContainsFunc(a, func(y T) bool { return eq(x, y) }) {
+			a = append(a, x)
+		}
+	}
+	return a
+}
+
 // handleAsk is a session's AskUserQuestion hook (see spawnSession): the question shows on the task, and the request
 // holds until Eugene answers there (handleAnswer), its reply answering the tool. An empty reply hands the question to
 // the session's own prompt in its terminal, as does the hook's request failing: a timeout, a board restart.
@@ -1294,6 +1424,7 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/brief/run", b.handleBriefRun)
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
 	mux.HandleFunc("DELETE /api/tasks/{id}", b.handleDelete)
+	mux.HandleFunc("POST /api/tasks/{id}/combine", b.handleCombine)
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
 	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
