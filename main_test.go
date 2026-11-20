@@ -74,6 +74,14 @@ func TestRoadmap(t *testing.T) {
 
 func TestAreas(t *testing.T) {
 	work, kith := t.TempDir(), t.TempDir()
+	// work's folder is a GitHub repository: its #numbers are its own pull requests, not BOARD_PR_URL's.
+	for _, args := range [][]string{{"init", "-q"}, {"remote", "add", "origin", "git@github.com:o/work.git"}} {
+		cmd := exec.CommandContext(t.Context(), "git", append([]string{"-C", work}, args...)...)
+		cmd.Env = slices.DeleteFunc(os.Environ(), func(e string) bool { return strings.HasPrefix(e, "GIT_") }) // a hook's GIT_DIR is this repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
 	b := &Board{home: "/home"}
 	t.Setenv("BOARD_BRIEF_EVERY", "6h") // an area without briefEvery's
 	t.Setenv("BOARD_PR_URL", "https://env/pull/")
@@ -84,7 +92,7 @@ func TestAreas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []Area{{"work", "Work", work, defaultRoadmap, "", "", "", "https://env/pull/", 6 * time.Hour},
+	want := []Area{{"work", "Work", work, defaultRoadmap, "", "", "", "https://github.com/o/work/pull/", 6 * time.Hour},
 		{"kith", "Kith", kith, defaultRoadmap, "", "1h", "https://kith/issues/", "https://kith/pull/", time.Hour},
 		{"nixos", "nixos", "/home/dev/nixos", defaultRoadmap, "", "", "", "https://env/pull/", 6 * time.Hour},
 		{"personal", "Personal", "/home", defaultRoadmap, "", "0", "", "https://env/pull/", 0}}
@@ -1155,5 +1163,18 @@ func TestHandleCombine(t *testing.T) {
 	}
 	if code := combine("old", "nope"); code != 404 {
 		t.Errorf("unknown task: %d, want 404", code)
+	}
+}
+
+func TestGHRemoteRe(t *testing.T) {
+	for remote, want := range map[string]string{"git@github.com:o/r.git": "o/r", "https://github.com/o/r": "o/r",
+		"ssh://git@github.com/o/r.git": "o/r", "https://github.com/o/r.git/": "o/r", "git@gitlab.com:o/r.git": ""} {
+		got := ""
+		if m := ghRemoteRe.FindStringSubmatch(remote); m != nil {
+			got = m[1]
+		}
+		if got != want {
+			t.Errorf("ghRemoteRe(%s) = %q, want %q", remote, got, want)
+		}
 	}
 }
