@@ -67,9 +67,10 @@ type Job struct {
 	Status    string     `json:"status"` // running | ok | failed | stopped
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
-	Session   string     `json:"session,omitempty"`  // button jobs: the Claude session's name, for remote control
-	Pane      string     `json:"pane,omitempty"`     // button jobs: its wezterm pane id
-	ClaudeID  string     `json:"claudeId,omitempty"` // Claude Code's session id, which the task's next session resumes
+	Session   string     `json:"session,omitempty"`   // button jobs: the Claude session's name, for remote control
+	Pane      string     `json:"pane,omitempty"`      // button jobs: its wezterm pane id
+	SessionID string     `json:"sessionId,omitempty"` // button jobs: the Claude session's id, to resume it by; the task's next session resumes it too
+	Retries   int        `json:"retries,omitempty"`   // how often the board resumed or continued the session, see maxRetries
 	// Question is the AskUserQuestion input the session waits on Eugene to answer on the board, see handleAsk.
 	Question json.RawMessage `json:"question,omitempty"`
 }
@@ -673,6 +674,136 @@ func (b *Board) handleDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"deleted": id})
 }
 
+// handleCombine folds two tasks into one, {"with": id}: the older stays and takes the newer's history, story,
+// references and files (see combine); the newer is removed, its session stopped as handleDelete does.
+func (b *Board) handleCombine(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		With string `json:"with"`
+	}
+	id := r.PathValue("id")
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.With == "" || req.With == id {
+		writeJSON(w, 400, map[string]string{"error": "need {with}: another task's id"})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	keep, ok1 := b.st.Tasks[id]
+	gone, ok2 := b.st.Tasks[req.With]
+	if !ok1 || !ok2 {
+		writeJSON(w, 404, map[string]string{"error": "no such task"})
+		return
+	}
+	if older(gone, keep) {
+		keep, gone = gone, keep
+	}
+	b.stopSession(gone)
+	// A session the board can't stop (no pane) would write the newer task back on its next update.
+	if b.busy(gone) {
+		writeJSON(w, 409, map[string]string{"error": fmt.Sprintf("Claude is working on “%s”", gone.Title)})
+		return
+	}
+	if err := b.combine(keep, gone); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	delete(b.st.Tasks, gone.ID)
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, keep)
+}
+
+// older reports whether a started before c: by their since dates when both have one and they differ, else by
+// their first history entries.
+func older(a, c *Task) bool {
+	if a.Since != "" && c.Since != "" && a.Since != c.Since {
+		return a.Since < c.Since
+	}
+	first := func(t *Task) time.Time {
+		if len(t.History) > 0 {
+			return t.History[0].At
+		}
+		return t.UpdatedAt
+	}
+	return first(a).Before(first(c))
+}
+
+// combine moves gone's history, story, references and files into keep; keep's own fields win where both have
+// one. A file whose move fails stays gone's, so nothing is lost. Callers hold mu.
+func (b *Board) combine(keep, gone *Task) error {
+	if err := b.moveFiles(keep, gone); err != nil {
+		return err
+	}
+	keep.History = append(keep.History, gone.History...)
+	slices.SortStableFunc(keep.History, func(x, y Entry) int { return x.At.Compare(y.At) })
+	if gone.Summary != "" {
+		keep.Summary = strings.TrimSpace(keep.Summary + "\n\n**" + gone.Title + "**: " + gone.Summary)
+	}
+	same := func(x, y string) bool { return x == y }
+	keep.Tags = union(keep.Tags, gone.Tags, same)
+	keep.Jira = union(keep.Jira, gone.Jira, same)
+	keep.Links = union(keep.Links, gone.Links, maps.Equal)
+	keep.Messages = union(keep.Messages, gone.Messages, maps.Equal)
+	keep.Triggers = append(keep.Triggers, gone.Triggers...)
+	for k, v := range gone.JiraStatus {
+		if _, ok := keep.JiraStatus[k]; !ok {
+			if keep.JiraStatus == nil {
+				keep.JiraStatus = map[string]string{}
+			}
+			keep.JiraStatus[k] = v
+		}
+	}
+	who := union(whoSep.Split(keep.Who, -1), whoSep.Split(gone.Who, -1), same)
+	keep.Who = strings.Join(slices.DeleteFunc(who, func(n string) bool { return n == "" }), ", ")
+	keep.WaitingFor = cmp.Or(keep.WaitingFor, gone.WaitingFor)
+	keep.Since = cmp.Or(keep.Since, gone.Since)
+	if keep.Thread == nil {
+		keep.Thread = gone.Thread
+	}
+	keep.Shipping = keep.Shipping || gone.Shipping
+	b.note(keep, "eugene", "combine", fmt.Sprintf("Combined with “%s” (%s), which is removed.", gone.Title, gone.ID))
+	return nil
+}
+
+// moveFiles moves gone's attached files to keep's folder, one at a time. Callers hold mu.
+func (b *Board) moveFiles(keep, gone *Task) error {
+	files := filepath.Join(filepath.Dir(b.path), "files")
+	if len(gone.Files) > 0 && !filepath.IsLocal(keep.ID) {
+		return fmt.Errorf("moveFiles: task id %q can't hold files", keep.ID)
+	}
+	for len(gone.Files) > 0 {
+		f := gone.Files[0]
+		to := filepath.Join(files, keep.ID, filepath.Base(f))
+		if slices.Contains(keep.Files, to) {
+			to = filepath.Join(files, keep.ID, gone.ID+"-"+filepath.Base(f))
+		}
+		if err := os.MkdirAll(filepath.Dir(to), 0o700); err != nil {
+			return fmt.Errorf("moveFiles: %w", err)
+		}
+		if err := os.Rename(f, to); err != nil {
+			return fmt.Errorf("moveFiles: %w", err)
+		}
+		keep.Files, gone.Files = append(keep.Files, to), gone.Files[1:]
+	}
+	if filepath.IsLocal(gone.ID) {
+		if err := os.RemoveAll(filepath.Join(files, gone.ID)); err != nil {
+			return fmt.Errorf("moveFiles: %w", err)
+		}
+	}
+	return nil
+}
+
+// union is a with each of c's items it lacks appended.
+func union[T any](a, c []T, eq func(x, y T) bool) []T {
+	for _, x := range c {
+		if !slices.ContainsFunc(a, func(y T) bool { return eq(x, y) }) {
+			a = append(a, x)
+		}
+	}
+	return a
+}
+
 // handleAsk is a session's AskUserQuestion hook (see spawnSession): the question shows on the task, and the request
 // holds until Eugene answers there (handleAnswer), its reply answering the tool. An empty reply hands the question to
 // the session's own prompt in its terminal, as does the hook's request failing: a timeout, a board restart.
@@ -990,7 +1121,7 @@ func (b *Board) start(t *Task, req actRequest) {
 	prev := t.Job
 	t.Job = &Job{Action: req.Action, Status: "running", StartedAt: time.Now()}
 	if prev != nil && !req.Fresh {
-		t.Job.ClaudeID = prev.ClaudeID
+		t.Job.SessionID = prev.SessionID
 	}
 	prompt, err := b.prompt(t, req)
 	if err == nil && req.Action == "update" {
@@ -1002,18 +1133,18 @@ func (b *Board) start(t *Task, req actRequest) {
 	case err != nil:
 	case !req.Fresh && sessionPane(prev):
 		verb, t.Job.Session, t.Job.Pane = "Continued", prev.Session, prev.Pane
-		err = typeInto(t.Job.Pane, prompt)
+		err = sendText(t.Job.Pane, prompt)
 	default:
-		resume := t.Job.ClaudeID != ""
-		if resume {
+		idFlag := "--resume"
+		if t.Job.SessionID != "" {
 			verb = "Resumed"
 		} else {
-			t.Job.ClaudeID = newSessionID()
+			idFlag, t.Job.SessionID = "--session-id", newSessionID()
 		}
 		t.Job.Session = t.ID + "-" + req.Action
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, t.Job.ClaudeID, resume, prompt)
+			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, idFlag, t.Job.SessionID, prompt)
 		}
 	}
 	if err != nil {
@@ -1029,33 +1160,34 @@ func (b *Board) start(t *Task, req actRequest) {
 	b.note(t, "claude", "session", fmt.Sprintf("%s session %q in %s: attach there, or on claude.ai/code (remote control).", verb, t.Job.Session, where))
 }
 
-// newSessionID is a random UUID (v4), the form claude's --session-id takes.
+// newSessionID is a random (v4) UUID, the form Claude Code's --session-id takes.
 func newSessionID() string {
-	u := make([]byte, 16)
-	_, _ = rand.Read(u) // crypto/rand.Read never fails
+	var u [16]byte
+	_, _ = rand.Read(u[:]) // crypto/rand never fails
 	u[6], u[8] = u[6]&0x0f|0x40, u[8]&0x3f|0x80
-	return fmt.Sprintf("%x-%x-%x-%x-%x", u[:4], u[4:6], u[6:8], u[8:10], u[10:])
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:])
 }
 
-// spawnSession opens an interactive Claude Code session with Claude session id claudeID, resuming it when resume,
-// and returns its wezterm pane id ("" in another terminal).
+// spawnSession opens an interactive Claude Code session and returns its wezterm pane id ("" in another terminal);
+// args end claude's argv: the session id to start or resume, and the prompt.
 // In wezterm the pane closes when Claude exits, so a live pane means a live session.
-func (b *Board) spawnSession(dir, id, name, claudeID string, resume bool, prompt string) (string, error) {
+func (b *Board) spawnSession(dir, id, name string, args ...string) (string, error) {
 	// Its questions wait on the board (handleAsk) for up to a day; the task id is path-escaped, so it can't break the quotes.
-	ask := fmt.Sprintf("curl -s -X POST '%s/api/tasks/%s/ask' -H 'Content-Type: application/json' --data-binary @-", b.selfURL, url.PathEscape(id))
-	settings, err := json.Marshal(map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
-		"matcher": "AskUserQuestion", "hooks": []any{map[string]any{"type": "command", "command": ask, "timeout": 86400}}}}}})
+	post := func(path string) string {
+		return fmt.Sprintf("curl -s -X POST '%s/api/tasks/%s/%s' -H 'Content-Type: application/json' --data-binary @-", b.selfURL, url.PathEscape(id), path)
+	}
+	onSession := []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": post("session")}}}}
+	settings, err := json.Marshal(map[string]any{"hooks": map[string]any{
+		"PreToolUse": []any{map[string]any{
+			"matcher": "AskUserQuestion", "hooks": []any{map[string]any{"type": "command", "command": post("ask"), "timeout": 86400}}}},
+		"StopFailure": onSession, "SessionEnd": onSession}})
 	if err != nil {
 		return "", fmt.Errorf("spawn: %w", err)
 	}
 	// zsh -lic gives the session the user's login env; the service's own PATH is bare.
 	// claude and the prompt reach zsh as "$0" and "$@", never as shell text.
-	idFlag := "--session-id"
-	if resume {
-		idFlag = "--resume"
-	}
-	session := []string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name,
-		idFlag, claudeID, "--settings", string(settings), prompt}
+	session := slices.Concat([]string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name,
+		"--settings", string(settings)}, args)
 	if len(b.terminal) > 0 {
 		// shortcut: no pane to watch, so a session that dies without reporting keeps its task busy,
 		// and a terminal that stays our child dies with a board restart; track its process if another terminal gets real use.
@@ -1162,15 +1294,15 @@ func (b *Board) addGuidance(t *Task, req actRequest) (int, error) {
 	if strings.TrimSpace(text) == "" {
 		return 400, errors.New("write the guidance to add to Claude's session")
 	}
-	if err := typeInto(t.Job.Pane, text); err != nil {
+	if err := sendText(t.Job.Pane, text); err != nil {
 		return 500, err
 	}
 	b.note(t, "eugene", "message", text)
 	return 200, nil
 }
 
-// typeInto pastes text into a session's pane and submits it; Claude Code queues it while busy.
-func typeInto(pane, text string) error {
+// sendText types text into pane and submits it.
+func sendText(pane, text string) error {
 	_, err := wezterm([]string{"cli", "send-text", "--pane-id", pane, "--", text})
 	if err == nil {
 		_, err = wezterm([]string{"cli", "send-text", "--pane-id", pane, "--no-paste", "\r"})
@@ -1178,13 +1310,27 @@ func typeInto(pane, text string) error {
 	return err
 }
 
+// maxRetries caps how often the board resumes or continues one job's session on its own.
+const maxRetries = 3
+
+// retryDelay is the wait before continuing a session after its first passing API error; it doubles with each retry.
+var retryDelay = time.Minute
+
+// passing are the StopFailure errors a retry can fix; the others (authentication_failed, billing_error,
+// invalid_request, ...) need Eugene.
+var passing = map[string]bool{"rate_limit": true, "overloaded": true, "server_error": true, "unknown": true}
+
+const resumePrompt = "The Brief Board resumed this session: its terminal closed before you reported back (a restart or a crash). " +
+	"Check what was already done (messages sent, commits, pushes, board updates) and carry on from there without repeating any of it; " +
+	"then report as asked."
+
 // busy reports whether t has a job still running; a session whose pane is gone ended without reporting,
-// and is marked failed so the buttons work again. Callers hold mu.
+// and is resumed, or else marked failed so the buttons work again. Callers hold mu.
 func (b *Board) busy(t *Task) bool {
 	if t.Job == nil || t.Job.Status != "running" {
 		return false
 	}
-	if t.Job.Pane == "" || paneAlive(t.Job.Pane) {
+	if t.Job.Pane == "" || paneAlive(t.Job.Pane) || b.resume(t) {
 		return true
 	}
 	now := time.Now()
@@ -1193,7 +1339,92 @@ func (b *Board) busy(t *Task) bool {
 	return false
 }
 
-// reapSessions fails every session job whose pane is gone, so the board corrects itself without waiting
+// resume reopens t's session in a new pane, up to maxRetries times a job; a session started before the board knew
+// session ids can't be. Callers hold mu.
+func (b *Board) resume(t *Task) bool {
+	j := t.Job
+	if j.SessionID == "" || j.Retries >= maxRetries {
+		return false
+	}
+	dir, err := b.dirFor(t)
+	pane := ""
+	if err == nil {
+		pane, err = b.spawnSession(dir, t.ID, j.Session, "--resume", j.SessionID, resumePrompt)
+	}
+	if err != nil {
+		b.note(t, "claude", "session", fmt.Sprintf("Could not resume session %q: %v", j.Session, err))
+		return false
+	}
+	j.Pane = pane
+	j.Retries++
+	b.note(t, "claude", "session", fmt.Sprintf("Session %q closed before reporting back; resumed it in wezterm pane %s.", j.Session, pane))
+	return true
+}
+
+// handleSessionHook takes a session's StopFailure and SessionEnd hooks (see spawnSession). A turn stopped by a passing
+// API error is continued after a backoff, up to maxRetries times a job; any other is noted for Eugene. Eugene exiting
+// the session ends its job, so it isn't resumed.
+func (b *Board) handleSessionHook(w http.ResponseWriter, r *http.Request) {
+	var hook struct {
+		Event  string `json:"hook_event_name"`
+		Reason string `json:"reason"`
+		Error  string `json:"error"`
+		Last   string `json:"last_assistant_message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id := r.PathValue("id")
+	t, ok := b.st.Tasks[id]
+	if !ok || t.Job == nil || t.Job.Status != "running" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	j := t.Job
+	switch {
+	case hook.Event == "SessionEnd" && (hook.Reason == "prompt_input_exit" || hook.Reason == "logout"):
+		now := time.Now()
+		j.Status, j.EndedAt = "stopped", &now
+		b.note(t, "claude", "session", fmt.Sprintf("Session %q was exited before reporting back.", j.Session))
+	case hook.Event == "StopFailure" && passing[hook.Error] && j.Retries < maxRetries:
+		// shortcut: a usage limit that resets hours away uses up the retries in minutes; read its reset time if that bites.
+		// shortcut: a board restart drops a pending continue; save it on the job if that bites.
+		wait := retryDelay << j.Retries
+		j.Retries++
+		b.note(t, "claude", "session", fmt.Sprintf("Session %q stopped: %s. Continuing it in %s.", j.Session, cmp.Or(hook.Last, hook.Error), wait))
+		time.AfterFunc(wait, func() { b.continueSession(id, j) })
+	case hook.Event == "StopFailure":
+		b.note(t, "claude", "session", fmt.Sprintf("Session %q stopped: %s. It waits for you in its terminal.", j.Session, cmp.Or(hook.Last, hook.Error)))
+	default:
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// continueSession types "continue" into j's session, if j is still id's running job and its session is live.
+func (b *Board) continueSession(id string, j *Job) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if t, ok := b.st.Tasks[id]; !ok || t.Job != j || j.Status != "running" || !sessionPane(j) {
+		return
+	}
+	text := fmt.Sprintf("Continued session %q.", j.Session)
+	if err := sendText(j.Pane, "continue"); err != nil {
+		text = fmt.Sprintf("Could not continue session %q: %v", j.Session, err)
+	}
+	b.note(b.st.Tasks[id], "claude", "session", text)
+	b.saveOrLog()
+}
+
+// reapSessions resumes or fails every session job whose pane is gone, so the board corrects itself without waiting
 // for a button press on that task, and forgets the pane of an ended job whose session has closed since.
 func (b *Board) reapSessions() {
 	all, err := panes()
@@ -1202,8 +1433,9 @@ func (b *Board) reapSessions() {
 	reaped := false
 	for _, t := range b.st.Tasks {
 		j := t.Job
-		if j != nil && j.Status == "running" && j.Pane != "" && !b.busy(t) {
-			reaped = true
+		if j != nil && j.Status == "running" && j.Pane != "" {
+			pane := j.Pane
+			reaped = !b.busy(t) || j.Pane != pane || reaped
 		}
 		// A session stays open after its report; once its pane is gone the task has no session to send to.
 		if err == nil && j != nil && j.Status != "running" && j.Pane != "" && !strings.Contains(all[j.Pane], j.Session) {
@@ -1330,11 +1562,13 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/brief/run", b.handleBriefRun)
 	mux.HandleFunc("PUT /api/tasks/{id}", b.handleUpsert)
 	mux.HandleFunc("DELETE /api/tasks/{id}", b.handleDelete)
+	mux.HandleFunc("POST /api/tasks/{id}/combine", b.handleCombine)
 	mux.HandleFunc("POST /api/tasks/{id}/notes", b.handleNote)
 	mux.HandleFunc("POST /api/tasks/{id}/files", b.handleAttach)
 	mux.HandleFunc("POST /api/tasks/{id}/act", b.handleAct)
 	mux.HandleFunc("POST /api/tasks/{id}/ask", b.handleAsk)
 	mux.HandleFunc("POST /api/tasks/{id}/answer", b.handleAnswer)
+	mux.HandleFunc("POST /api/tasks/{id}/session", b.handleSessionHook)
 	mux.HandleFunc("GET /api/settings", b.handleSettings)
 	mux.HandleFunc("PUT /api/settings", b.handleSaveSettings)
 	return mux
