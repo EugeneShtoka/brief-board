@@ -1252,6 +1252,7 @@ func (b *Board) handleSessionHook(w http.ResponseWriter, r *http.Request) {
 		b.note(t, "claude", "session", fmt.Sprintf("Session %q was exited before reporting back.", j.Session))
 	case hook.Event == "StopFailure" && passing[hook.Error] && j.Retries < maxRetries:
 		// shortcut: a usage limit that resets hours away uses up the retries in minutes; read its reset time if that bites.
+		// shortcut: a board restart drops a pending continue; save it on the job if that bites.
 		wait := retryDelay << j.Retries
 		j.Retries++
 		b.note(t, "claude", "session", fmt.Sprintf("Session %q stopped: %s. Continuing it in %s.", j.Session, cmp.Or(hook.Last, hook.Error), wait))
