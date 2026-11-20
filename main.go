@@ -21,6 +21,7 @@ import (
 	"bufio"
 	"cmp"
 	"context"
+	"crypto/rand"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -66,8 +67,10 @@ type Job struct {
 	Status    string     `json:"status"` // running | ok | failed | stopped
 	StartedAt time.Time  `json:"startedAt"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
-	Session   string     `json:"session,omitempty"` // button jobs: the Claude session's name, for remote control
-	Pane      string     `json:"pane,omitempty"`    // button jobs: its wezterm pane id
+	Session   string     `json:"session,omitempty"`   // button jobs: the Claude session's name, for remote control
+	Pane      string     `json:"pane,omitempty"`      // button jobs: its wezterm pane id
+	SessionID string     `json:"sessionId,omitempty"` // button jobs: the Claude session's id, to resume it by
+	Retries   int        `json:"retries,omitempty"`   // how often the board resumed or continued the session, see maxRetries
 	// Question is the AskUserQuestion input the session waits on Eugene to answer on the board, see handleAsk.
 	Question json.RawMessage `json:"question,omitempty"`
 }
@@ -984,10 +987,10 @@ func (b *Board) start(t *Task, req actRequest) {
 		return
 	}
 	if err == nil {
-		t.Job.Session = t.ID + "-" + req.Action
+		t.Job.Session, t.Job.SessionID = t.ID+"-"+req.Action, newSessionID()
 		var dir string
 		if dir, err = b.dirFor(t); err == nil {
-			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, prompt)
+			t.Job.Pane, err = b.spawnSession(dir, t.ID, t.Job.Session, "--session-id", t.Job.SessionID, prompt)
 		}
 	}
 	if err != nil {
@@ -1003,20 +1006,34 @@ func (b *Board) start(t *Task, req actRequest) {
 	b.note(t, "claude", "session", fmt.Sprintf("Started session %q in %s: attach there, or on claude.ai/code (remote control).", t.Job.Session, where))
 }
 
-// spawnSession opens an interactive Claude Code session and returns its wezterm pane id ("" in another terminal).
+// newSessionID is a random (v4) UUID, the form Claude Code's --session-id takes.
+func newSessionID() string {
+	var u [16]byte
+	_, _ = rand.Read(u[:]) // crypto/rand never fails
+	u[6], u[8] = u[6]&0x0f|0x40, u[8]&0x3f|0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:])
+}
+
+// spawnSession opens an interactive Claude Code session and returns its wezterm pane id ("" in another terminal);
+// args end claude's argv: the session id to start or resume, and the prompt.
 // In wezterm the pane closes when Claude exits, so a live pane means a live session.
-func (b *Board) spawnSession(dir, id, name, prompt string) (string, error) {
+func (b *Board) spawnSession(dir, id, name string, args ...string) (string, error) {
 	// Its questions wait on the board (handleAsk) for up to a day; the task id is path-escaped, so it can't break the quotes.
-	ask := fmt.Sprintf("curl -s -X POST '%s/api/tasks/%s/ask' -H 'Content-Type: application/json' --data-binary @-", b.selfURL, url.PathEscape(id))
-	settings, err := json.Marshal(map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
-		"matcher": "AskUserQuestion", "hooks": []any{map[string]any{"type": "command", "command": ask, "timeout": 86400}}}}}})
+	post := func(path string) string {
+		return fmt.Sprintf("curl -s -X POST '%s/api/tasks/%s/%s' -H 'Content-Type: application/json' --data-binary @-", b.selfURL, url.PathEscape(id), path)
+	}
+	onSession := []any{map[string]any{"hooks": []any{map[string]any{"type": "command", "command": post("session")}}}}
+	settings, err := json.Marshal(map[string]any{"hooks": map[string]any{
+		"PreToolUse": []any{map[string]any{
+			"matcher": "AskUserQuestion", "hooks": []any{map[string]any{"type": "command", "command": post("ask"), "timeout": 86400}}}},
+		"StopFailure": onSession, "SessionEnd": onSession}})
 	if err != nil {
 		return "", fmt.Errorf("spawn: %w", err)
 	}
 	// zsh -lic gives the session the user's login env; the service's own PATH is bare.
 	// claude and the prompt reach zsh as "$0" and "$@", never as shell text.
-	session := []string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name,
-		"--settings", string(settings), prompt}
+	session := slices.Concat([]string{"zsh", "-lic", `exec "$0" "$@"`, b.claude, "--permission-mode", "auto", "--remote-control", name, "-n", name,
+		"--settings", string(settings)}, args)
 	if len(b.terminal) > 0 {
 		// shortcut: no pane to watch, so a session that dies without reporting keeps its task busy,
 		// and a terminal that stays our child dies with a board restart; track its process if another terminal gets real use.
@@ -1133,11 +1150,7 @@ func (b *Board) handleSay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 409, map[string]string{"error": "this task has no live session in wezterm"})
 		return
 	}
-	_, err := wezterm([]string{"cli", "send-text", "--pane-id", t.Job.Pane, "--", req.Text})
-	if err == nil {
-		_, err = wezterm([]string{"cli", "send-text", "--pane-id", t.Job.Pane, "--no-paste", "\r"})
-	}
-	if err != nil {
+	if err := sendText(t.Job.Pane, req.Text); err != nil {
 		writeJSON(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1149,13 +1162,36 @@ func (b *Board) handleSay(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, t)
 }
 
+// sendText types text into pane and submits it.
+func sendText(pane, text string) error {
+	_, err := wezterm([]string{"cli", "send-text", "--pane-id", pane, "--", text})
+	if err == nil {
+		_, err = wezterm([]string{"cli", "send-text", "--pane-id", pane, "--no-paste", "\r"})
+	}
+	return err
+}
+
+// maxRetries caps how often the board resumes or continues one job's session on its own.
+const maxRetries = 3
+
+// retryDelay is the wait before continuing a session after its first passing API error; it doubles with each retry.
+var retryDelay = time.Minute
+
+// passing are the StopFailure errors a retry can fix; the others (authentication_failed, billing_error,
+// invalid_request, ...) need Eugene.
+var passing = map[string]bool{"rate_limit": true, "overloaded": true, "server_error": true, "unknown": true}
+
+const resumePrompt = "The Brief Board resumed this session: its terminal closed before you reported back (a restart or a crash). " +
+	"Check what was already done (messages sent, commits, pushes, board updates) and carry on from there without repeating any of it; " +
+	"then report as asked."
+
 // busy reports whether t has a job still running; a session whose pane is gone ended without reporting,
-// and is marked failed so the buttons work again. Callers hold mu.
+// and is resumed, or else marked failed so the buttons work again. Callers hold mu.
 func (b *Board) busy(t *Task) bool {
 	if t.Job == nil || t.Job.Status != "running" {
 		return false
 	}
-	if t.Job.Pane == "" || paneAlive(t.Job.Pane) {
+	if t.Job.Pane == "" || paneAlive(t.Job.Pane) || b.resume(t) {
 		return true
 	}
 	now := time.Now()
@@ -1164,15 +1200,100 @@ func (b *Board) busy(t *Task) bool {
 	return false
 }
 
-// reapSessions fails every session job whose pane is gone, so the board corrects itself without waiting
+// resume reopens t's session in a new pane, up to maxRetries times a job; a session started before the board knew
+// session ids can't be. Callers hold mu.
+func (b *Board) resume(t *Task) bool {
+	j := t.Job
+	if j.SessionID == "" || j.Retries >= maxRetries {
+		return false
+	}
+	dir, err := b.dirFor(t)
+	pane := ""
+	if err == nil {
+		pane, err = b.spawnSession(dir, t.ID, j.Session, "--resume", j.SessionID, resumePrompt)
+	}
+	if err != nil {
+		b.note(t, "claude", "session", fmt.Sprintf("Could not resume session %q: %v", j.Session, err))
+		return false
+	}
+	j.Pane = pane
+	j.Retries++
+	b.note(t, "claude", "session", fmt.Sprintf("Session %q closed before reporting back; resumed it in wezterm pane %s.", j.Session, pane))
+	return true
+}
+
+// handleSessionHook takes a session's StopFailure and SessionEnd hooks (see spawnSession). A turn stopped by a passing
+// API error is continued after a backoff, up to maxRetries times a job; any other is noted for Eugene. Eugene exiting
+// the session ends its job, so it isn't resumed.
+func (b *Board) handleSessionHook(w http.ResponseWriter, r *http.Request) {
+	var hook struct {
+		Event  string `json:"hook_event_name"`
+		Reason string `json:"reason"`
+		Error  string `json:"error"`
+		Last   string `json:"last_assistant_message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil {
+		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id := r.PathValue("id")
+	t, ok := b.st.Tasks[id]
+	if !ok || t.Job == nil || t.Job.Status != "running" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	j := t.Job
+	switch {
+	case hook.Event == "SessionEnd" && (hook.Reason == "prompt_input_exit" || hook.Reason == "logout"):
+		now := time.Now()
+		j.Status, j.EndedAt = "stopped", &now
+		b.note(t, "claude", "session", fmt.Sprintf("Session %q was exited before reporting back.", j.Session))
+	case hook.Event == "StopFailure" && passing[hook.Error] && j.Retries < maxRetries:
+		// shortcut: a usage limit that resets hours away uses up the retries in minutes; read its reset time if that bites.
+		wait := retryDelay << j.Retries
+		j.Retries++
+		b.note(t, "claude", "session", fmt.Sprintf("Session %q stopped: %s. Continuing it in %s.", j.Session, cmp.Or(hook.Last, hook.Error), wait))
+		time.AfterFunc(wait, func() { b.continueSession(id, j) })
+	case hook.Event == "StopFailure":
+		b.note(t, "claude", "session", fmt.Sprintf("Session %q stopped: %s. It waits for you in its terminal.", j.Session, cmp.Or(hook.Last, hook.Error)))
+	default:
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := b.save(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// continueSession types "continue" into j's session, if j is still id's running job and its session is live.
+func (b *Board) continueSession(id string, j *Job) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if t, ok := b.st.Tasks[id]; !ok || t.Job != j || j.Status != "running" || !sessionPane(j) {
+		return
+	}
+	text := fmt.Sprintf("Continued session %q.", j.Session)
+	if err := sendText(j.Pane, "continue"); err != nil {
+		text = fmt.Sprintf("Could not continue session %q: %v", j.Session, err)
+	}
+	b.note(b.st.Tasks[id], "claude", "session", text)
+	b.saveOrLog()
+}
+
+// reapSessions resumes or fails every session job whose pane is gone, so the board corrects itself without waiting
 // for a button press on that task.
 func (b *Board) reapSessions() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	reaped := false
 	for _, t := range b.st.Tasks {
-		if t.Job != nil && t.Job.Status == "running" && t.Job.Pane != "" && !b.busy(t) {
-			reaped = true
+		if t.Job != nil && t.Job.Status == "running" && t.Job.Pane != "" {
+			pane := t.Job.Pane
+			reaped = !b.busy(t) || t.Job.Pane != pane || reaped
 		}
 	}
 	if reaped {
@@ -1300,6 +1421,7 @@ func (b *Board) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/tasks/{id}/ask", b.handleAsk)
 	mux.HandleFunc("POST /api/tasks/{id}/answer", b.handleAnswer)
 	mux.HandleFunc("POST /api/tasks/{id}/say", b.handleSay)
+	mux.HandleFunc("POST /api/tasks/{id}/session", b.handleSessionHook)
 	mux.HandleFunc("GET /api/settings", b.handleSettings)
 	mux.HandleFunc("PUT /api/settings", b.handleSaveSettings)
 	return mux
