@@ -522,7 +522,7 @@ async function refresh() {
     $("note").hidden = true; render();
     if (!$("log").hidden) loadLog();
   } catch (e) { $("note").hidden = false; $("note").textContent = "Can't reach the board server; what's shown may be out of date."; }
-  clearTimeout(poll); poll = setTimeout(refresh, state.tasks.some(running) ? 3000 : 15 * 60000);
+  clearTimeout(poll); poll = setTimeout(refresh, state.tasks.some(running) ? 3000 : 60000); // a minute: what the server closes on its own (a merged pull request) shows while you look
 }
 
 // Apply the task a write returned to the local data; the poll picks up everything else.
@@ -851,6 +851,8 @@ $("tab-tickets").addEventListener("click", () => { history.replaceState(null, ""
 $("tab-history").addEventListener("click", () => { history.replaceState(null, "", "#history"); showTab(); });
 showTab();
 refresh();
+// A background tab's timers are throttled, so coming back to it reads the board at once.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 </script>
 </body>
 </html>
