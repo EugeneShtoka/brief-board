@@ -271,7 +271,7 @@ func TestSpawnSessionTerminal(t *testing.T) {
 	dir := t.TempDir()
 	// The terminal gets the session as its argv, run in the task's folder.
 	b := &Board{claude: "claude", selfURL: "http://board", terminal: []string{"sh", "-c", `printf '%s\n' "$PWD" "$@" > args.tmp && mv args.tmp args`, "sh"}}
-	pane, err := b.spawnSession(dir, "t'1", "s1", "do it")
+	pane, err := b.spawnSession(dir, "t'1", "s1", "--session-id", "u1", "do it")
 	if err != nil || pane != "" {
 		t.Fatalf("spawnSession = %q, %v; want no pane, no error", pane, err)
 	}
@@ -282,9 +282,11 @@ func TestSpawnSessionTerminal(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	// Its questions go to the board: the hook posts them to the task, its id escaped out of the shell quotes.
-	settings := `{"hooks":{"PreToolUse":[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/ask' -H 'Content-Type: application/json' --data-binary @-","timeout":86400,"type":"command"}],"matcher":"AskUserQuestion"}]}}`
-	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--settings\n" + settings + "\ndo it\n"
+	// Its questions, API errors and exits go to the board: the hooks post them to the task, its id escaped out of the shell quotes.
+	session := `[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/session' -H 'Content-Type: application/json' --data-binary @-","type":"command"}]}]`
+	settings := `{"hooks":{"PreToolUse":[{"hooks":[{"command":"curl -s -X POST 'http://board/api/tasks/t%271/ask' -H 'Content-Type: application/json' --data-binary @-","timeout":86400,"type":"command"}],"matcher":"AskUserQuestion"}],` +
+		`"SessionEnd":` + session + `,"StopFailure":` + session + `}}`
+	want := dir + "\nzsh\n-lic\nexec \"$0\" \"$@\"\nclaude\n--permission-mode\nauto\n--remote-control\ns1\n-n\ns1\n--settings\n" + settings + "\n--session-id\nu1\ndo it\n"
 	if string(out) != want {
 		t.Errorf("terminal got\n%s\nwant\n%s", out, want)
 	}
@@ -417,6 +419,79 @@ func TestSessionSayAndStop(t *testing.T) {
 	}
 }
 
+func TestSessionHook(t *testing.T) {
+	dir := t.TempDir()
+	// A fake wezterm: pane 7 is t1's session; every other call is logged.
+	fake := "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[{\"pane_id\":7,\"title\":\"✳ t1-act\"}]'; else echo \"$@\" >> " + dir + "/calls; fi\n"
+	if err := os.WriteFile(filepath.Join(dir, "wezterm"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	retryDelay = 0
+	t.Cleanup(func() { retryDelay = time.Minute })
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b.st.Tasks = map[string]*Task{
+		"t1": {ID: "t1", Job: &Job{Action: "act", Status: "running", Session: "t1-act", Pane: "7"}},
+		"t2": {ID: "t2", Job: &Job{Action: "act", Status: "running", Session: "t2-act", Pane: "8"}},
+	}
+	mux := b.routes()
+	hook := func(id, body string) {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/tasks/"+id+"/session", strings.NewReader(body)))
+		if rec.Code != http.StatusNoContent {
+			t.Errorf("hook %s: %d", body, rec.Code)
+		}
+	}
+	calls := func() string {
+		b.mu.Lock() // continueSession writes under it
+		defer b.mu.Unlock()
+		out, _ := os.ReadFile(filepath.Join(dir, "calls"))
+		return string(out)
+	}
+	last := func(id string) string {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		h := b.st.Tasks[id].History
+		return h[len(h)-1].Text
+	}
+
+	// A passing API error is continued, maxRetries times.
+	for i := range maxRetries {
+		hook("t1", `{"hook_event_name":"StopFailure","error":"overloaded","last_assistant_message":"API Error: 529"}`)
+		want := strings.Repeat("cli send-text --pane-id 7 -- continue\ncli send-text --pane-id 7 --no-paste \r\n", i+1)
+		for range 100 {
+			if calls() == want {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if calls() != want {
+			t.Fatalf("retry %d typed %q, want %q", i+1, calls(), want)
+		}
+	}
+	hook("t1", `{"hook_event_name":"StopFailure","error":"overloaded","last_assistant_message":"API Error: 529"}`)
+	if got := last("t1"); got != `Session "t1-act" stopped: API Error: 529. It waits for you in its terminal.` {
+		t.Errorf("out of retries, noted %q", got)
+	}
+	// One a retry can't fix is only noted.
+	hook("t2", `{"hook_event_name":"StopFailure","error":"authentication_failed","last_assistant_message":"Login expired · Please run /login"}`)
+	if got := last("t2"); got != `Session "t2-act" stopped: Login expired · Please run /login. It waits for you in its terminal.` {
+		t.Errorf("auth error noted %q", got)
+	}
+	// A session killed with its pane goes on running (so it can be resumed); Eugene exiting it ends the job.
+	hook("t2", `{"hook_event_name":"SessionEnd","reason":"other"}`)
+	if got := b.st.Tasks["t2"].Job.Status; got != "running" {
+		t.Errorf("after SessionEnd other, job %q, want running", got)
+	}
+	hook("t2", `{"hook_event_name":"SessionEnd","reason":"prompt_input_exit"}`)
+	if got := b.st.Tasks["t2"].Job.Status; got != "stopped" {
+		t.Errorf("after /exit, job %q, want stopped", got)
+	}
+	if strings.Contains(calls(), "pane-id 8") {
+		t.Error("typed into t2's pane")
+	}
+}
+
 func TestHandleAttach(t *testing.T) {
 	dir := t.TempDir()
 	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
@@ -494,24 +569,36 @@ func TestHandleDelete(t *testing.T) {
 }
 
 func TestReapSessions(t *testing.T) {
-	// The mux lists pane 7 only.
+	// The mux lists pane 7 only; a spawn opens pane 21 and logs its argv.
 	bin := t.TempDir()
-	if err := os.WriteFile(filepath.Join(bin, "wezterm"), []byte("#!/bin/sh\necho '[{\"pane_id\":7}]'\n"), 0o700); err != nil {
+	fake := "#!/bin/sh\nif [ \"$2\" = spawn ]; then echo \"$@\" >> " + bin + "/spawned; echo 21; else echo '[{\"pane_id\":7}]'; fi\n"
+	if err := os.WriteFile(filepath.Join(bin, "wezterm"), []byte(fake), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	dir := t.TempDir()
-	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, claude: "claude", areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
 	b.st.Tasks = map[string]*Task{
-		"live": {ID: "live", Job: &Job{Action: "act", Status: "running", Session: "s1", Pane: "7"}},
-		"dead": {ID: "dead", Job: &Job{Action: "act", Status: "running", Session: "s2", Pane: "17"}},
+		"live":    {ID: "live", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s1", Pane: "7"}},
+		"dead":    {ID: "dead", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s2", Pane: "17"}},
+		"resumed": {ID: "resumed", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s3", SessionID: "u3", Pane: "18"}},
+		"retried": {ID: "retried", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s4", SessionID: "u4", Pane: "19", Retries: maxRetries}},
 	}
 	b.reapSessions()
 	if got := b.st.Tasks["live"].Job.Status; got != "running" {
 		t.Errorf("live pane's job = %q, want running", got)
 	}
-	if got := b.st.Tasks["dead"].Job.Status; got != "failed" {
-		t.Errorf("gone pane's job = %q, want failed", got)
+	// Without a session id, or out of retries, a gone pane's job fails; with one, its session is resumed by id.
+	for _, id := range []string{"dead", "retried"} {
+		if got := b.st.Tasks[id].Job.Status; got != "failed" {
+			t.Errorf("%s: gone pane's job = %q, want failed", id, got)
+		}
+	}
+	if j := b.st.Tasks["resumed"].Job; j.Status != "running" || j.Pane != "21" || j.Retries != 1 {
+		t.Errorf("resumed job = %+v, want running in pane 21, 1 retry", j)
+	}
+	if out, _ := os.ReadFile(filepath.Join(bin, "spawned")); !strings.Contains(string(out), "--resume u3 "+resumePrompt) || strings.Count(string(out), "spawn") != 1 {
+		t.Errorf("spawned %q, want one session resuming u3", out)
 	}
 	if _, err := os.Stat(b.path); err != nil {
 		t.Errorf("reaping did not save: %v", err)
@@ -940,5 +1027,71 @@ func TestPromptSendsOnlyItsRule(t *testing.T) {
 	}
 	if !strings.Contains(actionRules["trigger"], actRule) {
 		t.Error("a trigger's session lacks act's rules")
+	}
+}
+
+func TestHandleCombine(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	day := time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)
+	gonePath := filepath.Join(dir, "files", "new", "a.txt")
+	b.st.Tasks = map[string]*Task{
+		"old": {ID: "old", Title: "Old", Summary: "first", Tags: []string{"x"}, Who: "Bar Levi",
+			Files:   []string{filepath.Join(dir, "files", "old", "a.txt")},
+			History: []Entry{{At: day, Kind: "created"}, {At: day.Add(2 * time.Hour), Kind: "note"}}},
+		"new": {ID: "new", Title: "New", Summary: "second", Tags: []string{"x", "y"}, Who: "Dana Cohen", Jira: []string{"BE-1"},
+			Files:   []string{gonePath},
+			History: []Entry{{At: day.Add(time.Hour), Kind: "created"}}},
+		"busy": {ID: "busy", History: []Entry{{At: day.Add(3 * time.Hour)}}, Job: &Job{Action: "act", Status: "running"}},
+	}
+	for _, f := range []string{b.st.Tasks["old"].Files[0], gonePath} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte(f), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/tasks/{id}/combine", b.handleCombine)
+	combine := func(id, with string) int {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), "POST", "/api/tasks/"+id+"/combine", strings.NewReader(`{"with":"`+with+`"}`)))
+		return rec.Code
+	}
+	// Pressed on the newer task: the older one still stays.
+	if code := combine("new", "old"); code != 200 {
+		t.Fatalf("combine: %d", code)
+	}
+	if _, ok := b.st.Tasks["new"]; ok {
+		t.Error("the newer task is still on the board")
+	}
+	got := b.st.Tasks["old"]
+	moved := filepath.Join(dir, "files", "old", "new-a.txt")
+	if data, err := os.ReadFile(moved); err != nil || string(data) != gonePath {
+		t.Errorf("moved file: %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Dir(gonePath)); !os.IsNotExist(err) {
+		t.Errorf("files/new still there: %v", err)
+	}
+	kinds := make([]string, 0, len(got.History))
+	for _, e := range got.History {
+		kinds = append(kinds, e.Kind)
+	}
+	if want := []string{"created", "created", "note", "combine"}; !slices.Equal(kinds, want) {
+		t.Errorf("history kinds = %v, want %v", kinds, want)
+	}
+	if got.Summary != "first\n\n**New**: second" || !slices.Equal(got.Tags, []string{"x", "y"}) || !slices.Equal(got.Jira, []string{"BE-1"}) ||
+		got.Who != "Bar Levi, Dana Cohen" || len(got.Files) != 2 || got.Files[1] != moved {
+		t.Errorf("combined task = %+v", got)
+	}
+	if code := combine("old", "busy"); code != 409 || b.st.Tasks["busy"] == nil {
+		t.Errorf("a newer task Claude works on: %d, want 409 and kept", code)
+	}
+	if code := combine("old", "old"); code != 400 {
+		t.Errorf("with itself: %d, want 400", code)
+	}
+	if code := combine("old", "nope"); code != 404 {
+		t.Errorf("unknown task: %d, want 404", code)
 	}
 }

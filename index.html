@@ -82,7 +82,7 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 .card { all: unset; box-sizing: border-box; -webkit-user-drag: element; /* all: unset clears it, and Chromium then never starts a drag */ cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.625rem 0.75rem; display: grid; gap: 0.375rem; min-width: 0; }
 .card:hover { border-color: var(--accent); }
 .lanes { align-items: stretch; } .lane { align-content: start; border-radius: 0.5rem; }
-.lane.drop { outline: 0.125rem dashed var(--accent); outline-offset: 0.25rem; }
+.lane.drop, .card.drop { outline: 0.125rem dashed var(--accent); outline-offset: 0.25rem; }
 .card:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
 .card.urgent { border-left: 0.1875rem solid var(--crit); }
 .card.closed .title { color: var(--muted); }
@@ -157,6 +157,13 @@ textarea:focus, input:focus { outline: 0.125rem solid var(--accent); outline-off
 .btn:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); }
 .btn.danger { color: var(--crit); }
+/* Close, Drop and Delete: one split button, the likeliest up front and the other two in its menu, which opens upward from the dialog's foot. */
+.split { position: relative; display: inline-flex; }
+.split > .btn { border-radius: 0.5rem 0 0 0.5rem; }
+.split summary { list-style: none; border-left: 0; border-radius: 0 0.5rem 0.5rem 0; padding-inline: 0.5rem; }
+.split summary::-webkit-details-marker { display: none; }
+.split .menu { position: absolute; z-index: 10; bottom: calc(100% + 0.25rem); left: 0; display: grid; gap: 0.25rem; padding: 0.25rem; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; box-shadow: 0 0.5rem 1.5rem rgb(10 14 24 / .2); }
+.split details:not([open]) .menu { display: none; }
 .btn:disabled { opacity: .5; cursor: not-allowed; }
 .hint { font-size: 0.75rem; color: var(--muted); }
 .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: center; justify-content: space-between; }
@@ -246,8 +253,10 @@ const put = (el, html) => { if (el._html !== html) { el._html = html; el.innerHT
 
 const closed = (t) => t.status === "done" || t.status === "dropped";
 const running = (t) => t.job && t.job.status === "running";
+const closedToday = (t) => t.doneAt && ymd(new Date(t.doneAt)) === today;
+// Closed shows today's closed tasks, and while searching every closed task that matches, so an old one can be found.
 function laneOf(t) {
-  if (closed(t)) return t.doneAt && ymd(new Date(t.doneAt)) === today ? "closed" : null;
+  if (closed(t)) return closedToday(t) || terms().length ? "closed" : null;
   return t.status === "doing" || t.status === "waiting" ? t.status : "todo";
 }
 // Areas come from the server (BOARD_AREAS); work holds anything unmarked.
@@ -298,7 +307,7 @@ function pills(t) {
   if (running(t)) out.push(`<span class="pill run">Claude: ${esc(t.job.action)}…</span>`);
   else if (t.job && t.job.status === "failed") out.push(`<span class="pill crit">${esc(t.job.action)} failed</span>`);
   if (preQa(t).length) out.push(`<span class="pill warn">Jira not in QA</span>`);
-  if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + hm(t.doneAt) : ""}</span>`);
+  if (closed(t)) out.push(`<span class="pill ${t.status === "done" ? "ok" : ""}">${t.status}${t.doneAt ? " " + (closedToday(t) ? "" : dm(t.doneAt) + " ") + hm(t.doneAt) : ""}</span>`);
   else if (carried(t) > 0) out.push(`<span class="pill ${carried(t) >= 3 ? "crit" : ""}">carried ${carried(t)}d</span>`);
   if (t.who || t.waitingFor) out.push(`<span>${esc([t.who, t.waitingFor].filter(Boolean).join(": "))}</span>`);
   return out.join("");
@@ -320,19 +329,20 @@ function render() {
   }).filter(Boolean).join(" · ") || "all"));
   for (const k in by) by[k].sort((a, b) => k === "closed" ? String(b.doneAt).localeCompare(String(a.doneAt))
     : (a.urgency === "high" ? 0 : 1) - (b.urgency === "high" ? 0 : 1) || (a.order ?? 99) - (b.order ?? 99));
-  put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${label} <span class="count">${by[k].length}</span></h2>${
+  const searching = terms().length > 0;
+  put($("lanes"), LANES.map(([k, label]) => `<section class="lane" data-lane="${k}"><h2>${k === "closed" && searching ? "Closed" : label} <span class="count">${by[k].length}</span></h2>${
     // A div, not a <button>: Firefox won't drag buttons.
     by[k].map((t) => `<div class="card ${t.urgency === "high" && !closed(t) ? "urgent" : ""} ${closed(t) ? "closed" : ""} ${t.status === "dropped" ? "dropped" : ""}" role="button" tabindex="0" draggable="true" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span><span class="meta">${pills(t)}</span></div>`).join("")
-    || `<div class="empty">${k === "closed" ? "Nothing closed yet today." : "Empty."}</div>`}</section>`).join(""));
+    || `<div class="empty">${k === "closed" ? searching ? "No closed task matches." : "Nothing closed yet today." : "Empty."}</div>`}</section>`).join(""));
 
-  const total = by.todo.length + by.doing.length + by.waiting.length + by.closed.length;
-  put($("pnum"), `${by.closed.length} / ${total} <small>closed today</small>`);
-  $("pbar").style.width = total ? `${(100 * by.closed.length) / total}%` : "0";
+  const done = by.closed.filter(closedToday).length, total = by.todo.length + by.doing.length + by.waiting.length + done;
+  put($("pnum"), `${done} / ${total} <small>closed today</small>`);
+  $("pbar").style.width = total ? `${(100 * done) / total}%` : "0";
   const days = [...Array(7)].map((_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); return ymd(d); });
   const counts = days.map((d) => state.tasks.filter(visible).filter((t) => t.doneAt && ymd(new Date(t.doneAt)) === d).length), max = Math.max(1, ...counts);
   put($("week"), days.map((d, i) => `<div title="${dm(d)}: ${counts[i]} closed"><i class="${d === today ? "today" : ""}" style="height:${(1.875 * counts[i]) / max}rem"></i><b>${["Su","Mo","Tu","We","Th","Fr","Sa"][new Date(d + "T12:00").getDay()]}</b></div>`).join(""));
 
-  $("n-tickets").textContent = total - by.closed.length;
+  $("n-tickets").textContent = total - done;
   $("n-history").textContent = [...state.tasks.filter(visible).flatMap((t) => t.history || []), ...(filtering() ? [] : state.log || [])].filter((e) => ymd(new Date(e.at)) === today).length || "";
 
   const b = state.brief || {};
@@ -378,7 +388,8 @@ function renderDialog(fresh) {
       <label for="f-comment">Guidance for Claude (optional: what to do, or what to find out)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
       ${filesField("Files for Claude, attached when you press a button")}
       <div class="btns" id="d-btns"></div>
-      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history. Send to the session types the guidance into it; Close, Drop and Delete stop it.</div>
+      <div class="tagrow" id="d-comb" hidden><label for="f-comb">Combine with<select id="f-comb"></select></label><button type="button" class="btn" id="f-comb-go">Combine</button></div>
+      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history. Send to the session types the guidance into it; Close, Drop and Delete stop it. Combine (or dropping a card on another) keeps the older task and moves the newer one's history, story and files into it.</div>
       <div class="err" id="f-err" hidden></div>
     </div>`; }
   // A wezterm session stays open after its report, for Eugene to steer; the board learns it ended only when told.
@@ -411,9 +422,16 @@ function renderDialog(fresh) {
     <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
     ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
     ${live ? `<button class="btn" data-act="say">Send to the session</button>` : ""}
-    <button class="btn" data-act="close" ${t.status === "done" ? "disabled" : ""}>Close</button>
-    <button class="btn danger" data-act="drop" ${t.status === "dropped" ? "disabled" : ""}>Drop</button>
-    <button class="btn danger" data-act="delete">Delete</button>`);
+    <button class="btn" data-act="combine">Combine…</button>
+    ${endButton(t)}`);
+}
+// Close for a task still open, Delete for one already closed; the other two are a click away in the menu.
+function endButton(t) {
+  const ends = { close: ["Close", t.status === "done"], drop: ["Drop", t.status === "dropped"], delete: ["Delete", false] };
+  const first = closed(t) ? "delete" : "close";
+  const btn = (k) => `<button class="btn ${k === "close" ? "" : "danger"}" data-act="${k}" ${ends[k][1] ? "disabled" : ""}>${ends[k][0]}</button>`;
+  return `<span class="split">${btn(first)}<details><summary class="btn" aria-label="More ways to end the task">▾</summary><div class="menu">${
+    Object.keys(ends).filter((k) => k !== first).map(btn).join("")}</div></details></span>`;
 }
 
 // A question the task's session waits on (handleAsk): each one's options, and Eugene's own words in place of them.
@@ -542,15 +560,24 @@ $("lanes").addEventListener("click", (e) => {
   const c = e.target.closest(".card"); if (!c) return;
   openId = c.dataset.id; renderDialog(true); $("dlg").showModal();
 });
-// Drag a card to another lane to change its status (desktop only; HTML5 drag events don't fire on touch).
+// Drag a card to another lane to change its status, or onto another card to combine the two (desktop only; HTML5 drag events don't fire on touch).
 const LANE_STATUS = { todo: "todo", doing: "doing", waiting: "waiting", closed: "done" };
-$("lanes").addEventListener("dragstart", (e) => { const c = e.target.closest(".card"); if (c) e.dataTransfer.setData("text/plain", c.dataset.id); });
-$("lanes").addEventListener("dragover", (e) => { const l = e.target.closest(".lane"); if (!l) return; e.preventDefault(); l.classList.add("drop"); });
+let dragId = null; // dataTransfer can't be read during dragover
+const unmark = () => document.querySelectorAll("#lanes .drop").forEach((x) => x.classList.remove("drop"));
+$("lanes").addEventListener("dragstart", (e) => { const c = e.target.closest(".card"); if (c) { dragId = c.dataset.id; e.dataTransfer.setData("text/plain", c.dataset.id); } });
+$("lanes").addEventListener("dragend", () => { dragId = null; unmark(); });
+$("lanes").addEventListener("dragover", (e) => {
+  const l = e.target.closest(".lane"); if (!l) return; e.preventDefault();
+  const c = e.target.closest(".card"), onto = c && c.dataset.id !== dragId ? c : null;
+  if (!(onto || l).classList.contains("drop")) { unmark(); (onto || l).classList.add("drop"); }
+});
 $("lanes").addEventListener("dragleave", (e) => { const l = e.target.closest(".lane"); if (l && !l.contains(e.relatedTarget)) l.classList.remove("drop"); });
 $("lanes").addEventListener("drop", async (e) => {
   const l = e.target.closest(".lane"); if (!l) return;
-  e.preventDefault(); l.classList.remove("drop");
-  const t = state.tasks.find((x) => x.id === e.dataTransfer.getData("text/plain"));
+  e.preventDefault(); unmark();
+  const c = e.target.closest(".card"), id = e.dataTransfer.getData("text/plain");
+  if (c && c.dataset.id !== id) return combine(id, c.dataset.id);
+  const t = state.tasks.find((x) => x.id === id);
   if (!t || laneOf(t) === l.dataset.lane) return;
   const r = await fetch(`api/tasks/${encodeURIComponent(t.id)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: LANE_STATUS[l.dataset.lane] }) }).catch(() => null);
   if (!r || !r.ok) { $("note").hidden = false; $("note").textContent = `Couldn't move “${t.title}”.`; return; }
@@ -568,9 +595,12 @@ $("dlg").addEventListener("click", (e) => {
   if (e.target.id === "s-add") return editProjects((ps) => ps.push({}));
   const rp = e.target.closest("[data-unproj]");
   if (rp) return removeProject(+rp.dataset.unproj);
+  if (e.target.id === "f-comb-go") return combine(openId, $("f-comb").value);
   const f = e.target.closest("[data-unfile]");
   if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
   const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
+  b.closest("details")?.removeAttribute("open");
+  if (b.dataset.act === "combine") return pickCombine();
   if (b.dataset.act === "close") return closeTask();
   if (b.dataset.act === "delete") return deleteTask();
   if (b.dataset.act === "say") return say();
@@ -581,6 +611,24 @@ async function closeTask() {
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "done" }) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't close the task."; return; }
   apply(r);
+}
+// Combine… lists the other tasks on the board to pick the one to combine with.
+function pickCombine() {
+  const others = state.tasks.filter((x) => x.id !== openId && laneOf(x)).sort((a, b) => a.title.localeCompare(b.title));
+  $("f-comb").innerHTML = others.map((x) => `<option value="${esc(x.id)}">${esc(x.title)}</option>`).join("");
+  $("d-comb").hidden = false; $("f-comb").focus();
+}
+// Combine folds the newer of two tasks into the older one (handleCombine), so it asks first; an open dialog then shows the one that stays.
+async function combine(id, withId) {
+  const a = state.tasks.find((x) => x.id === id), c = state.tasks.find((x) => x.id === withId);
+  if (!a || !c || !confirm(`Combine “${a.title}” and “${c.title}”? The older one stays and takes the newer one's history, story and files; the newer one is removed.`)) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(id)}/combine`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ with: withId }) }).catch(() => null);
+  const err = $("dlg").open ? $("f-err") : $("note");
+  if (!r || !r.ok) { err.hidden = false; err.textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't combine the tasks."; return; }
+  const t = await r.json();
+  state.tasks = [...state.tasks.filter((x) => x.id !== id && x.id !== withId), t];
+  if ($("dlg").open) { openId = t.id; renderDialog(true); }
+  render();
 }
 // Delete removes the task and its files for good, so it asks first.
 async function deleteTask() {
@@ -675,8 +723,8 @@ $("filter-menu").addEventListener("click", (e) => {
   hide[dim] = b.dataset.to === "all" ? [] : filterOpts().find(([d]) => d === dim)[2].map(([v]) => v).filter((v) => v !== b.dataset.v);
   setFilter();
 });
-// The dropdown closes on a click outside it and on Escape.
-document.addEventListener("click", (e) => { if (!$("filter").contains(e.target)) $("filter").open = false; });
+// A dropdown (the filter, a task's Close/Drop/Delete menu) closes on a click outside it; the filter also on Escape.
+document.addEventListener("click", (e) => { for (const d of document.querySelectorAll("details[open]")) if (!d.contains(e.target)) d.open = false; });
 $("filter").addEventListener("keydown", (e) => { if (e.key === "Escape" && $("filter").open) { $("filter").open = false; $("filter-sum").focus(); } });
 // The theme is kept per browser; "" follows the system's light or dark.
 function setTheme(t) {
