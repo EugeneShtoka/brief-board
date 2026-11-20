@@ -731,6 +731,7 @@ func TestLinkPulls(t *testing.T) {
 func TestEndsWithPulls(t *testing.T) {
 	for w, want := range map[string]bool{
 		"": true, "PR review": true, "PR #27 review": true, "pull request merge": true,
+		"review of #618 (part 1) and stacked #620 (WhatsApp media retry)": true, "merge of #12": true,
 		"prod deploy of release #1034, then re-time a finished match": false,
 		"Bar/Polina: OK to pay + #1024 re-review":                     false,
 	} {

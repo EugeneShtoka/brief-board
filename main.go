@@ -1122,7 +1122,7 @@ func (b *Board) prompt(t *Task, req actRequest) (string, error) {
 		sb.WriteString("Eugene attached files to this task (task.files): read them, they are part of it.\n")
 	}
 	fmt.Fprintf(&sb, "\nWhat to do: %s\n\nKeep the board current while you work (JSON body, fields merge):\n"+
-		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\",\"waitingFor\":\"PR review\"}'   # todo|doing|waiting|done|dropped; waitingFor: what who owes\n"+
+		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"status\":\"waiting\",\"waitingFor\":\"PR review\"}'   # todo|doing|waiting|done|dropped; waitingFor: what who owes; start it with \"PR review\" when that is all, and the merge closes the task\n"+
 		"  curl -s -X PUT %[2]s/api/tasks/%[3]s -H 'Content-Type: application/json' -d '{\"summary\":\"...\"}'    # when the story changed\n",
 		actionRules[req.Action], b.selfURL, t.ID)
 	if req.Action == "update" {
