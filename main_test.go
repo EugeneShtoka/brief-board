@@ -386,14 +386,11 @@ func TestSessionSayAndStop(t *testing.T) {
 	}
 	calls := func() string { out, _ := os.ReadFile(filepath.Join(dir, "calls")); return string(out) }
 
-	if code := do(http.MethodPost, "/api/tasks/t1/say", `{"text":"-also check the tests"}`); code != 200 {
-		t.Fatalf("say: %d", code)
+	if code := do(http.MethodPost, "/api/tasks/t1/act", `{"action":"act","comment":"-also check the tests"}`); code != 200 {
+		t.Fatalf("act while Claude works: %d", code)
 	}
 	if want := "cli send-text --pane-id 7 -- -also check the tests\ncli send-text --pane-id 7 --no-paste \r\n"; calls() != want {
-		t.Errorf("say typed %q, want %q", calls(), want)
-	}
-	if code := do(http.MethodPost, "/api/tasks/t2/say", `{"text":"x"}`); code != 409 {
-		t.Errorf("say into a pane that is no longer the session's: %d, want 409", code)
+		t.Errorf("act while Claude works typed %q, want %q", calls(), want)
 	}
 
 	do(http.MethodPut, "/api/tasks/t1", `{"status":"done"}`)
@@ -411,6 +408,61 @@ func TestSessionSayAndStop(t *testing.T) {
 	}
 	if code := do(http.MethodDelete, "/api/tasks/t3", ""); code != 200 || !strings.HasSuffix(calls(), "cli kill-pane --pane-id 9\n") {
 		t.Errorf("delete while Claude works: %d, calls %q; want 200 and pane 9 killed", code, calls())
+	}
+}
+
+func TestActKeepsOneSession(t *testing.T) {
+	dir := t.TempDir()
+	// A fake wezterm: panes 7 and 9 are a's and d's open sessions, pane 8 a pane that took e's old id; spawn opens pane 42.
+	fake := "#!/bin/sh\nif [ \"$2\" = list ]; then echo '[{\"pane_id\":7,\"title\":\"✳ a-act\"},{\"pane_id\":8,\"title\":\"zsh\"},{\"pane_id\":9,\"title\":\"✳ d-act\"}]'; exit; fi\n" +
+		"echo \"$@\" >> " + dir + "/calls\nif [ \"$2\" = spawn ]; then echo 42; fi\n"
+	if err := os.WriteFile(filepath.Join(dir, "wezterm"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir, claude: "claude", areas: []Area{{ID: "work", Name: "Work", Dir: dir}}}
+	b.st.Tasks = map[string]*Task{
+		"a": {ID: "a", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "a-act", Pane: "7", SessionID: "id-a"}},
+		"b": {ID: "b", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "b-act", SessionID: "id-b"}},
+		"c": {ID: "c", Area: "work"},
+		"d": {ID: "d", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "d-act", Pane: "9", SessionID: "id-d"}},
+		"e": {ID: "e", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "e-act", Pane: "8"}},
+	}
+	mux := b.routes()
+	act := func(id, body string) (int, string) {
+		_ = os.Remove(filepath.Join(dir, "calls"))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/tasks/"+id+"/act", strings.NewReader(body)))
+		out, _ := os.ReadFile(filepath.Join(dir, "calls"))
+		return rec.Code, string(out)
+	}
+
+	// Its session is open: the new round is typed into it.
+	if code, calls := act("a", `{"action":"act"}`); code != 200 || !strings.HasPrefix(calls, "cli send-text --pane-id 7 -- Eugene pressed") || strings.Contains(calls, "spawn") {
+		t.Errorf("a: %d, calls %q; want the prompt typed into pane 7", code, calls)
+	}
+	if j := b.st.Tasks["a"].Job; j.Status != "running" || j.Pane != "7" || j.SessionID != "id-a" {
+		t.Errorf("a's job = %+v, want running in pane 7 on id-a", j)
+	}
+	// Its session closed: it is resumed.
+	if code, calls := act("b", `{"action":"act"}`); code != 200 || !strings.Contains(calls, " --resume id-b ") {
+		t.Errorf("b: %d, calls %q; want a spawn resuming id-b", code, calls)
+	}
+	if j := b.st.Tasks["b"].Job; j.Pane != "42" || j.SessionID != "id-b" {
+		t.Errorf("b's job = %+v, want pane 42 on id-b", j)
+	}
+	// No session yet: a new one, with an id of its own.
+	if code, calls := act("c", `{"action":"act"}`); code != 200 || !strings.Contains(calls, " --session-id "+b.st.Tasks["c"].Job.SessionID+" ") || len(b.st.Tasks["c"].Job.SessionID) != 36 {
+		t.Errorf("c: %d, calls %q, id %q; want a spawn with a new session id", code, calls, b.st.Tasks["c"].Job.SessionID)
+	}
+	// Fresh: the open session is stopped and a new one started.
+	code, calls := act("d", `{"action":"act","fresh":true}`)
+	if id := b.st.Tasks["d"].Job.SessionID; code != 200 || !strings.HasPrefix(calls, "cli kill-pane --pane-id 9\n") || id == "id-d" || !strings.Contains(calls, " --session-id "+id+" ") {
+		t.Errorf("d: %d, calls %q; want pane 9 killed and a new session", code, calls)
+	}
+	// Claude works, but pane 8 is no longer its session: nothing to add to.
+	if code, calls := act("e", `{"action":"act","comment":"x"}`); code != 409 || calls != "" {
+		t.Errorf("e: %d, calls %q; want 409 and nothing typed", code, calls)
 	}
 }
 
@@ -564,9 +616,10 @@ func TestHandleDelete(t *testing.T) {
 }
 
 func TestReapSessions(t *testing.T) {
-	// The mux lists pane 7 only; a spawn opens pane 21 and logs its argv.
+	// The mux lists panes 7, 8 and 9, where 9 took an old session's id; a spawn opens pane 21 and logs its argv.
 	bin := t.TempDir()
-	fake := "#!/bin/sh\nif [ \"$2\" = spawn ]; then echo \"$@\" >> " + bin + "/spawned; echo 21; else echo '[{\"pane_id\":7}]'; fi\n"
+	list := `[{"pane_id":7,"title":"✳ s1"},{"pane_id":8,"title":"✳ s5"},{"pane_id":9,"title":"zsh"}]`
+	fake := "#!/bin/sh\nif [ \"$2\" = spawn ]; then echo \"$@\" >> " + bin + "/spawned; echo 21; else echo '" + list + "'; fi\n"
 	if err := os.WriteFile(filepath.Join(bin, "wezterm"), []byte(fake), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -578,6 +631,9 @@ func TestReapSessions(t *testing.T) {
 		"dead":    {ID: "dead", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s2", Pane: "17"}},
 		"resumed": {ID: "resumed", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s3", SessionID: "u3", Pane: "18"}},
 		"retried": {ID: "retried", Area: "work", Job: &Job{Action: "act", Status: "running", Session: "s4", SessionID: "u4", Pane: "19", Retries: maxRetries}},
+		"open":    {ID: "open", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "s5", Pane: "8"}},
+		"shut":    {ID: "shut", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "s6", Pane: "28"}},
+		"took":    {ID: "took", Area: "work", Job: &Job{Action: "act", Status: "ok", Session: "s7", Pane: "9"}},
 	}
 	b.reapSessions()
 	if got := b.st.Tasks["live"].Job.Status; got != "running" {
@@ -594,6 +650,12 @@ func TestReapSessions(t *testing.T) {
 	}
 	if out, _ := os.ReadFile(filepath.Join(bin, "spawned")); !strings.Contains(string(out), "--resume u3 "+resumePrompt) || strings.Count(string(out), "spawn") != 1 {
 		t.Errorf("spawned %q, want one session resuming u3", out)
+	}
+	// An ended job keeps its pane while its session is open there, and forgets it once the session closed.
+	for id, want := range map[string]string{"open": "8", "shut": "", "took": ""} {
+		if got := b.st.Tasks[id].Job.Pane; got != want {
+			t.Errorf("%s's pane = %q, want %q", id, got, want)
+		}
 	}
 	if _, err := os.Stat(b.path); err != nil {
 		t.Errorf("reaping did not save: %v", err)
