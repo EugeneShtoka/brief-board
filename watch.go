@@ -902,10 +902,10 @@ func (b *Board) settle(id string, pulls []ghPull) {
 	b.saveOrLog()
 }
 
-var reviewRe = regexp.MustCompile(`(?i)^(PR|pull request)\b`)
+var reviewRe = regexp.MustCompile(`(?i)^(PR|pull request|review|merge)\b`)
 
 // endsWithPulls is whether what a waiting task waits for ends with its pull requests: nothing, or their
-// review ("PR review", "PR #27 review"). Anything else (a deploy, an answer, a check on prod) keeps the
+// review ("PR review", "PR #27 review", "review of #618 and #620"). Anything else (a deploy, an answer, a check on prod) keeps the
 // task open once they merge.
 func endsWithPulls(waitingFor string) bool {
 	return waitingFor == "" || reviewRe.MatchString(waitingFor)
