@@ -151,9 +151,9 @@ func (b *Board) kithBack(lastOK time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var ids []string
-	for _, a := range b.areas {
-		if b.lastBrief(a.ID).After(lastOK) {
-			ids = append(ids, a.ID)
+	for i := range b.areas {
+		if id := b.areas[i].ID; b.lastBrief(id).After(lastOK) {
+			ids = append(ids, id)
 		}
 	}
 	if len(ids) == 0 {

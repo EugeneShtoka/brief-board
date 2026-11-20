@@ -44,7 +44,7 @@ next to the state file, which wins over the environment; saving them restarts th
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `BOARD_AREAS` | required | JSON list of areas: `{"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery"}` |
+| `BOARD_AREAS` | required | JSON list of areas: `{"id", "name", "dir", "roadmap", "jiraRoom", "briefEvery", "issueUrl", "prUrl"}`; the settings form edits it field by field |
 | `BOARD_ADDR` | `:8787` | Listen address |
 | `BOARD_STATE` | `~/.local/state/brief-board/state.json` | State file; logs and `settings.json` live next to it |
 | `BOARD_URL` | `http://localhost` + `BOARD_ADDR` | How sessions reach the board |
@@ -56,7 +56,7 @@ next to the state file, which wins over the environment; saving them restarts th
 | `BOARD_KITH_MCP` | `kith-mcp` | The kith MCP server command |
 | `BOARD_GITHUB_POLL` | off | How often to read GitHub notifications |
 | `BOARD_ISSUE_KEY` | `\b[A-Z][A-Z0-9]+-\d+\b` | Issue key pattern in the Jira feed and GitHub |
-| `BOARD_ISSUE_URL`, `BOARD_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page |
+| `BOARD_ISSUE_URL`, `BOARD_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page, for areas without `issueUrl` / `prUrl` |
 | `BOARD_CLEAN_MERGED` | off | `1`: a task done with a merged pull request closes its session and removes the worktree |
 
 The comment at the top of `main.go` documents each one in full.
