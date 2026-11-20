@@ -82,7 +82,7 @@ h1 { font: 700 1.75rem/1.15 var(--display); margin: 0.125rem 0 0.375rem; text-wr
 .card { all: unset; box-sizing: border-box; -webkit-user-drag: element; /* all: unset clears it, and Chromium then never starts a drag */ cursor: pointer; background: var(--surface); border: 1px solid var(--line); border-radius: 0.5rem; padding: 0.625rem 0.75rem; display: grid; gap: 0.375rem; min-width: 0; }
 .card:hover { border-color: var(--accent); }
 .lanes { align-items: stretch; } .lane { align-content: start; border-radius: 0.5rem; }
-.lane.drop { outline: 0.125rem dashed var(--accent); outline-offset: 0.25rem; }
+.lane.drop, .card.drop { outline: 0.125rem dashed var(--accent); outline-offset: 0.25rem; }
 .card:focus-visible { outline: 0.125rem solid var(--accent); outline-offset: 0.125rem; }
 .card.urgent { border-left: 0.1875rem solid var(--crit); }
 .card.closed .title { color: var(--muted); }
@@ -373,7 +373,8 @@ function renderDialog(fresh) {
       <label for="f-comment">Guidance for Claude (optional: what to do, or what to find out)<textarea id="f-comment" placeholder="e.g. keep it short, mention the 2112 decision, answer in Hebrew"></textarea></label>
       ${filesField("Files for Claude, attached when you press a button")}
       <div class="btns" id="d-btns"></div>
-      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history. Send to the session types the guidance into it; Close, Drop and Delete stop it.</div>
+      <div class="tagrow" id="d-comb" hidden><label for="f-comb">Combine with<select id="f-comb"></select></label><button type="button" class="btn" id="f-comb-go">Combine</button></div>
+      <div class="hint">Reply sends right away. Act opens a Claude session on this task (wezterm, or claude.ai/code); its questions show here to answer, its report lands in the history. Send to the session types the guidance into it; Close, Drop and Delete stop it. Combine (or dropping a card on another) keeps the older task and moves the newer one's history, story and files into it.</div>
       <div class="err" id="f-err" hidden></div>
     </div>`; }
   // A wezterm session stays open after its report, for Eugene to steer; the board learns it ended only when told.
@@ -406,6 +407,7 @@ function renderDialog(fresh) {
     <button class="btn ${t.who ? "" : "primary"}" data-act="act" ${busy ? "disabled" : ""}>Act</button>
     ${late.map((k) => `<button class="btn primary" data-act="qa" data-key="${esc(k)}" ${busy ? "disabled" : ""}>Move ${esc(k)} to QA</button>`).join("")}
     ${live ? `<button class="btn" data-act="say">Send to the session</button>` : ""}
+    <button class="btn" data-act="combine">Combine…</button>
     <button class="btn" data-act="close" ${t.status === "done" ? "disabled" : ""}>Close</button>
     <button class="btn danger" data-act="drop" ${t.status === "dropped" ? "disabled" : ""}>Drop</button>
     <button class="btn danger" data-act="delete">Delete</button>`);
@@ -537,15 +539,24 @@ $("lanes").addEventListener("click", (e) => {
   const c = e.target.closest(".card"); if (!c) return;
   openId = c.dataset.id; renderDialog(true); $("dlg").showModal();
 });
-// Drag a card to another lane to change its status (desktop only; HTML5 drag events don't fire on touch).
+// Drag a card to another lane to change its status, or onto another card to combine the two (desktop only; HTML5 drag events don't fire on touch).
 const LANE_STATUS = { todo: "todo", doing: "doing", waiting: "waiting", closed: "done" };
-$("lanes").addEventListener("dragstart", (e) => { const c = e.target.closest(".card"); if (c) e.dataTransfer.setData("text/plain", c.dataset.id); });
-$("lanes").addEventListener("dragover", (e) => { const l = e.target.closest(".lane"); if (!l) return; e.preventDefault(); l.classList.add("drop"); });
+let dragId = null; // dataTransfer can't be read during dragover
+const unmark = () => document.querySelectorAll("#lanes .drop").forEach((x) => x.classList.remove("drop"));
+$("lanes").addEventListener("dragstart", (e) => { const c = e.target.closest(".card"); if (c) { dragId = c.dataset.id; e.dataTransfer.setData("text/plain", c.dataset.id); } });
+$("lanes").addEventListener("dragend", () => { dragId = null; unmark(); });
+$("lanes").addEventListener("dragover", (e) => {
+  const l = e.target.closest(".lane"); if (!l) return; e.preventDefault();
+  const c = e.target.closest(".card"), onto = c && c.dataset.id !== dragId ? c : null;
+  if (!(onto || l).classList.contains("drop")) { unmark(); (onto || l).classList.add("drop"); }
+});
 $("lanes").addEventListener("dragleave", (e) => { const l = e.target.closest(".lane"); if (l && !l.contains(e.relatedTarget)) l.classList.remove("drop"); });
 $("lanes").addEventListener("drop", async (e) => {
   const l = e.target.closest(".lane"); if (!l) return;
-  e.preventDefault(); l.classList.remove("drop");
-  const t = state.tasks.find((x) => x.id === e.dataTransfer.getData("text/plain"));
+  e.preventDefault(); unmark();
+  const c = e.target.closest(".card"), id = e.dataTransfer.getData("text/plain");
+  if (c && c.dataset.id !== id) return combine(id, c.dataset.id);
+  const t = state.tasks.find((x) => x.id === id);
   if (!t || laneOf(t) === l.dataset.lane) return;
   const r = await fetch(`api/tasks/${encodeURIComponent(t.id)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: LANE_STATUS[l.dataset.lane] }) }).catch(() => null);
   if (!r || !r.ok) { $("note").hidden = false; $("note").textContent = `Couldn't move “${t.title}”.`; return; }
@@ -560,9 +571,11 @@ $("dlg").addEventListener("click", (e) => {
   if (e.target.id === "f-trig-add") return addTrigger();
   if (e.target.id === "f-pick") return $("f-files").click();
   if (e.target.id === "ask-term") return sendAnswer({});
+  if (e.target.id === "f-comb-go") return combine(openId, $("f-comb").value);
   const f = e.target.closest("[data-unfile]");
   if (f) { pend.splice(+f.dataset.unfile, 1); return showFiles(); }
   const b = e.target.closest("[data-act]"); if (!b || b.disabled) return;
+  if (b.dataset.act === "combine") return pickCombine();
   if (b.dataset.act === "close") return closeTask();
   if (b.dataset.act === "delete") return deleteTask();
   if (b.dataset.act === "say") return say();
@@ -573,6 +586,24 @@ async function closeTask() {
   const r = await fetch(`api/tasks/${encodeURIComponent(openId)}?actor=eugene`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "done" }) }).catch(() => null);
   if (!r || !r.ok) { $("f-err").hidden = false; $("f-err").textContent = "Couldn't close the task."; return; }
   apply(r);
+}
+// Combine… lists the other tasks on the board to pick the one to combine with.
+function pickCombine() {
+  const others = state.tasks.filter((x) => x.id !== openId && laneOf(x)).sort((a, b) => a.title.localeCompare(b.title));
+  $("f-comb").innerHTML = others.map((x) => `<option value="${esc(x.id)}">${esc(x.title)}</option>`).join("");
+  $("d-comb").hidden = false; $("f-comb").focus();
+}
+// Combine folds the newer of two tasks into the older one (handleCombine), so it asks first; an open dialog then shows the one that stays.
+async function combine(id, withId) {
+  const a = state.tasks.find((x) => x.id === id), c = state.tasks.find((x) => x.id === withId);
+  if (!a || !c || !confirm(`Combine “${a.title}” and “${c.title}”? The older one stays and takes the newer one's history, story and files; the newer one is removed.`)) return;
+  const r = await fetch(`api/tasks/${encodeURIComponent(id)}/combine`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ with: withId }) }).catch(() => null);
+  const err = $("dlg").open ? $("f-err") : $("note");
+  if (!r || !r.ok) { err.hidden = false; err.textContent = (r && (await r.json().catch(() => ({}))).error) || "Couldn't combine the tasks."; return; }
+  const t = await r.json();
+  state.tasks = [...state.tasks.filter((x) => x.id !== id && x.id !== withId), t];
+  if ($("dlg").open) { openId = t.id; renderDialog(true); }
+  render();
 }
 // Delete removes the task and its files for good, so it asks first.
 async function deleteTask() {

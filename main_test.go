@@ -937,3 +937,69 @@ func TestPromptSendsOnlyItsRule(t *testing.T) {
 		t.Error("a trigger's session lacks act's rules")
 	}
 }
+
+func TestHandleCombine(t *testing.T) {
+	dir := t.TempDir()
+	b := &Board{path: filepath.Join(dir, "state.json"), logDir: dir}
+	day := time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC)
+	gonePath := filepath.Join(dir, "files", "new", "a.txt")
+	b.st.Tasks = map[string]*Task{
+		"old": {ID: "old", Title: "Old", Summary: "first", Tags: []string{"x"}, Who: "Bar Levi",
+			Files:   []string{filepath.Join(dir, "files", "old", "a.txt")},
+			History: []Entry{{At: day, Kind: "created"}, {At: day.Add(2 * time.Hour), Kind: "note"}}},
+		"new": {ID: "new", Title: "New", Summary: "second", Tags: []string{"x", "y"}, Who: "Dana Cohen", Jira: []string{"BE-1"},
+			Files:   []string{gonePath},
+			History: []Entry{{At: day.Add(time.Hour), Kind: "created"}}},
+		"busy": {ID: "busy", History: []Entry{{At: day.Add(3 * time.Hour)}}, Job: &Job{Action: "act", Status: "running"}},
+	}
+	for _, f := range []string{b.st.Tasks["old"].Files[0], gonePath} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte(f), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/tasks/{id}/combine", b.handleCombine)
+	combine := func(id, with string) int {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), "POST", "/api/tasks/"+id+"/combine", strings.NewReader(`{"with":"`+with+`"}`)))
+		return rec.Code
+	}
+	// Pressed on the newer task: the older one still stays.
+	if code := combine("new", "old"); code != 200 {
+		t.Fatalf("combine: %d", code)
+	}
+	if _, ok := b.st.Tasks["new"]; ok {
+		t.Error("the newer task is still on the board")
+	}
+	got := b.st.Tasks["old"]
+	moved := filepath.Join(dir, "files", "old", "new-a.txt")
+	if data, err := os.ReadFile(moved); err != nil || string(data) != gonePath {
+		t.Errorf("moved file: %q, %v", data, err)
+	}
+	if _, err := os.Stat(filepath.Dir(gonePath)); !os.IsNotExist(err) {
+		t.Errorf("files/new still there: %v", err)
+	}
+	kinds := make([]string, 0, len(got.History))
+	for _, e := range got.History {
+		kinds = append(kinds, e.Kind)
+	}
+	if want := []string{"created", "created", "note", "combine"}; !slices.Equal(kinds, want) {
+		t.Errorf("history kinds = %v, want %v", kinds, want)
+	}
+	if got.Summary != "first\n\n**New**: second" || !slices.Equal(got.Tags, []string{"x", "y"}) || !slices.Equal(got.Jira, []string{"BE-1"}) ||
+		got.Who != "Bar Levi, Dana Cohen" || len(got.Files) != 2 || got.Files[1] != moved {
+		t.Errorf("combined task = %+v", got)
+	}
+	if code := combine("old", "busy"); code != 409 || b.st.Tasks["busy"] == nil {
+		t.Errorf("a newer task Claude works on: %d, want 409 and kept", code)
+	}
+	if code := combine("old", "old"); code != 400 {
+		t.Errorf("with itself: %d, want 400", code)
+	}
+	if code := combine("old", "nope"); code != 404 {
+		t.Errorf("unknown task: %d, want 404", code)
+	}
+}
