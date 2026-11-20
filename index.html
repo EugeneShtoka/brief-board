@@ -234,7 +234,7 @@ const kithLink = (label, room, event) => `<a href="${esc(kithURI(room, event))}"
 const messageLink = (m) => /^https:\/\//.test(m.url || "") ? `<a href="${esc(m.url)}" target="_blank" rel="noopener">${esc(m.label || "message")} ↗</a>` : kithLink(m.label || "message", m.room, m.event);
 const preQa = (t) => t.status === "done" ? (t.jira || []).filter((k) => PRE_QA.has((t.jiraStatus || {})[k])) : [];
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-// Issue and PR link bases come from the server: the area's issueUrl and prUrl, else BOARD_ISSUE_URL and BOARD_PR_URL; no link when unset.
+// Issue and PR link bases come from the server: the area's issueUrl and prUrl (its folder's GitHub origin when unset), else BOARD_ISSUE_URL and BOARD_PR_URL; no link when unset.
 const cfg = () => state.config || {};
 const bases = (area) => { const a = (cfg().areas || []).find((x) => x.id === area) || {}; return { issue: esc(a.issueUrl ?? cfg().issue ?? ""), pr: esc(a.prUrl ?? cfg().pr ?? "") }; };
 const refs = (s, { issue, pr }) => esc(s)
@@ -745,7 +745,7 @@ const PROJECT = [["id", "Id", "Stored on its tasks: lowercase, unique, e.g. kith
   ["roadmap", "Roadmap files", "Globs in the folder, comma-separated; empty is roadmap.md, TODO.md and the like; none reads no files."],
   ["jiraRoom", "Jira feed room", "The kith room its Jira bot posts in; empty watches none."],
   ["briefEvery", "Brief every", "e.g. 6h; empty is the board's below; 0 is only by the button."],
-  ["issueUrl", "Issue link base", "Empty is the board's below."], ["prUrl", "Pull request link base", "Empty is the board's below."]];
+  ["issueUrl", "Issue link base", "Empty is the board's below."], ["prUrl", "Pull request link base", "Empty is its folder's GitHub origin, else the board's below."]];
 let projects = [], projectsRaw = "", projectsLoaded = "";
 const projectHTML = (p, i) => `<fieldset class="proj" data-proj="${i}"><legend>${esc(p.name || p.id || "New project")}</legend>
   ${PROJECT.map(([k, label, hint]) => { const v = k === "roadmap" ? (Array.isArray(p[k]) ? p[k].join(", ") || "none" : "") : p[k] || "";

@@ -56,7 +56,7 @@ next to the state file, which wins over the environment; saving them restarts th
 | `BOARD_KITH_MCP` | `kith-mcp` | The kith MCP server command |
 | `BOARD_GITHUB_POLL` | off | How often to read GitHub notifications |
 | `BOARD_ISSUE_KEY` | `\b[A-Z][A-Z0-9]+-\d+\b` | Issue key pattern in the Jira feed and GitHub |
-| `BOARD_ISSUE_URL`, `BOARD_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page, for areas without `issueUrl` / `prUrl` |
+| `BOARD_ISSUE_URL`, `BOARD_PR_URL` | none | Link bases for issue keys and `#PR` numbers on the page, for areas without `issueUrl` / `prUrl`; an area without `prUrl` first takes its folder's GitHub `origin` |
 | `BOARD_CLEAN_MERGED` | off | `1`: a task done with a merged pull request closes its session and removes the worktree |
 
 The comment at the top of `main.go` documents each one in full.

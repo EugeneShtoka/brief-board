@@ -6,7 +6,7 @@
 // the folders their sessions run in; work's is also where the brief runs; roadmap: the files the roadmap run reads, see
 // defaultRoadmap; jiraRoom: the kith room the area's Jira bot posts in, see watchJira; briefEvery: how often the area is
 // briefed, a Go duration, default BOARD_BRIEF_EVERY, unset or 0 only by the board's button, see scheduleBrief;
-// issueUrl / prUrl: the area's link bases, default BOARD_ISSUE_URL / BOARD_PR_URL),
+// issueUrl / prUrl: the area's link bases, default BOARD_ISSUE_URL / BOARD_PR_URL; prUrl first defaults to its folder's GitHub origin),
 // BOARD_CLAUDE (claude), BOARD_URL (how claude reaches us),
 // BOARD_TERMINAL (where sessions open: unset is the wezterm mux, else a command the session is appended to,
 // run in the task's folder, e.g. "kitty", "alacritty -e" or "kitty @ launch --type=tab"),
@@ -20,6 +20,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/rand"
@@ -213,7 +214,7 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		}
 		seen[a.ID] = true
 		a.Name = cmp.Or(a.Name, a.ID)
-		a.IssueURL, a.PRURL = cmp.Or(a.IssueURL, os.Getenv("BOARD_ISSUE_URL")), cmp.Or(a.PRURL, os.Getenv("BOARD_PR_URL"))
+		a.IssueURL = cmp.Or(a.IssueURL, os.Getenv("BOARD_ISSUE_URL"))
 		if a.Roadmap == nil {
 			a.Roadmap = defaultRoadmap
 		}
@@ -226,11 +227,32 @@ func (b *Board) parseAreas(conf string) ([]Area, error) {
 		if a.Dir == "~" || strings.HasPrefix(a.Dir, "~/") {
 			a.Dir = filepath.Join(b.home, a.Dir[1:])
 		}
+		// Its own repository before the board's: BOARD_PR_URL is one repository's, and a #number elsewhere is another's.
+		if a.PRURL == "" {
+			a.PRURL = cmp.Or(repoPulls(a.Dir), os.Getenv("BOARD_PR_URL"))
+		}
 	}
 	if !seen["work"] {
 		return nil, errors.New("parseAreas: no work area")
 	}
 	return areas, nil
+}
+
+// ghRemoteRe is a GitHub remote's owner/repo: git@github.com:o/r.git, https://github.com/o/r, ssh://git@github.com/o/r.git.
+var ghRemoteRe = regexp.MustCompile(`github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$`)
+
+// repoPulls is the pull request link base of dir's origin when that is on GitHub, else "" (no repository, no origin, elsewhere).
+func repoPulls(dir string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin") //nolint:gosec // argv, no shell; the area's own folder
+	// Without an inherited GIT_DIR (a git hook's), which would answer for that repository instead of dir's.
+	cmd.Env = slices.DeleteFunc(os.Environ(), func(e string) bool { return strings.HasPrefix(e, "GIT_") })
+	out, err := cmd.Output()
+	if m := ghRemoteRe.FindSubmatch(bytes.TrimSpace(out)); err == nil && m != nil {
+		return "https://github.com/" + string(m[1]) + "/pull/"
+	}
+	return ""
 }
 
 // dirFor is the folder a session on t runs in: its area's; an unknown area or a missing folder is an error.
